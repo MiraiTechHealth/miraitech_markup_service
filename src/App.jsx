@@ -72,7 +72,7 @@ const EXTRA_CALCULATORS = [
   {
     id: 'step-cadence',
     label: 'Step Cadence · StepResUNet',
-    description: 'ML-контакты и фактическое время опоры',
+    description: 'ML-контакты, GCT и метрики по клику на колонку',
     color: '#d97706',
     fill: 'rgba(217,119,6,0.10)',
   },
@@ -1931,6 +1931,35 @@ export default function App() {
           })
         }
       }
+
+      // Plotly shapes do not emit click events. Add a nearly invisible,
+      // wide hit-line through every calculated contact so clicking a column
+      // reliably selects its metrics.
+      const clickableCalculatorIds = [...new Set(['step-cadence', ...activeCalculatorsRef.current])]
+      clickableCalculatorIds.forEach(calculatorId => {
+        const result = calculatorResultsRef.current[calculatorId]
+        if (!result?.contacts?.length) return
+        result.contacts.forEach((contact, contactIndex) => {
+          const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
+          const shift = contact.foot === 'right' ? offsetS2Ref.current : offsetS1Ref.current
+          const start = Number(contact.start_time_s) * timeScale + shift
+          const end = Number(contact.end_time_s) * timeScale + shift
+          if (!Number.isFinite(start) || !Number.isFinite(end)) return
+          traces.push({
+            x: [(start + end) / 2, (start + end) / 2],
+            y: yRanges[col] || [-1, 1],
+            customdata: [[calculatorId, contactIndex], [calculatorId, contactIndex]],
+            type: 'scatter',
+            mode: 'lines',
+            xaxis: xAxis,
+            yaxis: yAxis,
+            line: { color: 'rgba(255,255,255,0.01)', width: 18 },
+            opacity: 0.01,
+            hoverinfo: 'skip',
+            showlegend: false,
+          })
+        })
+      })
     })
     s1TraceIdxRef.current = s1Idx
     s2TraceIdxRef.current = s2Idx
@@ -1992,6 +2021,16 @@ export default function App() {
       chartDivRef.current.on('plotly_click', (d) => {
         if (!d?.points?.length) return
         const t = d.points[0].x
+        const clickedMeta = d.points[0].customdata
+        if (Array.isArray(clickedMeta) && clickedMeta.length === 2) {
+          const [calculatorId, contactIndex] = clickedMeta
+          const result = calculatorResultsRef.current[calculatorId]
+          const contact = result?.contacts?.[contactIndex]
+          if (contact) {
+            setSelectedCalculatorContact({ calculatorId, index: contactIndex, contact })
+            return
+          }
+        }
         const findCalculatorContact = (x) => {
           const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
           const calculatorIds = [...new Set(['step-cadence', ...activeCalculatorsRef.current])]
@@ -2067,7 +2106,7 @@ export default function App() {
         }
       })
     })
-  }, [parquetData, selectedCols, timeCol, insoleSensorNames, hasSpeedTracker, offsetS1, offsetS2, offsetST, showSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict])
+  }, [parquetData, selectedCols, timeCol, insoleSensorNames, hasSpeedTracker, offsetS1, offsetS2, offsetST, showSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict, activeCalculators, calculatorResults])
 
   const handleUnwrapAngles = useCallback(() => {
     if (!parquetData || !selectedCols.length) return
