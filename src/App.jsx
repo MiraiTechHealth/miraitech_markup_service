@@ -1945,17 +1945,28 @@ export default function App() {
           const start = Number(contact.start_time_s) * timeScale + shift
           const end = Number(contact.end_time_s) * timeScale + shift
           if (!Number.isFinite(start) || !Number.isFinite(end)) return
+          const yRange = yRanges[col] || [-1, 1]
+          const customdata = [
+            [calculatorId, contactIndex],
+            [calculatorId, contactIndex],
+            [calculatorId, contactIndex],
+            [calculatorId, contactIndex],
+            [calculatorId, contactIndex],
+          ]
           traces.push({
-            x: [(start + end) / 2, (start + end) / 2],
-            y: yRanges[col] || [-1, 1],
-            customdata: [[calculatorId, contactIndex], [calculatorId, contactIndex]],
+            x: [start, start, end, end, start],
+            y: [yRange[0], yRange[1], yRange[1], yRange[0], yRange[0]],
+            customdata,
             type: 'scatter',
             mode: 'lines',
+            fill: 'toself',
             xaxis: xAxis,
             yaxis: yAxis,
-            line: { color: 'rgba(255,255,255,0.01)', width: 18 },
+            line: { color: 'rgba(255,255,255,0.01)', width: 1 },
+            fillcolor: 'rgba(255,255,255,0.01)',
             opacity: 0.01,
-            hoverinfo: 'skip',
+            hoveron: 'fills',
+            hovertemplate: '<extra></extra>',
             showlegend: false,
           })
         })
