@@ -62,17 +62,31 @@ const EXTRA_CALCULATORS = [
   },
   {
     id: 'tkeo-cadence',
-    label: 'TKEO Cadence',
+    label: 'TKEO Cadence · без ML',
     description: 'Каденс и контакты по TKEO акселерометра',
     color: '#0891b2',
     fill: 'rgba(8,145,178,0.10)',
   },
   {
     id: 'step-cadence',
-    label: 'Step Cadence',
+    label: 'Step Cadence · StepResUNet',
     description: 'ML-контакты и фактическое время опоры',
     color: '#d97706',
     fill: 'rgba(217,119,6,0.10)',
+  },
+  {
+    id: 'jump-metrics',
+    label: 'Jump CNN-LSTM',
+    description: 'Flight time, высота, contact time и RSI',
+    color: '#db2777',
+    fill: 'rgba(219,39,119,0.10)',
+  },
+  {
+    id: 'force-jump',
+    label: 'Bilateral GRF · BiLSTM+CNN',
+    description: 'Пиковая вертикальная сила по двум стопам',
+    color: '#dc2626',
+    fill: 'rgba(220,38,38,0.10)',
   },
 ]
 const EXTRA_CALCULATOR_BY_ID = Object.fromEntries(EXTRA_CALCULATORS.map(calc => [calc.id, calc]))
@@ -382,6 +396,11 @@ function formatDuration(d, unit) {
   return d.toFixed(3) + 'с'
 }
 
+function formatMetric(value, digits = 2, suffix = '') {
+  if (value == null || !Number.isFinite(Number(value))) return '—'
+  return `${Number(value).toFixed(digits)}${suffix}`
+}
+
 function buildCursorShapes(x, n) {
   return Array.from({ length: n }, (_, i) => ({
     type: 'line',
@@ -550,6 +569,7 @@ export default function App() {
   const [calculatorResults, setCalculatorResults] = useState({})
   const [activeCalculators, setActiveCalculators] = useState([])
   const [calculatorLoading, setCalculatorLoading] = useState('')
+  const [weightKg, setWeightKg] = useState('70')
   const [checkHzData, setCheckHzData]   = useState(null)
   const [selectedCols, setSelectedCols] = useState([])
   const [timeCol, setTimeCol]           = useState('Time')
@@ -1627,13 +1647,21 @@ export default function App() {
 
     if (!parquetData || calculatorLoading) return
 
+    const parsedWeight = Number(weightKg)
+    if (calculatorId === 'force-jump' && (!Number.isFinite(parsedWeight) || parsedWeight <= 0)) {
+      setStatus({ text: 'Укажите положительный вес для Bilateral GRF', type: 'error' })
+      return
+    }
+
     const dataVersion = calculatorDataVersionRef.current
     setCalculatorLoading(calculatorId)
     try {
+      const payload = { rows: colMapToRows(parquetData) }
+      if (calculatorId === 'force-jump') payload.weight_kg = parsedWeight
       const resp = await fetch(`/calculator-api/calculate/${calculatorId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'accept': 'application/json' },
-        body: JSON.stringify({ rows: colMapToRows(parquetData) }),
+        body: JSON.stringify(payload),
       })
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}))
@@ -1649,8 +1677,13 @@ export default function App() {
       const left = data.summary?.left?.contact_count || 0
       const right = data.summary?.right?.contact_count || 0
       const cadence = data.summary?.cadence_spm
+      const resultText = calculatorId === 'jump-metrics'
+        ? `${data.summary?.total_jump_count || 0} прыж. · высота ${formatMetric(data.summary?.mean_jump_height_cm, 1, ' см')}`
+        : calculatorId === 'force-jump'
+          ? `пик ${formatMetric(data.summary?.peak_force_n, 1, ' Н')} · ${formatMetric(data.summary?.peak_force_bw, 2, ' BW')}`
+          : `L ${left} · R ${right}${cadence != null ? ` · ${cadence.toFixed(0)} spm` : ''}`
       setStatus({
-        text: `✓ ${data.label}: L ${left} · R ${right}${cadence != null ? ` · ${cadence.toFixed(0)} spm` : ''}`,
+        text: `✓ ${data.label}: ${resultText}`,
         type: 'ok',
       })
     } catch (err) {
@@ -1662,7 +1695,7 @@ export default function App() {
     } finally {
       if (dataVersion === calculatorDataVersionRef.current) setCalculatorLoading('')
     }
-  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading])
+  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg])
 
   // ── Build Plotly chart ────────────────────────────────────────────────────
   const renderChart = useCallback(() => {
@@ -2251,7 +2284,7 @@ export default function App() {
                         {hasSpeedTracker && (
                           <div className="sidebar-block-row calculator-primary-row">
                         <div className="sidebar-block">
-                          <span className="sidebar-block-lbl">Прогноз скорости</span>
+                          <span className="sidebar-block-lbl">Прогноз скорости · CausalSpeedTCN</span>
                           <button
                             type="button"
                             className={`btn-secondary btn-speed-predict${showSpeedPredict ? ' active' : ''}`}
@@ -2300,7 +2333,7 @@ export default function App() {
                         </div>
 
                         <div className="sidebar-block">
-                          <span className="sidebar-block-lbl">Прогноз дистанции</span>
+                          <span className="sidebar-block-lbl">Дистанция · CausalSpeedTCN</span>
                           <button
                             type="button"
                             className={`btn-secondary btn-distance-predict${showDistancePredict ? ' active' : ''}`}
@@ -2340,6 +2373,24 @@ export default function App() {
                         </div>
                           </div>
                         )}
+
+                        <div className="calculator-model-note">
+                          ML-модели: <b>step_gc_model.pt</b>, <b>speed_cont_v5.pt</b>, <b>jump_cnn_lstm.pt</b> и <b>fz_bilateral.pt</b>
+                        </div>
+
+                        <div className="calculator-weight-row">
+                          <label htmlFor="calculator-weight">Вес для GRF, кг</label>
+                          <input
+                            id="calculator-weight"
+                            type="number"
+                            min="1"
+                            max="300"
+                            step="0.1"
+                            value={weightKg}
+                            onChange={event => setWeightKg(event.target.value)}
+                          />
+                          <span>нужен для Bilateral GRF</span>
+                        </div>
 
                         <button
                           type="button"
@@ -2382,12 +2433,21 @@ export default function App() {
                                     {loading ? 'Считаю…' : active ? `Убрать ${calculator.label}` : calculator.label}
                                   </button>
                                   <span className="calculator-description">{calculator.description}</span>
+                                  {result?.model && (
+                                    <span className="calculator-model">
+                                      Модель: {result.model}{result.model_file ? ` · ${result.model_file}` : ''}
+                                    </span>
+                                  )}
                                   {result && (
                                     <span className="calculator-summary" style={{ '--calculator-color': calculator.color }}>
-                                      L {leftCount} · R {rightCount}
-                                      {summary?.cadence_spm != null && ` · ${summary.cadence_spm.toFixed(0)} spm`}
-                                      {summary?.left?.mean_contact_duration_s != null
-                                        && ` · GCT L ${(summary.left.mean_contact_duration_s * 1000).toFixed(0)} ms`}
+                                      {calculator.id === 'jump-metrics'
+                                        ? `${summary?.total_jump_count || 0} прыж. · высота ${formatMetric(summary?.mean_jump_height_cm, 1, ' см')} · flight ${formatMetric(summary?.left_mean_flight_time_ms, 0, ' мс')}`
+                                        : calculator.id === 'force-jump'
+                                          ? `пик ${formatMetric(summary?.peak_force_n, 1, ' Н')} · ${formatMetric(summary?.peak_force_bw, 2, ' BW')}`
+                                          : <>L {leftCount} · R {rightCount}
+                                            {summary?.cadence_spm != null && ` · ${summary.cadence_spm.toFixed(0)} spm`}
+                                            {summary?.left?.mean_contact_duration_s != null
+                                              && ` · GCT L ${(summary.left.mean_contact_duration_s * 1000).toFixed(0)} ms`}</>}
                                     </span>
                                   )}
                                 </div>

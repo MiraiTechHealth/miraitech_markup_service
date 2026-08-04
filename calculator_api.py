@@ -8,6 +8,7 @@ not add or change any backend API routes.
 from __future__ import annotations
 
 import asyncio
+from statistics import median
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
@@ -27,6 +28,22 @@ CALCULATOR_LABELS = {
     "step-detector-ttest": "Step Detector T-Test",
     "tkeo-cadence": "TKEO Cadence",
     "step-cadence": "Step Cadence",
+    "jump-metrics": "Jump CNN-LSTM",
+    "force-jump": "Bilateral GRF",
+}
+
+CALCULATOR_MODELS = {
+    "step-detector-ttest": "Pressure peak detector",
+    "tkeo-cadence": "TKEO + peak detection",
+    "step-cadence": "StepResUNet",
+    "jump-metrics": "JumpCNNLSTM",
+    "force-jump": "BiLSTMCNNRegressor",
+}
+
+CALCULATOR_MODEL_FILES = {
+    "step-cadence": "step_gc_model.pt",
+    "jump-metrics": "jump_cnn_lstm.pt",
+    "force-jump": "fz_bilateral.pt",
 }
 
 SENSOR_TO_FOOT = {
@@ -52,6 +69,37 @@ def _foot_summary(stats: Any) -> Dict[str, Any]:
             else None
         ),
     }
+
+
+def _round_or_none(value: Any, digits: int = 2) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def _rows_with_time_in_ms(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalise second-based markup files to the backend models' ms contract."""
+    times = []
+    for row in rows:
+        try:
+            times.append(float(row.get("Time")))
+        except (TypeError, ValueError):
+            continue
+
+    ordered = sorted(set(times))
+    deltas = [right - left for left, right in zip(ordered, ordered[1:]) if right > left]
+    if not deltas or median(deltas) >= 0.5:
+        return rows
+
+    normalised = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["Time"] = float(item["Time"]) * 1000.0
+        except (KeyError, TypeError, ValueError):
+            pass
+        normalised.append(item)
+    return normalised
 
 
 def _cadence_result(calculator_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -91,6 +139,8 @@ def _cadence_result(calculator_id: str, rows: List[Dict[str, Any]]) -> Dict[str,
     return {
         "calculator": calculator_id,
         "label": CALCULATOR_LABELS[calculator_id],
+        "model": CALCULATOR_MODELS[calculator_id],
+        "model_file": CALCULATOR_MODEL_FILES.get(calculator_id),
         "contacts": contacts,
         "summary": {
             "cadence_spm": float(result.cadence),
@@ -133,6 +183,8 @@ def _ttest_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     return {
         "calculator": "step-detector-ttest",
         "label": CALCULATOR_LABELS["step-detector-ttest"],
+        "model": CALCULATOR_MODELS["step-detector-ttest"],
+        "model_file": CALCULATOR_MODEL_FILES.get("step-detector-ttest"),
         "contacts": contacts,
         "summary": {
             "cadence_spm": None,
@@ -145,9 +197,101 @@ def _ttest_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _jump_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Run the JumpCNNLSTM and expose compact UI-friendly metrics."""
+    from app.services.calculators.ml_jump_metrics_calculator import (
+        get_jump_metrics_calculator,
+    )
+
+    rows = _rows_with_time_in_ms(rows)
+    calculator = get_jump_metrics_calculator(max_contact_time_ms=10000)
+    # Keep the detected pairs and the aggregate result from the same inference
+    # pass. The calculator itself also uses this lock around calculate().
+    with calculator._infer_lock:
+        result = calculator.calculate(rows)
+        details = {
+            foot: list(calculator.analysis_details.get(foot, {}).get("jump_pairs", []))
+            for foot in ("ESP32_Sensor_1", "ESP32_Sensor_2")
+        }
+
+    contacts = []
+    for sensor, foot in (("ESP32_Sensor_1", "left"), ("ESP32_Sensor_2", "right")):
+        for pair in details[sensor]:
+            start_ms = float(pair["takeoff_time"])
+            end_ms = float(pair["landing_time"])
+            contacts.append({
+                "foot": foot,
+                "start_time_s": start_ms / 1000.0,
+                "end_time_s": end_ms / 1000.0,
+                "peak_time_s": start_ms / 1000.0,
+                "duration_ms": float(pair["flight_time_ms"]),
+                "kind": "flight",
+                "confidence": None,
+            })
+    contacts.sort(key=lambda item: item["start_time_s"])
+
+    flight = result.flight_time
+    contact = result.contact_time
+    rsi = result.rsi
+    return {
+        "calculator": "jump-metrics",
+        "label": CALCULATOR_LABELS["jump-metrics"],
+        "model": CALCULATOR_MODELS["jump-metrics"],
+        "model_file": CALCULATOR_MODEL_FILES["jump-metrics"],
+        "contacts": contacts,
+        "summary": {
+            "left_jump_count": len(flight.left_flight_times_ms),
+            "right_jump_count": len(flight.right_flight_times_ms),
+            "total_jump_count": int(flight.total_flight_events),
+            "left_mean_flight_time_ms": _round_or_none(flight.left_mean_flight_time_ms),
+            "right_mean_flight_time_ms": _round_or_none(flight.right_mean_flight_time_ms),
+            "mean_jump_height_cm": _round_or_none(result.mean_jump_height_cm),
+            "max_jump_height_cm": _round_or_none(result.max_jump_height_cm),
+            "left_mean_contact_time_ms": _round_or_none(contact.left_mean_contact_time_ms),
+            "right_mean_contact_time_ms": _round_or_none(contact.right_mean_contact_time_ms),
+            "left_mean_rsi": _round_or_none(rsi.left_mean_rsi, 3),
+            "right_mean_rsi": _round_or_none(rsi.right_mean_rsi, 3),
+            "activity_type": result.activity_type,
+            "is_valid": bool(result.is_valid),
+        },
+    }
+
+
+def _force_result(rows: List[Dict[str, Any]], weight_kg: float) -> Dict[str, Any]:
+    """Run bilateral Fz regression and expose peak/flight metrics."""
+    from app.services.calculators.force_jump_calculator import get_force_jump_calculator
+
+    rows = _rows_with_time_in_ms(rows)
+    calculator = get_force_jump_calculator()
+    result = calculator.calculate(rows, weight_kg=weight_kg)
+    return {
+        "calculator": "force-jump",
+        "label": CALCULATOR_LABELS["force-jump"],
+        "model": CALCULATOR_MODELS["force-jump"],
+        "model_file": CALCULATOR_MODEL_FILES["force-jump"],
+        "events": [
+            {
+                "takeoff_time_ms": _round_or_none(event.takeoff_time_ms),
+                "landing_time_ms": _round_or_none(event.landing_time_ms),
+                "flight_time_ms": _round_or_none(event.flight_time_ms),
+            }
+            for event in result.jump_events
+        ],
+        "summary": {
+            "peak_force_n": _round_or_none(result.peak_force_n),
+            "peak_force_bw": _round_or_none(result.peak_force_bw, 3),
+            "jump_count": len(result.jump_events),
+            "weight_kg": _round_or_none(result.weight_kg),
+            "is_valid": bool(result.is_valid),
+        },
+    }
+
+
 def _calculate(calculator_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     if calculator_id == "step-detector-ttest":
         return _ttest_result(rows)
+    if calculator_id == "jump-metrics":
+        return _jump_result(rows)
     return _cadence_result(calculator_id, rows)
 
 
@@ -167,6 +311,18 @@ async def calculate(
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
         raise HTTPException(status_code=422, detail="Session rows are required")
+
+    if calculator_id == "force-jump":
+        try:
+            weight_kg = float(payload.get("weight_kg"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="weight_kg is required for Bilateral GRF")
+        if weight_kg <= 0:
+            raise HTTPException(status_code=422, detail="weight_kg must be positive")
+        try:
+            return await asyncio.to_thread(_force_result, rows, weight_kg)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     try:
         return await asyncio.to_thread(_calculate, calculator_id, rows)
