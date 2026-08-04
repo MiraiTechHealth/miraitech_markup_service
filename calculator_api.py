@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+import numpy as np
 import pandas as pd
 from fastapi import Body, FastAPI, HTTPException
 
@@ -50,6 +51,92 @@ SENSOR_TO_FOOT = {
     "ESP32_Sensor_1": "left",
     "ESP32_Sensor_2": "right",
 }
+
+_JUMP_RAW_COLUMNS = ("AcX", "AcY", "AcZ", "XData", "YData", "ZData", "GravityZ")
+_JUMP_FEATURE_COLUMNS = ("AcZ", "AcX", "AcY", "XData", "YData", "ZData", "GravityZ")
+
+
+def _preprocess_jump_foot(
+    foot_data: List[Dict[str, Any]],
+    foot_type: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Prepare one foot's raw rows exactly as the JumpCNNLSTM expects.
+
+    The model's backend calculator historically performed this transformation
+    internally. The markup calculator API now performs it explicitly and passes
+    the result through an adapter, while the base calculator still owns the
+    trained scaler and sliding-window inference.
+    """
+    rows = []
+    for entry in foot_data:
+        try:
+            time = float(entry.get("Time", 0))
+            values = [float(entry.get(column, 0)) for column in _JUMP_RAW_COLUMNS]
+            rows.append([time] + values)
+        except (TypeError, ValueError):
+            continue
+
+    if not rows:
+        return np.array([], dtype=np.float64), np.empty((0, len(_JUMP_RAW_COLUMNS)), dtype=np.float32)
+
+    rows.sort(key=lambda row: row[0])
+    data = np.asarray(rows, dtype=np.float64)
+
+    # Columns after Time: AcX AcY AcZ XData YData ZData GravityZ.
+    acx_index, acy_index = 1, 2
+    position_indices = (4, 5, 6)
+
+    if foot_type == "right":
+        data[:, acx_index] = -data[:, acx_index]
+        data[:, acy_index] = -data[:, acy_index]
+
+    for column_index in position_indices:
+        data[:, column_index] -= data[0, column_index]
+
+    features_by_name = {
+        "AcX": data[:, 1],
+        "AcY": data[:, 2],
+        "AcZ": data[:, 3],
+        "XData": data[:, 4],
+        "YData": data[:, 5],
+        "ZData": data[:, 6],
+        "GravityZ": data[:, 7],
+    }
+    features = np.column_stack(
+        [features_by_name[column] for column in _JUMP_FEATURE_COLUMNS]
+    ).astype(np.float32)
+    return data[:, 0], features
+
+
+_markup_jump_calculator = None
+
+
+def _get_markup_jump_calculator():
+    """Create one JumpCNNLSTM instance whose raw parser is markup-owned."""
+    global _markup_jump_calculator
+    if _markup_jump_calculator is None:
+        from app.services.calculators.ml_jump_metrics_calculator import (
+            MLJumpMetricsCalculator,
+        )
+
+        class MarkupPreprocessedJumpMetricsCalculator(MLJumpMetricsCalculator):
+            def __init__(self, *args, **kwargs):
+                self._markup_preprocessed_features = {}
+                super().__init__(*args, **kwargs)
+
+            def set_preprocessed_features(self, features_by_foot):
+                self._markup_preprocessed_features = features_by_foot
+
+            def _preprocess_foot(self, foot_data, foot_type):
+                return self._markup_preprocessed_features.get(
+                    foot_type,
+                    (np.array([], dtype=np.float64), np.empty((0, 7), dtype=np.float32)),
+                )
+
+        _markup_jump_calculator = MarkupPreprocessedJumpMetricsCalculator(
+            max_contact_time_ms=10000
+        )
+    return _markup_jump_calculator
 
 
 def _mean_or_none(values: Iterable[float]) -> float | None:
@@ -209,15 +296,21 @@ def _ttest_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def _jump_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Run the JumpCNNLSTM and expose compact UI-friendly metrics."""
-    from app.services.calculators.ml_jump_metrics_calculator import (
-        get_jump_metrics_calculator,
-    )
-
     rows = _rows_with_time_in_ms(rows)
-    calculator = get_jump_metrics_calculator(max_contact_time_ms=10000)
+    calculator = _get_markup_jump_calculator()
+    preprocessed = {
+        foot: _preprocess_jump_foot(
+            [row for row in rows if row.get("Name") == sensor],
+            foot,
+        )
+        for sensor, foot in SENSOR_TO_FOOT.items()
+    }
     # Keep the detected pairs and the aggregate result from the same inference
-    # pass. The calculator itself also uses this lock around calculate().
+    # pass. The calculator itself also uses this lock around calculate(). The
+    # base calculator's scaler and sliding-window inference remain unchanged;
+    # only its raw-row parser is bypassed to avoid preprocessing twice.
     with calculator._infer_lock:
+        calculator.set_preprocessed_features(preprocessed)
         result = calculator.calculate(rows)
         details = {
             foot: list(calculator.analysis_details.get(foot, {}).get("jump_pairs", []))
