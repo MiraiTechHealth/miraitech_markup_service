@@ -54,6 +54,7 @@ const ST_COL_COLORS = {
 const SPEED_PRED_COLS = new Set(['Speed', 'VelocityMs'])
 const DISTANCE_PRED_COLS = new Set(['Distance', 'DistanceM'])
 const PRED_COLOR = '#d62728'
+const TRACE_HOVER_TEMPLATE = '<b>%{fullData.name}</b><br>Время: %{x}<br>Значение: %{y:.4g}<extra></extra>'
 const EXTRA_CALCULATORS = [
   {
     id: 'step-detector-ttest',
@@ -78,8 +79,8 @@ const EXTRA_CALCULATORS = [
   },
   {
     id: 'jump-metrics',
-    label: 'Jump CNN-LSTM',
-    description: 'Flight time, высота, contact time и RSI',
+    label: 'Jump BiLSTM',
+    description: '24 признака IMU + давление · flight time, высота, contact time и RSI',
     color: '#db2777',
     fill: 'rgba(219,39,119,0.10)',
   },
@@ -91,13 +92,167 @@ const EXTRA_CALCULATORS = [
     fill: 'rgba(220,38,38,0.10)',
   },
 ]
+const PROTOCOL_DETECTORS = [
+  {
+    id: 'protocol-walking-detector',
+    label: 'Тест ходьбы · Step detector',
+    description: 'Определяет интервалы контакта стоп при ходьбе',
+    color: '#2563eb',
+    fill: 'rgba(37,99,235,0.10)',
+  },
+  {
+    id: 'protocol-running-detector',
+    label: 'Анализ бега · Run detector',
+    description: 'Определяет контакты левой и правой стопы в беге',
+    color: '#16a34a',
+    fill: 'rgba(22,163,74,0.10)',
+  },
+  {
+    id: 'protocol-jumping-detector',
+    label: 'Анализ прыжков · Jump detector',
+    description: 'Определяет интервалы отрыва и приземления',
+    color: '#db2777',
+    fill: 'rgba(219,39,119,0.10)',
+  },
+  {
+    id: 'protocol-shuttle-detector',
+    label: 'Челночный бег · Turn detector',
+    description: 'Определяет повороты и беговые отрезки',
+    color: '#d97706',
+    fill: 'rgba(217,119,6,0.10)',
+  },
+  {
+    id: 'protocol-sprint-detector',
+    label: 'Спринт 30 м · Sprint detector',
+    description: 'Старт/финиш 30 м, шаги, step length и stride length',
+    color: '#dc2626',
+    fill: 'rgba(220,38,38,0.10)',
+  },
+  {
+    id: 'protocol-beep-detector',
+    label: 'Тест Beep · Yo-Yo detector',
+    description: 'Определяет развороты на 180° и беговые фазы',
+    color: '#0891b2',
+    fill: 'rgba(8,145,178,0.10)',
+  },
+  {
+    id: 'protocol-ttest-detector',
+    label: 'T-тест · Phase detector',
+    description: 'Определяет четыре поворота и беговые фазы T-теста',
+    color: '#7c3aed',
+    fill: 'rgba(124,58,237,0.10)',
+  },
+]
 const EXTRA_CALCULATOR_BY_ID = Object.fromEntries(EXTRA_CALCULATORS.map(calc => [calc.id, calc]))
+const PROTOCOL_DETECTOR_BY_ID = Object.fromEntries(PROTOCOL_DETECTORS.map(detector => [detector.id, detector]))
+const CALCULATOR_BY_ID = { ...EXTRA_CALCULATOR_BY_ID, ...PROTOCOL_DETECTOR_BY_ID }
+const PER_FOOT_TURN_DETECTOR_IDS = new Set([
+  'protocol-shuttle-detector',
+  'protocol-beep-detector',
+  'protocol-ttest-detector',
+])
+
+const EVENT_STYLE_BY_KIND = {
+  run: {
+    label: 'Беговая фаза', color: '#16a34a', fill: 'rgba(22,163,74,0.10)', dash: 'dash', width: 1.5,
+  },
+  turn: {
+    label: 'Поворот', color: '#f97316', fill: 'rgba(249,115,22,0.18)', dash: 'solid', width: 2.25,
+  },
+  sprint: {
+    label: 'Отрезок 30 м', color: '#dc2626', fill: 'rgba(220,38,38,0.07)', dash: 'solid', width: 2.5,
+  },
+}
+const TURN_EVENT_STYLE_BY_FOOT = {
+  left: {
+    run: { color: '#2563eb', fill: 'rgba(37,99,235,0.11)', dash: 'dash', width: 1.75 },
+    turn: { color: '#db2777', fill: 'rgba(219,39,119,0.20)', dash: 'solid', width: 2.5 },
+  },
+  right: {
+    run: { color: '#0f766e', fill: 'rgba(15,118,110,0.11)', dash: 'dash', width: 1.75 },
+    turn: { color: '#f97316', fill: 'rgba(249,115,22,0.20)', dash: 'solid', width: 2.5 },
+  },
+}
+const FOOT_EVENT_STYLE = {
+  left: { color: '#2563eb', fill: 'rgba(37,99,235,0.13)', dash: 'dash', width: 1.5 },
+  right: { color: '#f97316', fill: 'rgba(249,115,22,0.13)', dash: 'dot', width: 1.5 },
+}
+const FLIGHT_EVENT_STYLE = {
+  left: { color: '#db2777', fill: 'rgba(219,39,119,0.14)', dash: 'dash', width: 1.75 },
+  right: { color: '#7c3aed', fill: 'rgba(124,58,237,0.14)', dash: 'dot', width: 1.75 },
+}
+
+function calculatorEventStyle(calculator, contact) {
+  const turnFootStyle = TURN_EVENT_STYLE_BY_FOOT[contact?.foot]?.[contact?.kind]
+  if (turnFootStyle) return turnFootStyle
+  const semanticStyle = EVENT_STYLE_BY_KIND[contact?.kind]
+  if (semanticStyle) return semanticStyle
+  if (contact?.kind === 'flight' && FLIGHT_EVENT_STYLE[contact?.foot]) {
+    return FLIGHT_EVENT_STYLE[contact.foot]
+  }
+  if (FOOT_EVENT_STYLE[contact?.foot]) return FOOT_EVENT_STYLE[contact.foot]
+  return {
+    color: calculator?.color || '#64748b',
+    fill: calculator?.fill || 'rgba(100,116,139,0.10)',
+    dash: 'dash',
+    width: 1.25,
+  }
+}
+
+function calculatorEventLegend(calculator, result) {
+  const items = new Map()
+  ;(result?.contacts || []).forEach(contact => {
+    const selectedTurnFoot = PER_FOOT_TURN_DETECTOR_IDS.has(calculator?.id)
+      && ['left', 'right'].includes(result?.summary?.detection_foot)
+      ? result.summary.detection_foot
+      : ''
+    const eventFoot = ['left', 'right'].includes(contact.foot) ? contact.foot : selectedTurnFoot
+    const foot = eventFoot === 'left' ? 'L' : eventFoot === 'right' ? 'R' : ''
+    const kind = contact.kind || 'event'
+    const footSpecificKind = ['step', 'contact', 'plateau', 'flight', 'run', 'turn'].includes(kind)
+    const key = footSpecificKind && foot ? `${kind}-${foot}` : kind
+    if (items.has(key)) return
+    const style = calculatorEventStyle(
+      calculator,
+      eventFoot && contact.foot !== eventFoot ? { ...contact, foot: eventFoot } : contact,
+    )
+    const footSuffix = foot ? ` ${foot}` : ''
+    const label = kind === 'run'
+      ? `Беговая фаза${footSuffix}`
+      : kind === 'turn'
+        ? `Поворот${footSuffix}`
+        : kind === 'sprint'
+          ? 'Отрезок 30 м'
+          : kind === 'flight'
+            ? `Прыжок ${foot}`
+            : kind === 'step'
+              ? `Шаг ${foot}`
+              : ['contact', 'plateau'].includes(kind)
+                ? `Контакт ${foot}`
+                : `Событие ${foot}`.trim()
+    items.set(key, { key, label, ...style })
+  })
+  return [...items.values()]
+}
 
 // Insole pressure channels and the device-name → foot mapping used for
 // per-foot calibration/normalization (mirrors the backend: ESP32_Sensor_1 is
 // the left insole, ESP32_Sensor_2 the right).
 const SENSOR_COLS = ['Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4']
 const SENSOR_NAME_TO_FOOT = { ESP32_Sensor_1: 'left', ESP32_Sensor_2: 'right' }
+const TURN_DETECTION_FOOT_OPTIONS = [
+  { value: 'both', label: 'L+R', title: 'Наложить независимые детекции левой и правой ног' },
+  { value: 'left', label: 'L', title: 'Детектировать только по левой ноге' },
+  { value: 'right', label: 'R', title: 'Детектировать только по правой ноге' },
+]
+
+function sensorNameForFoot(names, foot) {
+  const mappedName = names.find(name => SENSOR_NAME_TO_FOOT[name] === foot)
+  if (mappedName) return mappedName
+  const hasKnownMapping = names.some(name => SENSOR_NAME_TO_FOOT[name])
+  if (hasKnownMapping) return ''
+  return names[foot === 'left' ? 0 : 1] || ''
+}
 
 function parseSessionRows(raw) {
   if (Array.isArray(raw)) return raw
@@ -403,6 +558,28 @@ function formatMetric(value, digits = 2, suffix = '') {
   return `${Number(value).toFixed(digits)}${suffix}`
 }
 
+function protocolDetectorSummary(result) {
+  const summary = result?.summary
+  if (!summary) return 'события ещё не рассчитаны'
+  if (summary.turn_count != null) {
+    const detectionFoot = PER_FOOT_TURN_DETECTOR_IDS.has(result?.calculator)
+      ? { both: 'L+R', left: 'L', right: 'R' }[summary.detection_foot || 'both']
+      : ''
+    if (detectionFoot === 'L+R' && summary.left_turn_count != null && summary.right_turn_count != null) {
+      return `L+R · повороты L ${summary.left_turn_count} / R ${summary.right_turn_count} · фазы L ${summary.left_run_count || 0} / R ${summary.right_run_count || 0}`
+    }
+    return `${detectionFoot ? `${detectionFoot} · ` : ''}повороты ${summary.turn_count} · беговые фазы ${summary.run_count || 0}`
+  }
+  if (summary.sprint_count != null) {
+    if (summary.sprint_count === 0) return 'отрезок 30 м не найден'
+    return `30 м найдено · шаги ${summary.step_count || 0} (L ${summary.left_count || 0} / R ${summary.right_count || 0}) · step ${formatMetric(summary.step_length_m, 2, ' м')} · stride ${formatMetric(summary.stride_length_m, 2, ' м')}`
+  }
+  if (summary.flight_count != null) {
+    return `прыжки ${summary.flight_count} · L ${summary.left_count || 0} · R ${summary.right_count || 0}`
+  }
+  return `контакты ${summary.contact_count || 0} · L ${summary.left_count || 0} · R ${summary.right_count || 0}`
+}
+
 function normaliseSpeedPrediction(data) {
   const modelPoints = Array.isArray(data?.speed_series)
     ? data.speed_series
@@ -621,10 +798,16 @@ export default function App() {
   const [showSpeedPredict, setShowSpeedPredict] = useState(false)
   const [showDistancePredict, setShowDistancePredict] = useState(false)
   const [extraCalculatorsOpen, setExtraCalculatorsOpen] = useState(false)
+  const [protocolDetectorsOpen, setProtocolDetectorsOpen] = useState(true)
   const [calculatorResults, setCalculatorResults] = useState({})
   const [activeCalculators, setActiveCalculators] = useState([])
   const [calculatorLoading, setCalculatorLoading] = useState('')
   const [selectedCalculatorContact, setSelectedCalculatorContact] = useState(null)
+  const [turnDetectionFeet, setTurnDetectionFeet] = useState({
+    'protocol-shuttle-detector': 'both',
+    'protocol-beep-detector': 'both',
+    'protocol-ttest-detector': 'both',
+  })
   const [weightKg, setWeightKg] = useState('70')
   const [checkHzData, setCheckHzData]   = useState(null)
   const [selectedCols, setSelectedCols] = useState([])
@@ -899,6 +1082,7 @@ export default function App() {
     setCalculatorLoading('')
     setSelectedCalculatorContact(null)
     setExtraCalculatorsOpen(false)
+    setProtocolDetectorsOpen(true)
     setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
@@ -921,7 +1105,7 @@ export default function App() {
       if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`)
 
       const result = await resp.json()
-      
+
       setSessionAdditionalInfo(result.additional_info || null)
       const initialMarkupFiles = result.additional_info?.markup_files || []
       setMarkupFiles(initialMarkupFiles)
@@ -1037,25 +1221,30 @@ export default function App() {
     const calculatorShapes = []
     const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
     activeCalculatorsRef.current.forEach(calculatorId => {
-      const style = EXTRA_CALCULATOR_BY_ID[calculatorId]
+      const style = CALCULATOR_BY_ID[calculatorId]
       const result = calculatorResultsRef.current[calculatorId]
       if (!style || !result?.contacts?.length) return
 
       result.contacts.forEach(contact => {
         if (contact.foot === 'left' && !showSensor1) return
         if (contact.foot === 'right' && !showSensor2) return
-        const shift = contact.foot === 'right' ? offsetS2Ref.current : offsetS1Ref.current
+        const eventStyle = calculatorEventStyle(style, contact)
+        const shift = contact.foot === 'right'
+          ? offsetS2Ref.current
+          : contact.foot === 'left'
+            ? offsetS1Ref.current
+            : 0
         const x0 = contact.start_time_s * timeScale + shift
         const x1 = contact.end_time_s * timeScale + shift
         if (!isFinite(x0) || !isFinite(x1) || x1 <= x0) return
         calculatorShapes.push({
           type: 'rect', x0, x1,
           y0: 0, y1: 1, yref: 'paper',
-          fillcolor: style.fill,
+          fillcolor: eventStyle.fill,
           line: {
-            color: style.color,
-            width: contact.kind === 'plateau' ? 2 : 1.25,
-            dash: contact.foot === 'right' ? 'dot' : 'dash',
+            color: eventStyle.color,
+            width: eventStyle.width,
+            dash: eventStyle.dash,
           },
           layer: 'below',
         })
@@ -1544,6 +1733,7 @@ export default function App() {
     setCalculatorLoading('')
     setSelectedCalculatorContact(null)
     setExtraCalculatorsOpen(false)
+    setProtocolDetectorsOpen(true)
     setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
@@ -1693,13 +1883,29 @@ export default function App() {
     }
   }, [showDistancePredict, ensurePredictSeries, columns, selectedCols])
 
-  const toggleAdditionalCalculator = useCallback(async (calculatorId) => {
-    if (activeCalculators.includes(calculatorId)) {
+  const toggleAdditionalCalculator = useCallback(async (calculatorId, options = {}) => {
+    const force = Boolean(options.force)
+    const requestedDetectionFoot = PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)
+      ? (options.detectionFoot || turnDetectionFeet[calculatorId] || 'both')
+      : 'both'
+
+    if (activeCalculators.includes(calculatorId) && !force) {
       setActiveCalculators(prev => prev.filter(id => id !== calculatorId))
       return
     }
 
-    if (calculatorResults[calculatorId]) {
+    const cachedResult = calculatorResults[calculatorId]
+    const cacheHasSprintSteps = calculatorId !== 'protocol-sprint-detector'
+      || cachedResult?.summary?.step_count != null
+    const isJumpDetector = ['jump-metrics', 'protocol-jumping-detector'].includes(calculatorId)
+    const cacheHasJumpHeights = !isJumpDetector
+      || cachedResult?.contacts?.every(contact => contact.jump_height_cm != null)
+    const cacheMatchesDetectionFoot = !PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)
+      || (cachedResult?.summary?.detection_foot || 'both') === requestedDetectionFoot
+    const cacheHasSeparateFootOverlay = !PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)
+      || requestedDetectionFoot !== 'both'
+      || (cachedResult?.summary?.left_turn_count != null && cachedResult?.summary?.right_turn_count != null)
+    if (!force && cachedResult && cacheHasSprintSteps && cacheHasJumpHeights && cacheMatchesDetectionFoot && cacheHasSeparateFootOverlay) {
       setActiveCalculators(prev => prev.includes(calculatorId) ? prev : [...prev, calculatorId])
       return
     }
@@ -1717,6 +1923,16 @@ export default function App() {
     try {
       const payload = { rows: colMapToRows(parquetData) }
       if (calculatorId === 'force-jump') payload.weight_kg = parsedWeight
+      if (PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)) {
+        const selectedSensorName = requestedDetectionFoot === 'both'
+          ? ''
+          : sensorNameForFoot(insoleSensorNames, requestedDetectionFoot)
+        if (requestedDetectionFoot !== 'both' && !selectedSensorName) {
+          throw new Error(`В данных нет ${requestedDetectionFoot === 'left' ? 'левой' : 'правой'} ноги`)
+        }
+        payload.detection_foot = requestedDetectionFoot
+        if (selectedSensorName) payload.sensor_name = selectedSensorName
+      }
       const resp = await fetch(`/calculator-api/calculate/${calculatorId}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'accept': 'application/json' },
@@ -1732,15 +1948,18 @@ export default function App() {
 
       setCalculatorResults(prev => ({ ...prev, [calculatorId]: data }))
       setActiveCalculators(prev => prev.includes(calculatorId) ? prev : [...prev, calculatorId])
+      setSelectedCalculatorContact(prev => prev?.calculatorId === calculatorId ? null : prev)
 
       const left = data.summary?.left?.contact_count || 0
       const right = data.summary?.right?.contact_count || 0
       const cadence = data.summary?.cadence_spm
-      const resultText = calculatorId === 'jump-metrics'
-        ? `${data.summary?.total_jump_count || 0} прыж. · высота ${formatMetric(data.summary?.mean_jump_height_cm, 1, ' см')}`
-        : calculatorId === 'force-jump'
-          ? `пик ${formatMetric(data.summary?.peak_force_n, 1, ' Н')} · ${formatMetric(data.summary?.peak_force_bw, 2, ' BW')}`
-          : `L ${left} · R ${right}${cadence != null ? ` · ${cadence.toFixed(0)} spm` : ''}`
+      const resultText = PROTOCOL_DETECTOR_BY_ID[calculatorId]
+        ? protocolDetectorSummary(data)
+        : calculatorId === 'jump-metrics'
+          ? `${data.summary?.total_jump_count || 0} прыж. · высота ${formatMetric(data.summary?.mean_jump_height_cm, 1, ' см')}`
+          : calculatorId === 'force-jump'
+            ? `пик ${formatMetric(data.summary?.peak_force_n, 1, ' Н')} · ${formatMetric(data.summary?.peak_force_bw, 2, ' BW')}`
+            : `L ${left} · R ${right}${cadence != null ? ` · ${cadence.toFixed(0)} spm` : ''}`
       setStatus({
         text: `✓ ${data.label}: ${resultText}`,
         type: 'ok',
@@ -1754,7 +1973,7 @@ export default function App() {
     } finally {
       if (dataVersion === calculatorDataVersionRef.current) setCalculatorLoading('')
     }
-  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg])
+  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg, turnDetectionFeet, insoleSensorNames])
 
   // ── Build Plotly chart ────────────────────────────────────────────────────
   const renderChart = useCallback(() => {
@@ -1845,6 +2064,7 @@ export default function App() {
           line: { color: PALETTE[(2 * i) % PALETTE.length], width: 1.5 },
           connectgaps: false,
           visible: showSensor1,
+          hovertemplate: TRACE_HOVER_TEMPLATE,
         })
         if (data2) {
           s2Idx.push(traces.length)
@@ -1857,6 +2077,7 @@ export default function App() {
             line: { color: PALETTE[(2 * i + 1) % PALETTE.length], width: 1.5 },
             connectgaps: false,
             visible: showSensor2,
+            hovertemplate: TRACE_HOVER_TEMPLATE,
           })
         }
       }
@@ -1875,6 +2096,7 @@ export default function App() {
             line: { color: ST_COL_COLORS[stCol] ?? ST_COLOR, width: stOnly ? 2 : 1.5, dash: stOnly ? 'solid' : 'dot' },
             connectgaps: false,
             visible: showSpeedTrackerRef.current,
+            hovertemplate: TRACE_HOVER_TEMPLATE,
           })
         }
       }
@@ -1893,6 +2115,7 @@ export default function App() {
           xaxis: xAxis, yaxis: yAxis,
           line: { color: PRED_COLOR, width: 2 },
           connectgaps: false,
+          hovertemplate: TRACE_HOVER_TEMPLATE,
         })
         const st = speedPredict.stat
         if (st && st.peak_speed != null && st.timestep_at_peak_speed != null) {
@@ -1903,6 +2126,7 @@ export default function App() {
             type: 'scatter', mode: 'markers',
             xaxis: xAxis, yaxis: yAxis,
             marker: { color: PRED_COLOR, size: 11, symbol: 'star', line: { color: '#fff', width: 1 } },
+            hovertemplate: TRACE_HOVER_TEMPLATE,
           })
         }
       }
@@ -1919,6 +2143,7 @@ export default function App() {
           xaxis: xAxis, yaxis: yAxis,
           line: { color: PRED_COLOR, width: 2 },
           connectgaps: false,
+          hovertemplate: TRACE_HOVER_TEMPLATE,
         })
         const st = speedPredict.stat
         if (st && st.distance_at_peak_speed != null && st.timestep_at_peak_speed != null) {
@@ -1929,49 +2154,11 @@ export default function App() {
             type: 'scatter', mode: 'markers',
             xaxis: xAxis, yaxis: yAxis,
             marker: { color: PRED_COLOR, size: 11, symbol: 'star', line: { color: '#fff', width: 1 } },
+            hovertemplate: TRACE_HOVER_TEMPLATE,
           })
         }
       }
 
-      // Plotly shapes do not emit click events. Add a nearly invisible,
-      // wide hit-line through every calculated contact so clicking a column
-      // reliably selects its metrics.
-      const clickableCalculatorIds = [...new Set(['step-cadence', ...activeCalculatorsRef.current])]
-      clickableCalculatorIds.forEach(calculatorId => {
-        const result = calculatorResultsRef.current[calculatorId]
-        if (!result?.contacts?.length) return
-        result.contacts.forEach((contact, contactIndex) => {
-          const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
-          const shift = contact.foot === 'right' ? offsetS2Ref.current : offsetS1Ref.current
-          const start = Number(contact.start_time_s) * timeScale + shift
-          const end = Number(contact.end_time_s) * timeScale + shift
-          if (!Number.isFinite(start) || !Number.isFinite(end)) return
-          const yRange = yRanges[col] || [-1, 1]
-          const customdata = [
-            [calculatorId, contactIndex],
-            [calculatorId, contactIndex],
-            [calculatorId, contactIndex],
-            [calculatorId, contactIndex],
-            [calculatorId, contactIndex],
-          ]
-          traces.push({
-            x: [start, start, end, end, start],
-            y: [yRange[0], yRange[1], yRange[1], yRange[0], yRange[0]],
-            customdata,
-            type: 'scatter',
-            mode: 'lines',
-            fill: 'toself',
-            xaxis: xAxis,
-            yaxis: yAxis,
-            line: { color: 'rgba(255,255,255,0.01)', width: 1 },
-            fillcolor: 'rgba(255,255,255,0.01)',
-            opacity: 0.01,
-            hoveron: 'fills',
-            hovertemplate: '<extra></extra>',
-            showlegend: false,
-          })
-        })
-      })
     })
     s1TraceIdxRef.current = s1Idx
     s2TraceIdxRef.current = s2Idx
@@ -1991,6 +2178,13 @@ export default function App() {
       paper_bgcolor: '#fff',
       showlegend: true,
       dragmode: 'pan',
+      hovermode: 'closest',
+      hoverlabel: {
+        bgcolor: '#ffffff',
+        bordercolor: '#94a3b8',
+        font: { color: '#111827', size: 12 },
+        namelength: -1,
+      },
       legend: { orientation: 'h', y: -0.06, font: { size: 11 } },
     }
 
@@ -2040,7 +2234,11 @@ export default function App() {
           const result = calculatorResultsRef.current[calculatorId]
           if (!result?.contacts?.length) return
           result.contacts.forEach((contact, index) => {
-            const shift = contact.foot === 'right' ? offsetS2Ref.current : offsetS1Ref.current
+            const shift = contact.foot === 'right'
+              ? offsetS2Ref.current
+              : contact.foot === 'left'
+                ? offsetS1Ref.current
+                : 0
             const start = Number(contact.start_time_s) * timeScale + shift
             const end = Number(contact.end_time_s) * timeScale + shift
             if (!Number.isFinite(start) || !Number.isFinite(end)) return
@@ -2070,17 +2268,6 @@ export default function App() {
       chartDivRef.current.on('plotly_click', (d) => {
         if (!d?.points?.length) return
         const t = d.points[0].x
-        const clickedMeta = d.points[0].customdata
-        if (Array.isArray(clickedMeta) && clickedMeta.length === 2) {
-          const [calculatorId, contactIndex] = clickedMeta
-          const result = calculatorResultsRef.current[calculatorId]
-          const contact = result?.contacts?.[contactIndex]
-          if (contact) {
-            setSelectedCalculatorContact({ calculatorId, index: contactIndex, contact })
-            return
-          }
-        }
-
         if (relabelStepRef.current === 'start') {
           const sm = selectedMarkupRef.current
           if (sm) {
@@ -2551,8 +2738,117 @@ export default function App() {
                         </div>
                           </div>
 
+                        <button
+                          type="button"
+                          className={`calculator-expand${protocolDetectorsOpen ? ' open' : ''}`}
+                          onClick={() => setProtocolDetectorsOpen(open => !open)}
+                          aria-expanded={protocolDetectorsOpen}
+                          aria-controls="protocol-detectors"
+                        >
+                          <span>
+                            Детекторы протоколов
+                            {activeCalculators.some(id => PROTOCOL_DETECTOR_BY_ID[id]) && (
+                              <span className="calculator-active-count">
+                                {activeCalculators.filter(id => PROTOCOL_DETECTOR_BY_ID[id]).length}
+                              </span>
+                            )}
+                          </span>
+                          <span className="calculator-expand-chevron">⌄</span>
+                        </button>
+
+                        {protocolDetectorsOpen && (
+                          <div id="protocol-detectors" className="calculator-options">
+                            {PROTOCOL_DETECTORS.map(detector => {
+                              const active = activeCalculators.includes(detector.id)
+                              const loading = calculatorLoading === detector.id
+                              const result = calculatorResults[detector.id]
+                              const eventLegend = calculatorEventLegend(detector, result)
+                              const supportsPerFootDetection = PER_FOOT_TURN_DETECTOR_IDS.has(detector.id)
+                              const selectedDetectionFoot = turnDetectionFeet[detector.id] || 'both'
+                              return (
+                                <div key={detector.id} className="calculator-option">
+                                  <button
+                                    type="button"
+                                    className={`btn-secondary btn-calculator${active ? ' active' : ''}`}
+                                    style={{ '--calculator-color': detector.color }}
+                                    disabled={!parquetData || !!calculatorLoading}
+                                    onClick={() => toggleAdditionalCalculator(detector.id)}
+                                    title={active
+                                      ? `Убрать события «${detector.label}» с графика`
+                                      : `Запустить «${detector.label}» на загруженных данных`}
+                                  >
+                                    <span className="calculator-dot" />
+                                    {loading ? 'Детектирую…' : active ? `Убрать ${detector.label}` : detector.label}
+                                  </button>
+                                  <span className="calculator-description">{detector.description}</span>
+                                  {supportsPerFootDetection && (
+                                    <div className="turn-foot-selector" role="radiogroup" aria-label={`Нога для детекции поворотов: ${detector.label}`}>
+                                      <span className="turn-foot-selector-label">Источник:</span>
+                                      {TURN_DETECTION_FOOT_OPTIONS.map(option => {
+                                        const sensorName = option.value === 'both'
+                                          ? ''
+                                          : sensorNameForFoot(insoleSensorNames, option.value)
+                                        const available = option.value === 'both' || Boolean(sensorName)
+                                        return (
+                                          <button
+                                            key={option.value}
+                                            type="button"
+                                            className={`turn-foot-choice${selectedDetectionFoot === option.value ? ' active' : ''}`}
+                                            role="radio"
+                                            aria-checked={selectedDetectionFoot === option.value}
+                                            disabled={!available || !!calculatorLoading}
+                                            title={available
+                                              ? `${option.title}${sensorName ? ` · ${sensorName}` : ''}`
+                                              : 'Сенсор этой ноги отсутствует в данных'}
+                                            onClick={() => {
+                                              if (selectedDetectionFoot === option.value) return
+                                              setTurnDetectionFeet(prev => ({ ...prev, [detector.id]: option.value }))
+                                              if (active) {
+                                                void toggleAdditionalCalculator(detector.id, {
+                                                  force: true,
+                                                  detectionFoot: option.value,
+                                                })
+                                              }
+                                            }}
+                                          >
+                                            {option.label}
+                                          </button>
+                                        )
+                                      })}
+                                    </div>
+                                  )}
+                                  {result?.model && (
+                                    <span className="calculator-model">
+                                      Детектор: {result.model}{result.model_file ? ` · ${result.model_file}` : ''}
+                                    </span>
+                                  )}
+                                  {result && (
+                                    <span className="calculator-summary" style={{ '--calculator-color': detector.color }}>
+                                      {protocolDetectorSummary(result)}
+                                    </span>
+                                  )}
+                                  {active && eventLegend.length > 0 && (
+                                    <div className="calculator-event-legend" aria-label="Легенда событий">
+                                      {eventLegend.map(item => (
+                                        <span
+                                          key={item.key}
+                                          className="calculator-event-key"
+                                          style={{ '--event-color': item.color, '--event-fill': item.fill }}
+                                        >
+                                          <span className="calculator-event-swatch" />
+                                          {item.label}
+                                        </span>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                              )
+                            })}
+                          </div>
+                        )}
+
                         <div className="calculator-model-note">
-                          ML-модели: <b>step_gc_model.pt</b>, <b>speed_cont_v5.pt</b>, <b>jump_cnn_lstm.pt</b> и <b>fz_bilateral.pt</b>
+                          ML-модели: <b>step_gc_model.pt</b>, <b>speed_cont_v5.pt</b>, <b>jump_bilstm.pt</b> и <b>fz_bilateral.pt</b>
                         </div>
 
                         <div className="calculator-weight-row">
@@ -2571,11 +2867,19 @@ export default function App() {
 
                         {selectedCalculatorContact && (() => {
                           const detail = selectedCalculatorContact.contact
-                          const calculator = EXTRA_CALCULATOR_BY_ID[selectedCalculatorContact.calculatorId]
-                          const foot = detail.foot === 'left' ? 'L' : 'R'
-                          const durationLabel = detail.kind === 'flight' ? 'Flight' : 'GCT'
+                          const calculator = CALCULATOR_BY_ID[selectedCalculatorContact.calculatorId]
+                          const detailStyle = calculatorEventStyle(calculator, detail)
+                          const foot = detail.foot === 'left' ? 'L' : detail.foot === 'right' ? 'R' : 'ALL'
+                          const durationLabel = {
+                            flight: 'Flight',
+                            contact: 'GCT',
+                            step: 'Контакт шага',
+                            turn: 'Поворот',
+                            run: 'Беговая фаза',
+                            sprint: 'Спринт',
+                          }[detail.kind] || 'Событие'
                           return (
-                            <div className="calculator-contact-detail" style={{ '--calculator-color': calculator?.color || '#2563eb' }}>
+                            <div className="calculator-contact-detail" style={{ '--calculator-color': detailStyle.color }}>
                               <div className="calculator-contact-head">
                                 <span>{calculator?.label || 'ML-контакт'} · {foot} · #{selectedCalculatorContact.index + 1}</span>
                                 <button
@@ -2592,6 +2896,16 @@ export default function App() {
                                 {detail.confidence != null && (
                                   <span>confidence {formatMetric(Number(detail.confidence) * 100, 0, '%')}</span>
                                 )}
+                                {detail.direction && <span>направление {detail.direction}</span>}
+                                {detail.angle_deg != null && <span>угол {formatMetric(detail.angle_deg, 0, '°')}</span>}
+                                {detail.jump_height_cm != null && (
+                                  <span><b>высота</b> {formatMetric(detail.jump_height_cm, 1, ' см')}</span>
+                                )}
+                                {detail.step_length_m != null && <span>step length {formatMetric(detail.step_length_m, 3, ' м')}</span>}
+                                {detail.stride_length_m != null && <span>stride length {formatMetric(detail.stride_length_m, 3, ' м')}</span>}
+                                {detail.distance_m != null && detail.kind === 'step' && (
+                                  <span>дистанция {formatMetric(detail.distance_m, 2, ' м')}</span>
+                                )}
                               </div>
                             </div>
                           )
@@ -2606,8 +2920,10 @@ export default function App() {
                         >
                           <span>
                             Другие калькуляторы
-                            {activeCalculators.length > 0 && (
-                              <span className="calculator-active-count">{activeCalculators.length}</span>
+                            {activeCalculators.some(id => EXTRA_CALCULATOR_BY_ID[id]) && (
+                              <span className="calculator-active-count">
+                                {activeCalculators.filter(id => EXTRA_CALCULATOR_BY_ID[id]).length}
+                              </span>
                             )}
                           </span>
                           <span className="calculator-expand-chevron">⌄</span>
@@ -2622,6 +2938,7 @@ export default function App() {
                               const summary = result?.summary
                               const leftCount = summary?.left?.contact_count || 0
                               const rightCount = summary?.right?.contact_count || 0
+                              const eventLegend = calculatorEventLegend(calculator, result)
                               return (
                                 <div key={calculator.id} className="calculator-option">
                                   <button
@@ -2681,6 +2998,20 @@ export default function App() {
                                             )}
                                           </>}
                                     </span>
+                                  )}
+                                  {active && eventLegend.length > 0 && (
+                                    <div className="calculator-event-legend" aria-label="Легенда событий">
+                                      {eventLegend.map(item => (
+                                        <span
+                                          key={item.key}
+                                          className="calculator-event-key"
+                                          style={{ '--event-color': item.color, '--event-fill': item.fill }}
+                                        >
+                                          <span className="calculator-event-swatch" />
+                                          {item.label}
+                                        </span>
+                                      ))}
+                                    </div>
                                   )}
                                 </div>
                               )
