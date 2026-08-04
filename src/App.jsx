@@ -669,6 +669,7 @@ export default function App() {
   const videoRef        = useRef(null)
   const videoWrapRef    = useRef(null)
   const chartDivRef     = useRef(null)
+  const chartNativeClickRef = useRef(null)
   const timelineRef     = useRef(null)
   const videoUrlRef     = useRef(null)
   const offsetS1Ref     = useRef(0)
@@ -2029,6 +2030,43 @@ export default function App() {
       plotInitRef.current = true
       setChartReady(true)
       updateOverlayShapes()
+
+      const findCalculatorContact = (x) => {
+        const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
+        const calculatorIds = [...new Set(['step-cadence', ...activeCalculatorsRef.current])]
+        const candidates = []
+
+        calculatorIds.forEach(calculatorId => {
+          const result = calculatorResultsRef.current[calculatorId]
+          if (!result?.contacts?.length) return
+          result.contacts.forEach((contact, index) => {
+            const shift = contact.foot === 'right' ? offsetS2Ref.current : offsetS1Ref.current
+            const start = Number(contact.start_time_s) * timeScale + shift
+            const end = Number(contact.end_time_s) * timeScale + shift
+            if (!Number.isFinite(start) || !Number.isFinite(end)) return
+            const x0 = Math.min(start, end)
+            const x1 = Math.max(start, end)
+            if (x >= x0 && x <= x1) {
+              candidates.push({ calculatorId, index, contact })
+            }
+          })
+        })
+
+        candidates.sort((a, b) => {
+          if (a.calculatorId === 'step-cadence' && b.calculatorId !== 'step-cadence') return -1
+          if (b.calculatorId === 'step-cadence' && a.calculatorId !== 'step-cadence') return 1
+          return Number(a.contact.duration_ms || 0) - Number(b.contact.duration_ms || 0)
+        })
+        return candidates[0] || null
+      }
+
+      const selectCalculatorContactAtX = (x) => {
+        const selectedContact = findCalculatorContact(Number(x))
+        if (!selectedContact) return false
+        setSelectedCalculatorContact(selectedContact)
+        return true
+      }
+
       chartDivRef.current.on('plotly_click', (d) => {
         if (!d?.points?.length) return
         const t = d.points[0].x
@@ -2041,34 +2079,6 @@ export default function App() {
             setSelectedCalculatorContact({ calculatorId, index: contactIndex, contact })
             return
           }
-        }
-        const findCalculatorContact = (x) => {
-          const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
-          const calculatorIds = [...new Set(['step-cadence', ...activeCalculatorsRef.current])]
-          const candidates = []
-
-          calculatorIds.forEach(calculatorId => {
-            const result = calculatorResultsRef.current[calculatorId]
-            if (!result?.contacts?.length) return
-            result.contacts.forEach((contact, index) => {
-              const shift = contact.foot === 'right' ? offsetS2Ref.current : offsetS1Ref.current
-              const start = Number(contact.start_time_s) * timeScale + shift
-              const end = Number(contact.end_time_s) * timeScale + shift
-              if (!Number.isFinite(start) || !Number.isFinite(end)) return
-              const x0 = Math.min(start, end)
-              const x1 = Math.max(start, end)
-              if (x >= x0 && x <= x1) {
-                candidates.push({ calculatorId, index, contact })
-              }
-            })
-          })
-
-          candidates.sort((a, b) => {
-            if (a.calculatorId === 'step-cadence' && b.calculatorId !== 'step-cadence') return -1
-            if (b.calculatorId === 'step-cadence' && a.calculatorId !== 'step-cadence') return 1
-            return Number(a.contact.duration_ms || 0) - Number(b.contact.duration_ms || 0)
-          })
-          return candidates[0] || null
         }
 
         if (relabelStepRef.current === 'start') {
@@ -2097,15 +2107,40 @@ export default function App() {
           if (currentFootRef.current === 'left') setLeftContacts(p => [...p, t])
           else setRightContacts(p => [...p, t])
         } else {
-          const selectedContact = findCalculatorContact(t)
-          if (selectedContact) {
-            setSelectedCalculatorContact(selectedContact)
-          } else if (videoRef.current) {
+          if (!selectCalculatorContactAtX(t) && videoRef.current) {
             const scale = timeUnitRef.current === 'ms' ? 1000 : 1
             videoRef.current.currentTime = Math.max(0, t / scale)
           }
         }
       })
+
+      if (chartNativeClickRef.current) {
+        chartDivRef.current.removeEventListener('click', chartNativeClickRef.current, true)
+      }
+      const nativeChartClick = (event) => {
+        if (event.target?.closest?.('.modebar')) return
+        if (relabelStepRef.current || labelingRef.current) return
+
+        const xAxis = chartDivRef.current?._fullLayout?.xaxis
+        const rect = chartDivRef.current?.getBoundingClientRect()
+        const axisOffset = Number(xAxis?._offset)
+        const axisLength = Number(xAxis?._length)
+        const range = xAxis?.range
+        if (!rect || !xAxis || !Number.isFinite(axisOffset) || !Number.isFinite(axisLength) || axisLength <= 0 || !Array.isArray(range) || range.length < 2) return
+
+        const axisPixel = event.clientX - rect.left - axisOffset
+        if (axisPixel < 0 || axisPixel > axisLength) return
+
+        const x = typeof xAxis.p2l === 'function'
+          ? xAxis.p2l(axisPixel)
+          : Number(range[0]) + (axisPixel / axisLength) * (Number(range[1]) - Number(range[0]))
+        if (selectCalculatorContactAtX(x)) {
+          event.preventDefault()
+          event.stopPropagation()
+        }
+      }
+      chartNativeClickRef.current = nativeChartClick
+      chartDivRef.current.addEventListener('click', nativeChartClick, true)
 
       chartDivRef.current.on('plotly_relayout', (eventData) => {
         if (eventData['xaxis.range[0]'] !== undefined && eventData['xaxis.range[1]'] !== undefined) {
@@ -2177,6 +2212,9 @@ export default function App() {
   // ── Cleanup ───────────────────────────────────────────────────────────────
   useEffect(() => () => {
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current)
+    if (chartDivRef.current && chartNativeClickRef.current) {
+      chartDivRef.current.removeEventListener('click', chartNativeClickRef.current, true)
+    }
     if (chartDivRef.current) Plotly.purge(chartDivRef.current)
   }, [])
 
