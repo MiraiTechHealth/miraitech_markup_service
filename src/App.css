@@ -720,6 +720,45 @@ body { background: var(--bg); overflow: hidden }
   line-height: 1.2;
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
+.calculator-contact-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 2px 0 4px;
+  padding: 6px 7px;
+  border: 1px solid color-mix(in srgb, var(--calculator-color) 45%, #dbe3ec);
+  border-left: 3px solid var(--calculator-color);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--calculator-color) 7%, white);
+  color: var(--text2);
+  font-size: 9px;
+  line-height: 1.3;
+}
+.calculator-contact-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: var(--calculator-color);
+  font-weight: 750;
+}
+.calculator-contact-close {
+  border: 0;
+  padding: 0 2px;
+  background: transparent;
+  color: var(--text2);
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+}
+.calculator-contact-close:hover { color: var(--text); }
+.calculator-contact-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 8px;
+  font-variant-numeric: tabular-nums;
+}
+.calculator-contact-metrics b { color: var(--text); }
 .calculator-summary {
   color: var(--calculator-color);
   font-size: 9.5px;

@@ -624,6 +624,7 @@ export default function App() {
   const [calculatorResults, setCalculatorResults] = useState({})
   const [activeCalculators, setActiveCalculators] = useState([])
   const [calculatorLoading, setCalculatorLoading] = useState('')
+  const [selectedCalculatorContact, setSelectedCalculatorContact] = useState(null)
   const [weightKg, setWeightKg] = useState('70')
   const [checkHzData, setCheckHzData]   = useState(null)
   const [selectedCols, setSelectedCols] = useState([])
@@ -895,6 +896,7 @@ export default function App() {
     setCalculatorResults({})
     setActiveCalculators([])
     setCalculatorLoading('')
+    setSelectedCalculatorContact(null)
     setExtraCalculatorsOpen(false)
     setOffsetST(0)
     setShowGaps(false)
@@ -1539,6 +1541,7 @@ export default function App() {
     setCalculatorResults({})
     setActiveCalculators([])
     setCalculatorLoading('')
+    setSelectedCalculatorContact(null)
     setExtraCalculatorsOpen(false)
     setOffsetST(0)
     setShowGaps(false)
@@ -1989,6 +1992,34 @@ export default function App() {
       chartDivRef.current.on('plotly_click', (d) => {
         if (!d?.points?.length) return
         const t = d.points[0].x
+        const findCalculatorContact = (x) => {
+          const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
+          const calculatorIds = [...new Set(['step-cadence', ...activeCalculatorsRef.current])]
+          const candidates = []
+
+          calculatorIds.forEach(calculatorId => {
+            const result = calculatorResultsRef.current[calculatorId]
+            if (!result?.contacts?.length) return
+            result.contacts.forEach((contact, index) => {
+              const shift = contact.foot === 'right' ? offsetS2Ref.current : offsetS1Ref.current
+              const start = Number(contact.start_time_s) * timeScale + shift
+              const end = Number(contact.end_time_s) * timeScale + shift
+              if (!Number.isFinite(start) || !Number.isFinite(end)) return
+              const x0 = Math.min(start, end)
+              const x1 = Math.max(start, end)
+              if (x >= x0 && x <= x1) {
+                candidates.push({ calculatorId, index, contact })
+              }
+            })
+          })
+
+          candidates.sort((a, b) => {
+            if (a.calculatorId === 'step-cadence' && b.calculatorId !== 'step-cadence') return -1
+            if (b.calculatorId === 'step-cadence' && a.calculatorId !== 'step-cadence') return 1
+            return Number(a.contact.duration_ms || 0) - Number(b.contact.duration_ms || 0)
+          })
+          return candidates[0] || null
+        }
 
         if (relabelStepRef.current === 'start') {
           const sm = selectedMarkupRef.current
@@ -2015,9 +2046,14 @@ export default function App() {
         } else if (labelingRef.current) {
           if (currentFootRef.current === 'left') setLeftContacts(p => [...p, t])
           else setRightContacts(p => [...p, t])
-        } else if (videoRef.current) {
-          const scale = timeUnitRef.current === 'ms' ? 1000 : 1
-          videoRef.current.currentTime = Math.max(0, t / scale)
+        } else {
+          const selectedContact = findCalculatorContact(t)
+          if (selectedContact) {
+            setSelectedCalculatorContact(selectedContact)
+          } else if (videoRef.current) {
+            const scale = timeUnitRef.current === 'ms' ? 1000 : 1
+            videoRef.current.currentTime = Math.max(0, t / scale)
+          }
         }
       })
 
@@ -2445,6 +2481,34 @@ export default function App() {
                           <span>нужен для Bilateral GRF</span>
                         </div>
 
+                        {selectedCalculatorContact && (() => {
+                          const detail = selectedCalculatorContact.contact
+                          const calculator = EXTRA_CALCULATOR_BY_ID[selectedCalculatorContact.calculatorId]
+                          const foot = detail.foot === 'left' ? 'L' : 'R'
+                          const durationLabel = detail.kind === 'flight' ? 'Flight' : 'GCT'
+                          return (
+                            <div className="calculator-contact-detail" style={{ '--calculator-color': calculator?.color || '#2563eb' }}>
+                              <div className="calculator-contact-head">
+                                <span>{calculator?.label || 'ML-контакт'} · {foot} · #{selectedCalculatorContact.index + 1}</span>
+                                <button
+                                  type="button"
+                                  className="calculator-contact-close"
+                                  onClick={() => setSelectedCalculatorContact(null)}
+                                  aria-label="Закрыть показатели контакта"
+                                >×</button>
+                              </div>
+                              <div className="calculator-contact-metrics">
+                                <span><b>{durationLabel}</b> {formatMetric(detail.duration_ms, 0, ' ms')}</span>
+                                <span>начало {formatMetric(detail.start_time_s, 3, ' s')}</span>
+                                <span>конец {formatMetric(detail.end_time_s, 3, ' s')}</span>
+                                {detail.confidence != null && (
+                                  <span>confidence {formatMetric(Number(detail.confidence) * 100, 0, '%')}</span>
+                                )}
+                              </div>
+                            </div>
+                          )
+                        })()}
+
                         <button
                           type="button"
                           className={`calculator-expand${extraCalculatorsOpen ? ' open' : ''}`}
@@ -2515,18 +2579,15 @@ export default function App() {
                                               step L {formatMetric(summary?.left?.mean_step_interval_s, 3, ' s')}
                                               {' · '}
                                               step R {formatMetric(summary?.right?.mean_step_interval_s, 3, ' s')}
-                                              {summary?.symmetry_index != null
-                                                && ` · сим ${(summary.symmetry_index * 100).toFixed(0)}%`}
                                             </span>
-                                            {(summary?.gait_pattern || summary?.left?.mean_confidence != null || summary?.right?.mean_confidence != null) && (
+                                            {(summary?.left?.mean_confidence != null || summary?.right?.mean_confidence != null) && (
                                               <>
                                                 <br />
                                                 <span>
-                                                  {summary?.gait_pattern && `паттерн ${summary.gait_pattern}`}
                                                   {summary?.left?.mean_confidence != null
-                                                    && ` · conf L ${(summary.left.mean_confidence * 100).toFixed(0)}%`}
+                                                    && `conf L ${(summary.left.mean_confidence * 100).toFixed(0)}%`}
                                                   {summary?.right?.mean_confidence != null
-                                                    && ` · R ${(summary.right.mean_confidence * 100).toFixed(0)}%`}
+                                                    && ` · conf R ${(summary.right.mean_confidence * 100).toFixed(0)}%`}
                                                 </span>
                                               </>
                                             )}
