@@ -2497,10 +2497,40 @@ export default function App() {
                                         ? `${summary?.total_jump_count || 0} прыж. · высота ${formatMetric(summary?.mean_jump_height_cm, 1, ' см')} · flight ${formatMetric(summary?.left_mean_flight_time_ms, 0, ' мс')}`
                                         : calculator.id === 'force-jump'
                                           ? `пик ${formatMetric(summary?.peak_force_n, 1, ' Н')} · ${formatMetric(summary?.peak_force_bw, 2, ' BW')}`
-                                          : <>L {leftCount} · R {rightCount}
-                                            {summary?.cadence_spm != null && ` · ${summary.cadence_spm.toFixed(0)} spm`}
-                                            {summary?.left?.mean_contact_duration_s != null
-                                              && ` · GCT L ${(summary.left.mean_contact_duration_s * 1000).toFixed(0)} ms`}</>}
+                                          : <>
+                                            <span>
+                                              L {leftCount} · R {rightCount}
+                                              {summary?.cadence_spm != null && ` · ${summary.cadence_spm.toFixed(0)} spm`}
+                                            </span>
+                                            <br />
+                                            <span>
+                                              GCT L {formatMetric(summary?.left?.mean_contact_duration_s != null
+                                                ? summary.left.mean_contact_duration_s * 1000 : null, 0, ' ms')}
+                                              {' · '}
+                                              GCT R {formatMetric(summary?.right?.mean_contact_duration_s != null
+                                                ? summary.right.mean_contact_duration_s * 1000 : null, 0, ' ms')}
+                                            </span>
+                                            <br />
+                                            <span>
+                                              step L {formatMetric(summary?.left?.mean_step_interval_s, 3, ' s')}
+                                              {' · '}
+                                              step R {formatMetric(summary?.right?.mean_step_interval_s, 3, ' s')}
+                                              {summary?.symmetry_index != null
+                                                && ` · сим ${(summary.symmetry_index * 100).toFixed(0)}%`}
+                                            </span>
+                                            {(summary?.gait_pattern || summary?.left?.mean_confidence != null || summary?.right?.mean_confidence != null) && (
+                                              <>
+                                                <br />
+                                                <span>
+                                                  {summary?.gait_pattern && `паттерн ${summary.gait_pattern}`}
+                                                  {summary?.left?.mean_confidence != null
+                                                    && ` · conf L ${(summary.left.mean_confidence * 100).toFixed(0)}%`}
+                                                  {summary?.right?.mean_confidence != null
+                                                    && ` · R ${(summary.right.mean_confidence * 100).toFixed(0)}%`}
+                                                </span>
+                                              </>
+                                            )}
+                                          </>}
                                     </span>
                                   )}
                                 </div>

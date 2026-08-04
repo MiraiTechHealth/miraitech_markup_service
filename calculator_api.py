@@ -57,7 +57,13 @@ def _mean_or_none(values: Iterable[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
-def _foot_summary(stats: Any) -> Dict[str, Any]:
+def _foot_summary(stats: Any, events: Iterable[Dict[str, Any]] = ()) -> Dict[str, Any]:
+    events = list(events)
+    confidences = [
+        float(event["confidence"])
+        for event in events
+        if event.get("confidence") is not None
+    ]
     return {
         "contact_count": int(stats.n_zero_runs),
         "mean_step_interval_s": (
@@ -68,6 +74,7 @@ def _foot_summary(stats: Any) -> Dict[str, Any]:
             if stats.mean_contact_duration_s > 0
             else None
         ),
+        "mean_confidence": _mean_or_none(confidences),
     }
 
 
@@ -113,10 +120,13 @@ def _cadence_result(calculator_id: str, rows: List[Dict[str, Any]]) -> Dict[str,
         calculator = StepCadenceCalculator()
 
     result = calculator.calculate(rows)
+    events_by_sensor = {
+        sensor: calculator._viz_data.get(sensor, {}).get("contact_events", [])
+        for sensor in SENSOR_TO_FOOT
+    }
     contacts = []
     for sensor, foot in SENSOR_TO_FOOT.items():
-        events = calculator._viz_data.get(sensor, {}).get("contact_events", [])
-        for event in events:
+        for event in events_by_sensor[sensor]:
             start_s = float(event["timestep_s"])
             duration_s = float(event["contact_time_s"])
             contacts.append(
@@ -147,8 +157,8 @@ def _cadence_result(calculator_id: str, rows: List[Dict[str, Any]]) -> Dict[str,
             "symmetry_index": float(result.symmetry_index),
             "gait_pattern": result.gait_pattern,
             "is_valid": bool(result.is_valid),
-            "left": _foot_summary(result.left),
-            "right": _foot_summary(result.right),
+            "left": _foot_summary(result.left, events_by_sensor["ESP32_Sensor_1"]),
+            "right": _foot_summary(result.right, events_by_sensor["ESP32_Sensor_2"]),
         },
     }
 
