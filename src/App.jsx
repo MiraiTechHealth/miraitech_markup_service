@@ -49,7 +49,7 @@ const ST_COL_COLORS = {
   Distance: '#9467bd',    // purple
   DistanceM: '#9467bd',
 }
-// Speed/Distance-predict overlays (charts/sprint-speed): drawn on top of their
+// Speed/Distance-predict overlays (charts/sprint): drawn on top of their
 // respective subplots. Both read from the same fetched series.
 const SPEED_PRED_COLS = new Set(['Speed', 'VelocityMs'])
 const DISTANCE_PRED_COLS = new Set(['Distance', 'DistanceM'])
@@ -401,6 +401,59 @@ function formatDuration(d, unit) {
 function formatMetric(value, digits = 2, suffix = '') {
   if (value == null || !Number.isFinite(Number(value))) return '—'
   return `${Number(value).toFixed(digits)}${suffix}`
+}
+
+function normaliseSpeedPrediction(data) {
+  const modelPoints = Array.isArray(data?.speed_series)
+    ? data.speed_series
+      .map(point => ({
+        // Charts API returns CausalSpeedTCN timestamps in milliseconds.
+        time: Number(point.time) / 1000,
+        speed: Number(point.speed),
+        distance: Number(point.distance),
+      }))
+      .filter(point => Number.isFinite(point.time) && Number.isFinite(point.speed) && Number.isFinite(point.distance))
+    : []
+
+  const trackerPoints = Array.isArray(data?.speed?.data_points)
+    ? data.speed.data_points
+      .map(point => ({
+        time: Number(point.time),
+        speed: Number(point.speed),
+        distance: Number(point.distance),
+      }))
+      .filter(point => Number.isFinite(point.time) && Number.isFinite(point.speed) && Number.isFinite(point.distance))
+    : []
+
+  const dataPoints = modelPoints.length > 0 ? modelPoints : trackerPoints
+  if (!modelPoints.length) {
+    return {
+      ...data,
+      data_points: dataPoints,
+      stat: data?.speed?.stat || null,
+      model: 'SpeedTracker',
+    }
+  }
+
+  const peak = dataPoints.reduce((best, point) => point.speed > best.speed ? point : best, dataPoints[0])
+  const start = dataPoints.find(point => point.speed > 0 && point.distance > 0) || dataPoints[0]
+  const finish = dataPoints.find(point => point.distance >= 30)
+  const duration = finish && finish.time > start.time ? finish.time - start.time : null
+
+  return {
+    ...data,
+    data_points: dataPoints,
+    stat: {
+      timestep_at_peak_speed: peak.time,
+      distance_at_peak_speed: peak.distance,
+      peak_speed: peak.speed,
+      start_time: start.time,
+      end_time: finish?.time ?? null,
+      average_speed: duration ? 30 / duration : null,
+      duration,
+    },
+    model: 'CausalSpeedTCN ensemble',
+  }
 }
 
 function buildCursorShapes(x, n) {
@@ -1561,7 +1614,7 @@ export default function App() {
     })
   }, [loadVideo, loadParquetFile, importLabeledCsv])
 
-  // ── Speed/Distance predict (charts/sprint-speed) ─────────────────────────
+  // ── Speed/Distance predict (charts/sprint) ────────────────────────────────
   // Both overlays read the same fetched series (it carries speed AND
   // distance per point) — whichever button is clicked first fetches, the
   // other reuses the cached result. Visibility is toggled independently.
@@ -1573,7 +1626,7 @@ export default function App() {
 
     setPredictLoading(true)
     try {
-      const resp = await fetch(`${API_BASE}/api/sessions/${sid}/charts/sprint-speed`, {
+      const resp = await fetch(`${API_BASE}/api/sessions/${sid}/charts/sprint`, {
         headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
       })
       if (resp.status === 401) {
@@ -1585,9 +1638,9 @@ export default function App() {
         const errData = await resp.json().catch(() => ({}))
         throw new Error(parseApiError(errData, resp.status))
       }
-      const data = await resp.json()
-      if (!data?.data_points?.length) {
-        throw new Error('В charts/sprint-speed нет точек для этой сессии')
+      const data = normaliseSpeedPrediction(await resp.json())
+      if (!data.data_points.length) {
+        throw new Error('В charts/sprint нет точек скорости для этой сессии')
       }
       setSpeedPredict(data)
       return data
@@ -1822,7 +1875,7 @@ export default function App() {
         }
       }
 
-      // Speed-predict overlay (charts/sprint-speed) on top of the speed subplot.
+      // Speed-predict overlay (charts/sprint) on top of the speed subplot.
       // Backend time is seconds (raw device Time / 1000); the ST trace here plots
       // rawTime + offsetST, so rawTime = point.time * 1000 realigns the two.
       if (SPEED_PRED_COLS.has(col) && showSpeedPredict && speedPredict?.data_points?.length) {
@@ -2292,10 +2345,10 @@ export default function App() {
                             onClick={fetchSpeedPredict}
                             disabled={predictLoading || !sessionId.trim()}
                             title={!sessionId.trim()
-                              ? 'Укажите ID сессии — прогноз берётся по сессии (charts/sprint-speed)'
+                              ? 'Укажите ID сессии — прогноз берётся по сессии (charts/sprint)'
                               : showSpeedPredict
                                 ? 'Убрать прогноз скорости с графика'
-                                : `Загрузить charts/sprint-speed${hasSpeedTracker ? ' и наложить поверх колонки Speed' : ' для этой сессии'}`}
+                                : `Загрузить charts/sprint${hasSpeedTracker ? ' и наложить поверх колонки Speed' : ' для этой сессии'}`}
                           >
                             {predictLoading
                               ? '⏳ Загрузка…'
@@ -2341,10 +2394,10 @@ export default function App() {
                             onClick={fetchDistancePredict}
                             disabled={predictLoading || !sessionId.trim()}
                             title={!sessionId.trim()
-                              ? 'Укажите ID сессии — прогноз берётся по сессии (charts/sprint-speed)'
+                              ? 'Укажите ID сессии — прогноз берётся по сессии (charts/sprint)'
                               : showDistancePredict
                                 ? 'Убрать прогноз дистанции с графика'
-                                : `Загрузить charts/sprint-speed${hasSpeedTracker ? ' и наложить поверх колонки Distance' : ' для этой сессии'}`}
+                                : `Загрузить charts/sprint${hasSpeedTracker ? ' и наложить поверх колонки Distance' : ' для этой сессии'}`}
                           >
                             {predictLoading
                               ? '⏳ Загрузка…'
