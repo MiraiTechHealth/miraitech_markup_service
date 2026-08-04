@@ -2283,10 +2283,9 @@ export default function App() {
                     {(hasSpeedTracker || insoleSensorNames.length > 0) && (
                       <div className="calculator-panel">
                         <span className="sidebar-block-lbl">Калькуляторы</span>
-                        {hasSpeedTracker && (
-                          <div className="sidebar-block-row calculator-primary-row">
+                        <div className="sidebar-block-row calculator-primary-row">
                         <div className="sidebar-block">
-                          <span className="sidebar-block-lbl">Прогноз скорости · CausalSpeedTCN</span>
+                          <span className="sidebar-block-lbl">Прогноз скорости · CausalSpeedTCN ensemble</span>
                           <button
                             type="button"
                             className={`btn-secondary btn-speed-predict${showSpeedPredict ? ' active' : ''}`}
@@ -2296,7 +2295,7 @@ export default function App() {
                               ? 'Укажите ID сессии — прогноз берётся по сессии (charts/sprint-speed)'
                               : showSpeedPredict
                                 ? 'Убрать прогноз скорости с графика'
-                                : 'Загрузить charts/sprint-speed и наложить поверх колонки Speed'}
+                                : `Загрузить charts/sprint-speed${hasSpeedTracker ? ' и наложить поверх колонки Speed' : ' для этой сессии'}`}
                           >
                             {predictLoading
                               ? '⏳ Загрузка…'
@@ -2335,7 +2334,7 @@ export default function App() {
                         </div>
 
                         <div className="sidebar-block">
-                          <span className="sidebar-block-lbl">Дистанция · CausalSpeedTCN</span>
+                          <span className="sidebar-block-lbl">Дистанция · CausalSpeedTCN ensemble</span>
                           <button
                             type="button"
                             className={`btn-secondary btn-distance-predict${showDistancePredict ? ' active' : ''}`}
@@ -2345,7 +2344,7 @@ export default function App() {
                               ? 'Укажите ID сессии — прогноз берётся по сессии (charts/sprint-speed)'
                               : showDistancePredict
                                 ? 'Убрать прогноз дистанции с графика'
-                                : 'Загрузить charts/sprint-speed и наложить поверх колонки Distance'}
+                                : `Загрузить charts/sprint-speed${hasSpeedTracker ? ' и наложить поверх колонки Distance' : ' для этой сессии'}`}
                           >
                             {predictLoading
                               ? '⏳ Загрузка…'
@@ -2374,7 +2373,6 @@ export default function App() {
                           )}
                         </div>
                           </div>
-                        )}
 
                         <div className="calculator-model-note">
                           ML-модели: <b>step_gc_model.pt</b>, <b>speed_cont_v5.pt</b>, <b>jump_cnn_lstm.pt</b> и <b>fz_bilateral.pt</b>
