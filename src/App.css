@@ -688,6 +688,11 @@ body { background: var(--bg); overflow: hidden }
   gap: 7px;
   padding-top: 1px;
 }
+.calculator-option-featured {
+  border-color: color-mix(in srgb, var(--calculator-color) 38%, var(--border));
+  border-left: 3px solid var(--calculator-color);
+  background: color-mix(in srgb, var(--calculator-color) 4%, white);
+}
 .calculator-option {
   display: flex;
   flex-direction: column;
