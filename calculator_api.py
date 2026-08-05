@@ -22,6 +22,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from jump_bilstm_runtime import MarkupJumpBiLSTMCalculator  # noqa: E402
+from step_detector_ttest_runtime import StepDetectorTTest  # noqa: E402
 
 
 app = FastAPI(title="MiraiTech Markup Calculators")
@@ -200,8 +201,6 @@ def _cadence_result(calculator_id: str, rows: List[Dict[str, Any]]) -> Dict[str,
 
 
 def _ttest_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    from app.services.calculators.step_detector_ttest import StepDetectorTTest
-
     steps = StepDetectorTTest().calculate(pd.DataFrame(rows))
     contacts = [
         {
