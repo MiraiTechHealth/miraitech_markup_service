@@ -58,8 +58,8 @@ const TRACE_HOVER_TEMPLATE = '<b>%{fullData.name}</b><br>Время: %{x}<br>З�
 const EXTRA_CALCULATORS = [
   {
     id: 'step-detector-ttest',
-    label: 'Step Detector T-Test',
-    description: 'Контакты по давлению Sensor 1 + Sensor 2',
+    label: 'T-тест · Step detector',
+    description: 'Детектирует шаги левой и правой ноги по давлению Sensor 1 + Sensor 2',
     color: '#7c3aed',
     fill: 'rgba(124,58,237,0.10)',
   },
@@ -92,6 +92,13 @@ const EXTRA_CALCULATORS = [
     fill: 'rgba(220,38,38,0.10)',
   },
 ]
+const FEATURED_EXTRA_CALCULATOR_IDS = new Set(['step-detector-ttest'])
+const FEATURED_EXTRA_CALCULATORS = EXTRA_CALCULATORS.filter(
+  calculator => FEATURED_EXTRA_CALCULATOR_IDS.has(calculator.id),
+)
+const COLLAPSIBLE_EXTRA_CALCULATORS = EXTRA_CALCULATORS.filter(
+  calculator => !FEATURED_EXTRA_CALCULATOR_IDS.has(calculator.id),
+)
 const PROTOCOL_DETECTORS = [
   {
     id: 'protocol-walking-detector',
@@ -2847,6 +2854,78 @@ export default function App() {
                           </div>
                         )}
 
+                        <div className="calculator-options calculator-featured-options">
+                          {FEATURED_EXTRA_CALCULATORS.map(calculator => {
+                            const active = activeCalculators.includes(calculator.id)
+                            const loading = calculatorLoading === calculator.id
+                            const result = calculatorResults[calculator.id]
+                            const summary = result?.summary
+                            const leftCount = summary?.left?.contact_count || 0
+                            const rightCount = summary?.right?.contact_count || 0
+                            const eventLegend = calculatorEventLegend(calculator, result)
+                            return (
+                              <div
+                                key={calculator.id}
+                                className="calculator-option calculator-option-featured"
+                                style={{ '--calculator-color': calculator.color }}
+                              >
+                                <button
+                                  type="button"
+                                  className={`btn-secondary btn-calculator${active ? ' active' : ''}`}
+                                  style={{ '--calculator-color': calculator.color }}
+                                  disabled={!parquetData || !!calculatorLoading}
+                                  onClick={() => toggleAdditionalCalculator(calculator.id)}
+                                  title={active
+                                    ? `Убрать ${calculator.label} с графика`
+                                    : `Запустить ${calculator.label} для загруженных данных`}
+                                >
+                                  <span className="calculator-dot" />
+                                  {loading ? 'Детектирую…' : active ? `Убрать ${calculator.label}` : calculator.label}
+                                </button>
+                                <span className="calculator-description">{calculator.description}</span>
+                                {result?.model && (
+                                  <span className="calculator-model">
+                                    Детектор: {result.model}{result.model_file ? ` · ${result.model_file}` : ''}
+                                  </span>
+                                )}
+                                {result && (
+                                  <span className="calculator-summary" style={{ '--calculator-color': calculator.color }}>
+                                    <span>L {leftCount} · R {rightCount}</span>
+                                    <br />
+                                    <span>
+                                      GCT L {formatMetric(summary?.left?.mean_contact_duration_s != null
+                                        ? summary.left.mean_contact_duration_s * 1000 : null, 0, ' ms')}
+                                      {' · '}
+                                      GCT R {formatMetric(summary?.right?.mean_contact_duration_s != null
+                                        ? summary.right.mean_contact_duration_s * 1000 : null, 0, ' ms')}
+                                    </span>
+                                    <br />
+                                    <span>
+                                      step L {formatMetric(summary?.left?.mean_step_interval_s, 3, ' s')}
+                                      {' · '}
+                                      step R {formatMetric(summary?.right?.mean_step_interval_s, 3, ' s')}
+                                    </span>
+                                  </span>
+                                )}
+                                {active && eventLegend.length > 0 && (
+                                  <div className="calculator-event-legend" aria-label="Легенда шагов T-теста">
+                                    {eventLegend.map(item => (
+                                      <span
+                                        key={item.key}
+                                        className="calculator-event-key"
+                                        style={{ '--event-color': item.color, '--event-fill': item.fill }}
+                                      >
+                                        <span className="calculator-event-swatch" />
+                                        {item.label}
+                                      </span>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+
                         <div className="calculator-model-note">
                           ML-модели: <b>step_gc_model.pt</b>, <b>speed_cont_v5.pt</b>, <b>jump_bilstm.pt</b> и <b>fz_bilateral.pt</b>
                         </div>
@@ -2920,9 +2999,9 @@ export default function App() {
                         >
                           <span>
                             Другие калькуляторы
-                            {activeCalculators.some(id => EXTRA_CALCULATOR_BY_ID[id]) && (
+                            {activeCalculators.some(id => COLLAPSIBLE_EXTRA_CALCULATORS.some(calculator => calculator.id === id)) && (
                               <span className="calculator-active-count">
-                                {activeCalculators.filter(id => EXTRA_CALCULATOR_BY_ID[id]).length}
+                                {activeCalculators.filter(id => COLLAPSIBLE_EXTRA_CALCULATORS.some(calculator => calculator.id === id)).length}
                               </span>
                             )}
                           </span>
@@ -2931,7 +3010,7 @@ export default function App() {
 
                         {extraCalculatorsOpen && (
                           <div id="extra-calculators" className="calculator-options">
-                            {EXTRA_CALCULATORS.map(calculator => {
+                            {COLLAPSIBLE_EXTRA_CALCULATORS.map(calculator => {
                               const active = activeCalculators.includes(calculator.id)
                               const loading = calculatorLoading === calculator.id
                               const result = calculatorResults[calculator.id]
