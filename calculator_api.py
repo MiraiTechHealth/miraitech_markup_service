@@ -8,6 +8,7 @@ not add or change any backend API routes.
 from __future__ import annotations
 
 import asyncio
+import os
 from statistics import median
 import sys
 from pathlib import Path
@@ -17,7 +18,10 @@ import pandas as pd
 from fastapi import Body, FastAPI, HTTPException
 
 
-BACKEND_ROOT = Path(__file__).resolve().parent.parent / "MiraiTech-backend"
+DEFAULT_BACKEND_ROOT = Path(__file__).resolve().parent.parent / "MiraiTech-backend"
+BACKEND_ROOT = Path(
+    os.environ.get("MIRAITECH_BACKEND_ROOT", str(DEFAULT_BACKEND_ROOT))
+).expanduser().resolve()
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
