@@ -2107,7 +2107,7 @@ export default function App() {
 
     setPredictLoading(true)
     try {
-      const resp = await fetch(`${API_BASE}/api/sessions/${sid}/charts/sprint`, {
+      const resp = await fetch(`${MARKUP_API}/sessions/${sid}/charts/sprint`, {
         headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
       })
       if (resp.status === 401) {
