@@ -9,6 +9,7 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? (
 )
 const CALCULATOR_API = import.meta.env.VITE_CALCULATOR_API ?? '/calculator-api'
 const MARKUP_API = `${CALCULATOR_API}/markup`
+const UI_FONT_FAMILY = 'Inter, "Segoe UI Variable", "Segoe UI", Arial, sans-serif'
 
 // Math.max/min(...array) blows the call stack on long sessions (V8 caps spread
 // argument count well below typical sample counts) — reduce instead.
@@ -154,6 +155,10 @@ const PROTOCOL_DETECTORS = [
 ]
 const EXTRA_CALCULATOR_BY_ID = Object.fromEntries(EXTRA_CALCULATORS.map(calc => [calc.id, calc]))
 const PROTOCOL_DETECTOR_BY_ID = Object.fromEntries(PROTOCOL_DETECTORS.map(detector => [detector.id, detector]))
+const PROTOCOL_SECTION_CALCULATOR_IDS = new Set([
+  ...PROTOCOL_DETECTORS.map(detector => detector.id),
+  ...FEATURED_EXTRA_CALCULATORS.map(calculator => calculator.id),
+])
 const CALCULATOR_BY_ID = { ...EXTRA_CALCULATOR_BY_ID, ...PROTOCOL_DETECTOR_BY_ID }
 const PER_FOOT_TURN_DETECTOR_IDS = new Set([
   'protocol-shuttle-detector',
@@ -255,12 +260,53 @@ const TURN_DETECTION_FOOT_OPTIONS = [
   { value: 'right', label: 'R', title: 'Детектировать только по правой ноге' },
 ]
 
+function inferSensorFoot(name) {
+  if (!name) return null
+  if (SENSOR_NAME_TO_FOOT[name]) return SENSOR_NAME_TO_FOOT[name]
+
+  const normalized = String(name).trim().toLowerCase()
+  if (/(^|[_\s-])left($|[_\s-])/.test(normalized)) return 'left'
+  if (/(^|[_\s-])right($|[_\s-])/.test(normalized)) return 'right'
+  if (/^(?:esp32_)?sensor[_\s-]*1(?:\D|$)/.test(normalized)) return 'left'
+  if (/^(?:esp32_)?sensor[_\s-]*2(?:\D|$)/.test(normalized)) return 'right'
+  return null
+}
+
+function groupSensorNamesByFoot(names) {
+  const groups = { left: [], right: [] }
+  const unknown = []
+
+  names.forEach(name => {
+    const foot = inferSensorFoot(name)
+    if (foot) groups[foot].push(name)
+    else unknown.push(name)
+  })
+
+  // Legacy parquet files sometimes carry anonymous device names. Keep their
+  // original ordering as a deterministic left/right fallback.
+  unknown.forEach((name, index) => {
+    const foot = groups.left.length === 0
+      ? 'left'
+      : groups.right.length === 0
+        ? 'right'
+        : index % 2 === 0 ? 'left' : 'right'
+    groups[foot].push(name)
+  })
+
+  return groups
+}
+
+function sensorFootForName(name, names) {
+  const inferred = inferSensorFoot(name)
+  if (inferred) return inferred
+  const groups = groupSensorNamesByFoot(names)
+  if (groups.left.includes(name)) return 'left'
+  if (groups.right.includes(name)) return 'right'
+  return null
+}
+
 function sensorNameForFoot(names, foot) {
-  const mappedName = names.find(name => SENSOR_NAME_TO_FOOT[name] === foot)
-  if (mappedName) return mappedName
-  const hasKnownMapping = names.some(name => SENSOR_NAME_TO_FOOT[name])
-  if (hasKnownMapping) return ''
-  return names[foot === 'left' ? 0 : 1] || ''
+  return groupSensorNamesByFoot(names)[foot]?.[0] || ''
 }
 
 function rowsToColMap(rows) {
@@ -331,12 +377,22 @@ function resolveStDataCol(data, col) {
   return col
 }
 
-function buildDefaultCols(numCols, hasSpeedTracker) {
-  const imu = PREFERRED_COLS.filter(c => numCols.includes(c)).slice(0, 3)
+function buildDefaultCols(numCols, hasSpeedTracker, colMap, sensorNames) {
+  const sensorSet = new Set(sensorNames)
+  const nameArr = colMap?.Name
+  const hasVisibleData = (col) => {
+    const values = colMap?.[col] || []
+    return values.some((value, index) => (
+      safeNum(value) !== null
+      && (!nameArr || sensorSet.size === 0 || sensorSet.has(nameArr[index]))
+    ))
+  }
+  const plottable = numCols.filter(hasVisibleData)
+  const imu = PREFERRED_COLS.filter(c => plottable.includes(c)).slice(0, 3)
   const st  = hasSpeedTracker ? ST_COL_NAMES.filter(c => numCols.includes(c)) : []
   const merged = [...imu]
   st.forEach(c => { if (!merged.includes(c)) merged.push(c) })
-  return merged.length ? merged : numCols.slice(0, 3)
+  return merged.length ? merged : plottable.slice(0, 3)
 }
 
 // Derived channel: TKEO of the accel magnitude, mirroring the backend
@@ -477,7 +533,7 @@ function addNormalizedSensorColumns(colMap, additionalInfo) {
     for (let i = 0; i < raw.length; i++) {
       const v = safeNum(raw[i])
       if (v === null) continue
-      const foot = names ? SENSOR_NAME_TO_FOOT[names[i]] : null
+      const foot = names ? inferSensorFoot(names[i]) : null
       const footCalib = foot ? calib[foot] : null
       if (!footCalib) continue // this foot lacks calibration → leave as no-data
       out[i] = normalizeSensorValue(v, footCalib.min[si], footCalib.max[si])
@@ -506,7 +562,7 @@ function buildGapBandShapes(intervals, nSubplots) {
       shapes.push({
         type: 'rect',
         x0, x1,
-        xref: 'x',
+        xref: i === 0 ? 'x' : `x${i + 1}`,
         y0: 0, y1: 1,
         yref: i === 0 ? 'y domain' : `y${i + 1} domain`,
         fillcolor: GAP_FILL,
@@ -584,6 +640,8 @@ function unwrapAngleDegrees(arr, threshold = 180.0) {
   }
   return result
 }
+
+const UNWRAPPABLE_ANGLE_COLUMNS = new Set(['XData', 'YData', 'ZData'])
 function formatTime(s) {
   if (!isFinite(s) || s < 0) return '0:00.0'
   const m = Math.floor(s / 60)
@@ -602,6 +660,13 @@ function formatDuration(d, unit) {
 function formatMetric(value, digits = 2, suffix = '') {
   if (value == null || !Number.isFinite(Number(value))) return '—'
   return `${Number(value).toFixed(digits)}${suffix}`
+}
+
+function formatInterval(value) {
+  const number = Number(value)
+  if (!Number.isFinite(number)) return '—'
+  if (Number.isInteger(number)) return String(number)
+  return number.toFixed(number < 10 ? 2 : 1).replace(/0+$/, '').replace(/\.$/, '')
 }
 
 function protocolDetectorSummary(result) {
@@ -687,7 +752,7 @@ function buildCursorShapes(x, n) {
     type: 'line',
     x0: x, x1: x,
     y0: 0, y1: 1,
-    xref: 'x',
+    xref: i === 0 ? 'x' : `x${i + 1}`,
     yref: i === 0 ? 'y domain' : `y${i + 1} domain`,
     line: { color: 'rgba(220,40,40,0.85)', width: 2, dash: 'dot' },
   }))
@@ -698,11 +763,31 @@ function buildSelectedPointShapes(x, n) {
     type: 'line',
     x0: x, x1: x,
     y0: 0, y1: 1,
-    xref: 'x',
+    xref: i === 0 ? 'x' : `x${i + 1}`,
     yref: i === 0 ? 'y domain' : `y${i + 1} domain`,
     line: { color: SEL_LINE, width: 3.5 },
     layer: 'above',
   }))
+}
+
+function chartSubplotCenterTop(index, total) {
+  if (total <= 0) return '50%'
+  const gap = 0.03
+  const subplotHeight = (1 - gap * (total - 1)) / total
+  const centerDomain = 1 - index * (subplotHeight + gap) - subplotHeight / 2
+  return `calc(12px + (100% - 54px) * ${1 - centerDomain})`
+}
+
+function chartSubplotMetrics(index, total, chartHeight) {
+  const gap = 0.03
+  const plotTop = 12
+  const plotHeight = Math.max(1, chartHeight - 54)
+  const subplotHeight = total > 0 ? (1 - gap * (total - 1)) / total : 1
+  const topDomain = 1 - index * (subplotHeight + gap)
+  return {
+    top: plotTop + (1 - topDomain) * plotHeight,
+    height: subplotHeight * plotHeight,
+  }
 }
 
 function getPairStartIndex(index) {
@@ -773,23 +858,31 @@ function extractContactPairsFromTargetRuns(times, targets, offset = 0) {
   return contacts
 }
 
-function extractContactsFromLabeledCsv(rows, timeCol, leftSensor, rightSensor, offsetS1, offsetS2) {
-  const bySensor = (sensorName) => {
-    const filtered = rows
+function extractContactsFromLabeledCsv(rows, timeCol, leftSensors, rightSensors, offsetS1, offsetS2) {
+  const bySensors = (sensorNames) => {
+    const candidates = sensorNames.map(sensorName => rows
       .filter(r => (r.Name || r.name) === sensorName)
       .map(r => ({
         t: safeNum(r[timeCol]),
         target: r.Target ?? r.target ?? r.Label ?? r.label ?? '',
       }))
       .filter(r => r.t !== null)
-      .sort((a, b) => a.t - b.t)
-    return filtered
+      .sort((a, b) => a.t - b.t))
+      .filter(candidate => candidate.length > 0)
+
+    // A foot can have separate pressure and IMU devices. Prefer the densest
+    // labeled timeline instead of interleaving timestamps from both devices.
+    return candidates.sort((a, b) => {
+      const aTargets = a.reduce((n, row) => n + Number(isTargetOne(row.target)), 0)
+      const bTargets = b.reduce((n, row) => n + Number(isTargetOne(row.target)), 0)
+      return bTargets - aTargets || b.length - a.length
+    })[0] || []
   }
 
-  const leftRows = bySensor(leftSensor)
-  const rightRows = bySensor(rightSensor)
+  const leftRows = bySensors(leftSensors)
+  const rightRows = bySensors(rightSensors)
   if (!leftRows.length && !rightRows.length) {
-    throw new Error(`Строки для сенсоров ${leftSensor} / ${rightSensor} не найдены`)
+    throw new Error('Строки для сенсоров левой и правой ноги не найдены')
   }
 
   const leftContacts = extractContactPairsFromTargetRuns(
@@ -847,7 +940,7 @@ export default function App() {
   const [showSpeedPredict, setShowSpeedPredict] = useState(false)
   const [showDistancePredict, setShowDistancePredict] = useState(false)
   const [extraCalculatorsOpen, setExtraCalculatorsOpen] = useState(false)
-  const [protocolDetectorsOpen, setProtocolDetectorsOpen] = useState(true)
+  const [protocolDetectorsOpen, setProtocolDetectorsOpen] = useState(false)
   const [calculatorResults, setCalculatorResults] = useState({})
   const [activeCalculators, setActiveCalculators] = useState([])
   const [calculatorLoading, setCalculatorLoading] = useState('')
@@ -882,6 +975,12 @@ export default function App() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [dataPanelOpen, setDataPanelOpen]       = useState(true)
   const [chartPanelOpen, setChartPanelOpen]     = useState(true)
+  const [columnsPanelOpen, setColumnsPanelOpen] = useState(false)
+  const [modelsPanelOpen, setModelsPanelOpen]   = useState(false)
+  const [videoPanelOpen, setVideoPanelOpen]     = useState(false)
+  const [chartReorder, setChartReorder]         = useState(null)
+  const [sidebarWidth, setSidebarWidth]         = useState(292)
+  const [videoPanelWidth, setVideoPanelWidth]   = useState(null)
   const [labMenuOpen, setLabMenuOpen]           = useState(false)
   const labMenuRef = useRef(null)
 
@@ -900,6 +999,8 @@ export default function App() {
   // Refs
   const videoRef        = useRef(null)
   const videoWrapRef    = useRef(null)
+  const videoSideRef    = useRef(null)
+  const chartAreaRef    = useRef(null)
   const chartDivRef     = useRef(null)
   const chartNativeClickRef = useRef(null)
   const timelineRef     = useRef(null)
@@ -936,13 +1037,18 @@ export default function App() {
   const stTraceIdxRef    = useRef([])
   const selectedMarkupRef = useRef(null)
   const relabelStepRef   = useRef(null)
-  const zoomRangeRef     = useRef(null)
+  const subplotRangesRef = useRef({})
+  const chartReorderRef  = useRef(null)
   const importedCsvTextRef = useRef('')
   const skipClearImportCsvRef = useRef(false)
 
   const insoleSensorNames = useMemo(
     () => sensorNames.filter(n => n !== SPEED_TRACKER),
     [sensorNames],
+  )
+  const sensorGroups = useMemo(
+    () => groupSensorNamesByFoot(insoleSensorNames),
+    [insoleSensorNames],
   )
   const hasSpeedTracker = useMemo(
     () => sensorNames.includes(SPEED_TRACKER),
@@ -1117,6 +1223,7 @@ export default function App() {
     setParquetData(null)
     setColumns([])
     setSelectedCols([])
+    setColumnsPanelOpen(false)
     setSensorNames([])
     setLeftContacts([])
     setRightContacts([])
@@ -1125,7 +1232,7 @@ export default function App() {
     setSessionRecordAvailable(false)
     setPendingImportFilename('')
     importedCsvTextRef.current = ''
-    zoomRangeRef.current = null
+    subplotRangesRef.current = {}
     setRelabelStep(null)
     setShowLeftPatterns(true)
     setShowRightPatterns(true)
@@ -1141,7 +1248,7 @@ export default function App() {
     setCalculatorLoading('')
     setSelectedCalculatorContact(null)
     setExtraCalculatorsOpen(false)
-    setProtocolDetectorsOpen(true)
+    setProtocolDetectorsOpen(false)
     setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
@@ -1206,7 +1313,7 @@ export default function App() {
 
       const numCols = computeNumericColumns(colMap, tCol)
       setColumns(numCols)
-      setSelectedCols(buildDefaultCols(numCols, hasST))
+      setSelectedCols(buildDefaultCols(numCols, hasST, colMap, insole))
       setShowSpeedTracker(hasST)
       setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
 
@@ -1246,15 +1353,25 @@ export default function App() {
     const sm = selectedMarkupRef.current
     const nSubplots = selectedColsRef.current.length || 1
 
+    const pushAcrossSubplots = (target, shape) => {
+      for (let subplotIndex = 0; subplotIndex < nSubplots; subplotIndex++) {
+        target.push({
+          ...shape,
+          xref: subplotIndex === 0 ? 'x' : `x${subplotIndex + 1}`,
+          yref: subplotIndex === 0 ? 'y domain' : `y${subplotIndex + 1} domain`,
+        })
+      }
+    }
+
     const pushContactShapes = (contacts, fillColor, lineColor, foot) => {
       const isSelectedFoot = sm?.foot === foot
       for (let i = 0; i + 1 < contacts.length; i += 2) {
         const x0 = Math.min(contacts[i], contacts[i + 1])
         const x1 = Math.max(contacts[i], contacts[i + 1])
         const isSel = isSelectedFoot && (sm.index === i || sm.index === i + 1)
-        contactShapes.push({
+        pushAcrossSubplots(contactShapes, {
           type: 'rect', x0, x1,
-          y0: 0, y1: 1, yref: 'paper',
+          y0: 0, y1: 1,
           fillcolor: isSel ? SEL_FILL : fillColor,
           line: { color: isSel ? SEL_LINE : lineColor, width: isSel ? 3 : 1.5 },
           layer: 'below',
@@ -1264,9 +1381,9 @@ export default function App() {
         const i = contacts.length - 1
         const t = contacts[i]
         const isSel = isSelectedFoot && sm.index === i
-        contactShapes.push({
+        pushAcrossSubplots(contactShapes, {
           type: 'line', x0: t, x1: t,
-          y0: 0, y1: 1, yref: 'paper',
+          y0: 0, y1: 1,
           line: {
             color: isSel ? SEL_LINE : lineColor,
             width: isSel ? 3.5 : 2,
@@ -1305,9 +1422,9 @@ export default function App() {
         const x0 = contact.start_time_s * timeScale + shift
         const x1 = contact.end_time_s * timeScale + shift
         if (!isFinite(x0) || !isFinite(x1) || x1 <= x0) return
-        calculatorShapes.push({
+        pushAcrossSubplots(calculatorShapes, {
           type: 'rect', x0, x1,
-          y0: 0, y1: 1, yref: 'paper',
+          y0: 0, y1: 1,
           fillcolor: eventStyle.fill,
           line: {
             color: eventStyle.color,
@@ -1324,12 +1441,13 @@ export default function App() {
     if (showGapsRef.current && checkHzData) {
       const seen = new Set()
       const intervals = []
-      insoleSensorNames.forEach((name, i) => {
-        const visible = i === 0 ? showSensor1 : showSensor2
+      insoleSensorNames.forEach(name => {
+        const foot = sensorFootForName(name, insoleSensorNames)
+        const visible = foot === 'left' ? showSensor1 : showSensor2
         if (!visible) return
         const gaps = checkHzData[name]?.gaps
         if (!gaps?.length) return
-        const shift = i === 0 ? offsetS1Ref.current : offsetS2Ref.current
+        const shift = foot === 'left' ? offsetS1Ref.current : offsetS2Ref.current
         for (const [startT, endT] of gaps) {
           // Gap timestamps use the same raw Time units as the plotted traces.
           // Dividing ms by 1000 here used to place every red band off-chart.
@@ -1420,7 +1538,8 @@ export default function App() {
     const timeArr = parquetData[timeCol] || []
     const nameArr = parquetData['Name']  || []
     const n = timeArr.length
-    const rightSensorName = insoleSensorNames[1] || 'ESP32_Sensor_2'
+    const leftSensorNames = new Set(sensorGroups.left)
+    const rightSensorNames = new Set(sensorGroups.right)
 
     const buildIv = (contacts, offset) => {
       const out = []
@@ -1445,9 +1564,11 @@ export default function App() {
       const t    = timeArr[i]
       const target = name === SPEED_TRACKER
         ? ''
-        : name === rightSensorName
+        : rightSensorNames.has(name)
           ? (inIv(t, rIv) ? 1 : 0)
-          : (inIv(t, lIv) ? 1 : 0)
+          : leftSensorNames.has(name)
+            ? (inIv(t, lIv) ? 1 : 0)
+            : ''
       const vals = allCols.map(c => {
         const v = parquetData[c][i]
         return v == null ? '' : String(v)
@@ -1457,7 +1578,7 @@ export default function App() {
     }
 
     return hdr + '\n' + rows.join('\n')
-  }, [parquetData, timeCol, insoleSensorNames])
+  }, [parquetData, timeCol, sensorGroups])
 
   const exportLabels = useCallback(() => {
     const csv = generateCsvString()
@@ -1639,27 +1760,25 @@ export default function App() {
       const hasTarget = headers.some(c => ['Target', 'target', 'Label', 'label'].includes(c))
       if (!hasTarget) throw new Error('Колонка Target не найдена — это не размеченный CSV')
 
-      const leftSensor = insoleSensorNames[0]
-      const rightSensor = insoleSensorNames[1]
-      if (!leftSensor) throw new Error('В данных сессии нет сенсоров стельки')
+      if (!sensorGroups.left.length && !sensorGroups.right.length) {
+        throw new Error('В данных сессии нет сенсоров стельки')
+      }
 
       const csvNames = new Set(rows.map(r => r.Name || r.name).filter(Boolean))
-      const resolveSensor = (preferred, fallback) => {
-        if (csvNames.has(preferred)) return preferred
-        if (fallback && csvNames.has(fallback)) return fallback
-        return preferred
+      const resolveSensors = (preferred, fallback) => {
+        const matched = preferred.filter(name => csvNames.has(name))
+        if (matched.length) return matched
+        return fallback && csvNames.has(fallback) ? [fallback] : preferred
       }
-      const leftName = resolveSensor(leftSensor, 'ESP32_Sensor_1')
-      const rightName = rightSensor
-        ? resolveSensor(rightSensor, 'ESP32_Sensor_2')
-        : null
+      const leftNames = resolveSensors(sensorGroups.left, 'ESP32_Sensor_1')
+      const rightNames = resolveSensors(sensorGroups.right, 'ESP32_Sensor_2')
 
       const { leftContacts: importedLeft, rightContacts: importedRight, leftCount, rightCount } =
         extractContactsFromLabeledCsv(
           rows,
           tCol,
-          leftName,
-          rightName || '__none__',
+          leftNames,
+          rightNames,
           offsetS1Ref.current,
           offsetS2Ref.current,
         )
@@ -1688,7 +1807,7 @@ export default function App() {
     } catch (err) {
       setStatus({ text: `Ошибка импорта CSV: ${err.message}`, type: 'error' })
     }
-  }, [parquetData, insoleSensorNames, sessionId, token, fetchSessionMarkupsFromDb, sessionLabel])
+  }, [parquetData, sensorGroups, sessionId, token, fetchSessionMarkupsFromDb, sessionLabel])
 
   // ── Video zoom helpers ────────────────────────────────────────────────────
   const clampPan = useCallback((z, px, py) => {
@@ -1782,6 +1901,74 @@ export default function App() {
     return () => el.removeEventListener('wheel', handleVideoWheel)
   }, [handleVideoWheel])
 
+  const startSidebarResize = useCallback((event) => {
+    event.preventDefault()
+    const startX = event.clientX
+    const startWidth = sidebarWidth
+    const onMove = moveEvent => {
+      const nextWidth = Math.max(250, Math.min(460, startWidth + moveEvent.clientX - startX))
+      setSidebarWidth(nextWidth)
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [sidebarWidth])
+
+  const startVideoResize = useCallback((event) => {
+    const videoSide = videoSideRef.current
+    const content = videoSide?.parentElement
+    if (!videoSide || !content) return
+    event.preventDefault()
+    const startX = event.clientX
+    const startWidth = videoSide.getBoundingClientRect().width
+    const contentWidth = content.getBoundingClientRect().width
+    const onMove = moveEvent => {
+      const maxWidth = Math.max(320, contentWidth - 420)
+      const nextWidth = Math.max(280, Math.min(maxWidth, startWidth + moveEvent.clientX - startX))
+      setVideoPanelWidth(nextWidth)
+    }
+    const onUp = () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [])
+
+  const resizeSidebarWithKeyboard = useCallback((event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+    event.preventDefault()
+    setSidebarWidth(current => {
+      if (event.key === 'Home') return 250
+      if (event.key === 'End') return 460
+      return Math.max(250, Math.min(460, current + (event.key === 'ArrowRight' ? 16 : -16)))
+    })
+  }, [])
+
+  const resizeVideoWithKeyboard = useCallback((event) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+    const videoSide = videoSideRef.current
+    const content = videoSide?.parentElement
+    if (!videoSide || !content) return
+    event.preventDefault()
+    const current = videoSide.getBoundingClientRect().width
+    const maxWidth = Math.max(320, content.getBoundingClientRect().width - 420)
+    const next = event.key === 'Home'
+      ? 280
+      : event.key === 'End'
+        ? maxWidth
+        : current + (event.key === 'ArrowRight' ? 20 : -20)
+    setVideoPanelWidth(Math.max(280, Math.min(maxWidth, next)))
+  }, [])
+
+  const toggleVideoPanel = useCallback(() => {
+    if (videoPanelOpen && videoRef.current) videoRef.current.pause()
+    setVideoPanelOpen(open => !open)
+  }, [videoPanelOpen])
+
   // ── Video loader ──────────────────────────────────────────────────────────
   const loadVideo = useCallback((file) => {
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current)
@@ -1789,6 +1976,7 @@ export default function App() {
     videoUrlRef.current = url
     setVideoUrl(url)
     setVideoName(file.name)
+    setVideoPanelOpen(true)
     setCurrentTime(0)
   }, [])
 
@@ -1797,6 +1985,7 @@ export default function App() {
     setStatus({ text: `Читаю ${file.name}…`, type: 'loading' })
     setSessionLabel(file.name)
     setChartReady(false)
+    setColumnsPanelOpen(false)
     plotInitRef.current = false
     if (chartDivRef.current) {
       if (chartNativeClickRef.current) {
@@ -1821,13 +2010,14 @@ export default function App() {
     setCalculatorLoading('')
     setSelectedCalculatorContact(null)
     setExtraCalculatorsOpen(false)
-    setProtocolDetectorsOpen(true)
+    setProtocolDetectorsOpen(false)
     setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
     setSelectedMarkup(null)
     anglesUnwrappedRef.current = false
     setAnglesUnwrapped(false)
+    subplotRangesRef.current = {}
     importedCsvTextRef.current = ''
     setPendingImportFilename('')
     setActiveMarkupFileId('')
@@ -1852,7 +2042,7 @@ export default function App() {
 
       const numCols = computeNumericColumns(colMap, tCol)
       setColumns(numCols)
-      setSelectedCols(buildDefaultCols(numCols, hasST))
+      setSelectedCols(buildDefaultCols(numCols, hasST, colMap, insole))
       setShowSpeedTracker(hasST)
       setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
 
@@ -1958,9 +2148,10 @@ export default function App() {
       setStatus({
         text: `✓ speed predict: ${data.data_points.length} точек${peak != null ? ` · пик ${peak.toFixed(2)} m/s` : ''}`,
         type: 'ok',
+        area: 'models',
       })
     } catch (err) {
-      setStatus({ text: `Ошибка speed predict: ${err.message}`, type: 'error' })
+      setStatus({ text: `Ошибка speed predict: ${err.message}`, type: 'error', area: 'models' })
     }
   }, [showSpeedPredict, ensurePredictSeries, columns])
 
@@ -1982,9 +2173,10 @@ export default function App() {
       setStatus({
         text: `✓ distance predict: ${data.data_points.length} точек${dist != null ? ` · на пике скорости ${dist.toFixed(1)} м` : ''}`,
         type: 'ok',
+        area: 'models',
       })
     } catch (err) {
-      setStatus({ text: `Ошибка distance predict: ${err.message}`, type: 'error' })
+      setStatus({ text: `Ошибка distance predict: ${err.message}`, type: 'error', area: 'models' })
     }
   }, [showDistancePredict, ensurePredictSeries, columns])
 
@@ -2019,7 +2211,7 @@ export default function App() {
 
     const parsedWeight = Number(weightKg)
     if (calculatorId === 'force-jump' && (!Number.isFinite(parsedWeight) || parsedWeight <= 0)) {
-      setStatus({ text: 'Укажите положительный вес для Bilateral GRF', type: 'error' })
+      setStatus({ text: 'Укажите положительный вес для Bilateral GRF', type: 'error', area: 'models' })
       return
     }
 
@@ -2068,13 +2260,14 @@ export default function App() {
       setStatus({
         text: `✓ ${data.label}: ${resultText}`,
         type: 'ok',
+        area: 'models',
       })
     } catch (err) {
       if (dataVersion !== calculatorDataVersionRef.current) return
       const localHint = err instanceof TypeError
         ? 'Локальный API калькуляторов недоступен — запустите npm run calculator-api'
         : err.message
-      setStatus({ text: `Ошибка калькулятора: ${localHint}`, type: 'error' })
+      setStatus({ text: `Ошибка калькулятора: ${localHint}`, type: 'error', area: 'models' })
     } finally {
       if (dataVersion === calculatorDataVersionRef.current) setCalculatorLoading('')
     }
@@ -2084,13 +2277,13 @@ export default function App() {
   const renderChart = useCallback(() => {
     if (!parquetData || !selectedCols.length || !chartDivRef.current) return
 
-    const sensor1Name = insoleSensorNames[0] || ''
-    const sensor2Name = insoleSensorNames[1] || ''
     const nameArr = parquetData['Name']
 
-    const filterBySensor = (sName) => {
-      if (!nameArr || !sName) return parquetData
-      const mask = nameArr.map(v => v === sName)
+    const filterBySensors = (sensorNames) => {
+      if (!nameArr) return parquetData
+      if (!sensorNames.length) return null
+      const sensorSet = new Set(sensorNames)
+      const mask = nameArr.map(v => sensorSet.has(v))
       const out  = {}
       Object.entries(parquetData).forEach(([k, arr]) => {
         out[k] = arr.filter((_, i) => mask[i])
@@ -2101,27 +2294,49 @@ export default function App() {
     const applyUnwrap = (d) => {
       if (!anglesUnwrappedRef.current || !d) return d
       const out = { ...d }
-      selectedCols.forEach(col => { if (out[col]) out[col] = unwrapAngleDegrees(out[col]) })
+      selectedCols.forEach((col) => {
+        if (UNWRAPPABLE_ANGLE_COLUMNS.has(col) && out[col]) {
+          out[col] = unwrapAngleDegrees(out[col])
+        }
+      })
       return out
     }
-    const data1 = applyUnwrap(filterBySensor(sensor1Name))
-    const data2 = sensor2Name ? applyUnwrap(filterBySensor(sensor2Name)) : null
-    const dataST = hasSpeedTracker ? filterBySensor(SPEED_TRACKER) : null
+    const data1 = applyUnwrap(filterBySensors(sensorGroups.left)) || {}
+    const data2 = sensorGroups.right.length
+      ? applyUnwrap(filterBySensors(sensorGroups.right))
+      : null
+    const dataST = hasSpeedTracker ? filterBySensors([SPEED_TRACKER]) : null
 
     const shift1 = offsetS1Ref.current
     const shift2 = offsetS2Ref.current
     const shiftST = offsetSTRef.current
-    const tArr1 = (data1[timeCol] || []).map(v => { const n = safeNum(v); return n !== null ? n + shift1 : null })
-    const tArr2 = data2 ? (data2[timeCol] || []).map(v => { const n = safeNum(v); return n !== null ? n + shift2 : null }) : []
-    const tArrST = dataST
-      ? (dataST[timeCol] || []).map(v => { const n = safeNum(v); return n !== null ? n + shiftST : null })
-      : []
+    const buildSeries = (data, col, shift) => {
+      if (!data) return { x: [], y: [] }
+      const times = data[timeCol] || []
+      const values = data[col] || []
+      const x = []
+      const y = []
+      for (let index = 0; index < Math.min(times.length, values.length); index++) {
+        const t = safeNum(times[index])
+        const value = safeNum(values[index])
+        if (t === null || value === null) continue
+        x.push(t + shift)
+        y.push(value)
+      }
+      return { x, y }
+    }
+    const s1Series = Object.fromEntries(selectedCols.map(col => [col, buildSeries(data1, col, shift1)]))
+    const s2Series = Object.fromEntries(selectedCols.map(col => [col, buildSeries(data2, col, shift2)]))
+    const stSeries = Object.fromEntries(selectedCols.map(col => {
+      const stCol = dataST ? resolveStDataCol(dataST, col) : col
+      return [col, buildSeries(dataST, stCol, shiftST)]
+    }))
 
-    const allTVals = [
-      ...tArr1,
-      ...tArr2,
-      ...(showSpeedTrackerRef.current ? tArrST : []),
-    ].filter(v => v !== null)
+    const allTVals = selectedCols.flatMap(col => [
+      ...(ST_ONLY_COLS.has(col) || !showSensor1 ? [] : s1Series[col].x),
+      ...(ST_ONLY_COLS.has(col) || !showSensor2 ? [] : s2Series[col].x),
+      ...(showSpeedTrackerRef.current ? stSeries[col].x : []),
+    ])
     if (!allTVals.length) {
       setStatus({ text: `Колонка "${timeCol}" пустая`, type: 'error' })
       return
@@ -2136,12 +2351,11 @@ export default function App() {
     const yRanges = {}
     selectedCols.forEach(col => {
       const stOnly = ST_ONLY_COLS.has(col)
-      const vals1 = (stOnly || !showSensor1) ? [] : (data1[col] || []).map(safeNum).filter(v => v !== null)
-      const vals2 = (stOnly || !data2 || !showSensor2) ? [] : (data2[col] || []).map(safeNum).filter(v => v !== null)
+      const vals1 = (stOnly || !showSensor1) ? [] : s1Series[col].y
+      const vals2 = (stOnly || !showSensor2) ? [] : s2Series[col].y
       let vals  = [...vals1, ...vals2]
       if (dataST && showSpeedTrackerRef.current) {
-        const stCol = resolveStDataCol(dataST, col)
-        vals = [...vals, ...(dataST[stCol] || []).map(safeNum).filter(v => v !== null)]
+        vals = [...vals, ...stSeries[col].y]
       }
       if (showSpeedPredict && SPEED_PRED_COLS.has(col) && speedPredict?.data_points?.length) {
         vals = [...vals, ...speedPredict.data_points.map(point => safeNum(point.speed)).filter(value => value !== null)]
@@ -2165,23 +2379,25 @@ export default function App() {
       const stOnly = ST_ONLY_COLS.has(col)
 
       if (!stOnly) {
-        s1Idx.push(traces.length)
-        traces.push({
-          x: tArr1,
-          y: (data1[col] || []).map(safeNum),
-          name: data2 ? `${col} (S1)` : col,
-          type: 'scatter', mode: 'lines',
-          xaxis: xAxis, yaxis: yAxis,
-          line: { color: PALETTE[(2 * i) % PALETTE.length], width: 1.5 },
-          connectgaps: false,
-          visible: showSensor1,
-          hovertemplate: TRACE_HOVER_TEMPLATE,
-        })
-        if (data2) {
+        if (s1Series[col].y.length) {
+          s1Idx.push(traces.length)
+          traces.push({
+            x: s1Series[col].x,
+            y: s1Series[col].y,
+            name: data2 ? `${col} (S1)` : col,
+            type: 'scatter', mode: 'lines',
+            xaxis: xAxis, yaxis: yAxis,
+            line: { color: PALETTE[(2 * i) % PALETTE.length], width: 1.5 },
+            connectgaps: false,
+            visible: showSensor1,
+            hovertemplate: TRACE_HOVER_TEMPLATE,
+          })
+        }
+        if (s2Series[col].y.length) {
           s2Idx.push(traces.length)
           traces.push({
-            x: tArr2,
-            y: (data2[col] || []).map(safeNum),
+            x: s2Series[col].x,
+            y: s2Series[col].y,
             name: `${col} (S2)`,
             type: 'scatter', mode: 'lines',
             xaxis: xAxis, yaxis: yAxis,
@@ -2195,12 +2411,12 @@ export default function App() {
 
       if (dataST) {
         const stCol = resolveStDataCol(dataST, col)
-        const yST = (dataST[stCol] || []).map(safeNum)
-        if (yST.some(v => v !== null)) {
+        const seriesST = stSeries[col]
+        if (seriesST.y.length) {
           stIdx.push(traces.length)
           traces.push({
-            x: tArrST,
-            y: yST,
+            x: seriesST.x,
+            y: seriesST.y,
             name: `${col} (ST)`,
             type: 'scatter', mode: 'lines',
             xaxis: xAxis, yaxis: yAxis,
@@ -2288,16 +2504,17 @@ export default function App() {
       margin: { t: 12, l: 60, r: 16, b: 42 },
       plot_bgcolor: '#f8f9fa',
       paper_bgcolor: '#fff',
+      font: { family: UI_FONT_FAMILY, color: '#334155', size: 11 },
       showlegend: true,
       dragmode: 'pan',
       hovermode: 'closest',
       hoverlabel: {
         bgcolor: '#ffffff',
         bordercolor: '#94a3b8',
-        font: { color: '#111827', size: 12 },
+        font: { family: UI_FONT_FAMILY, color: '#111827', size: 12 },
         namelength: -1,
       },
-      legend: { orientation: 'h', y: -0.06, font: { size: 11 } },
+      legend: { orientation: 'h', y: -0.06, font: { family: UI_FONT_FAMILY, size: 11 } },
     }
 
     selectedCols.forEach((col, i) => {
@@ -2309,7 +2526,7 @@ export default function App() {
       layout[yKey] = {
         domain:    [Math.max(0, bottom), Math.min(1, top)],
         title:     { text: col, font: { size: 11 } },
-        range:     yRanges[col],
+        range:     subplotRangesRef.current[col]?.y || yRanges[col],
         showgrid:  true,
         gridcolor: '#e8e8e8',
         zeroline:  false,
@@ -2321,9 +2538,8 @@ export default function App() {
         gridcolor:       '#e8e8e8',
         title:           i === n - 1 ? { text: 'Время', font: { size: 11 } } : undefined,
         tickfont:        { size: 10 },
-        matches:         i > 0 ? 'x' : undefined,
         showticklabels:  i === n - 1,
-        range:           zoomRangeRef.current || [xMin, xMax],
+        range:           subplotRangesRef.current[col]?.x || [xMin, xMax],
       }
     })
 
@@ -2420,12 +2636,27 @@ export default function App() {
         if (event.target?.closest?.('.modebar')) return
         if (relabelStepRef.current || labelingRef.current) return
 
-        const xAxis = chartDivRef.current?._fullLayout?.xaxis
+        const fullLayout = chartDivRef.current?._fullLayout
         const rect = chartDivRef.current?.getBoundingClientRect()
+        if (!rect || !fullLayout) return
+
+        const chartY = event.clientY - rect.top
+        const subplotIndex = selectedCols.findIndex((_, index) => {
+          const yAxisKey = index === 0 ? 'yaxis' : `yaxis${index + 1}`
+          const yAxis = fullLayout[yAxisKey]
+          const axisOffset = Number(yAxis?._offset)
+          const axisLength = Number(yAxis?._length)
+          return Number.isFinite(axisOffset)
+            && Number.isFinite(axisLength)
+            && chartY >= axisOffset
+            && chartY <= axisOffset + axisLength
+        })
+        const xAxisKey = subplotIndex > 0 ? `xaxis${subplotIndex + 1}` : 'xaxis'
+        const xAxis = fullLayout[xAxisKey]
         const axisOffset = Number(xAxis?._offset)
         const axisLength = Number(xAxis?._length)
         const range = xAxis?.range
-        if (!rect || !xAxis || !Number.isFinite(axisOffset) || !Number.isFinite(axisLength) || axisLength <= 0 || !Array.isArray(range) || range.length < 2) return
+        if (!xAxis || !Number.isFinite(axisOffset) || !Number.isFinite(axisLength) || axisLength <= 0 || !Array.isArray(range) || range.length < 2) return
 
         const axisPixel = event.clientX - rect.left - axisOffset
         if (axisPixel < 0 || axisPixel > axisLength) return
@@ -2442,16 +2673,40 @@ export default function App() {
       chartDivRef.current.addEventListener('click', nativeChartClick, true)
 
       chartDivRef.current.on('plotly_relayout', (eventData) => {
-        if (eventData['xaxis.range[0]'] !== undefined && eventData['xaxis.range[1]'] !== undefined) {
-          zoomRangeRef.current = [eventData['xaxis.range[0]'], eventData['xaxis.range[1]']]
-        } else if (eventData['xaxis.range'] !== undefined) {
-          zoomRangeRef.current = eventData['xaxis.range']
-        } else if (eventData['xaxis.autorange'] === true) {
-          zoomRangeRef.current = null
-        }
+        selectedCols.forEach((col, index) => {
+          const xAxisKey = index === 0 ? 'xaxis' : `xaxis${index + 1}`
+          const yAxisKey = index === 0 ? 'yaxis' : `yaxis${index + 1}`
+          const current = subplotRangesRef.current[col] || {}
+          const next = { ...current }
+          let changed = false
+
+          if (eventData[`${xAxisKey}.range[0]`] !== undefined && eventData[`${xAxisKey}.range[1]`] !== undefined) {
+            next.x = [eventData[`${xAxisKey}.range[0]`], eventData[`${xAxisKey}.range[1]`]]
+            changed = true
+          } else if (eventData[`${xAxisKey}.range`] !== undefined) {
+            next.x = eventData[`${xAxisKey}.range`]
+            changed = true
+          } else if (eventData[`${xAxisKey}.autorange`] === true) {
+            delete next.x
+            changed = true
+          }
+
+          if (eventData[`${yAxisKey}.range[0]`] !== undefined && eventData[`${yAxisKey}.range[1]`] !== undefined) {
+            next.y = [eventData[`${yAxisKey}.range[0]`], eventData[`${yAxisKey}.range[1]`]]
+            changed = true
+          } else if (eventData[`${yAxisKey}.range`] !== undefined) {
+            next.y = eventData[`${yAxisKey}.range`]
+            changed = true
+          } else if (eventData[`${yAxisKey}.autorange`] === true) {
+            delete next.y
+            changed = true
+          }
+
+          if (changed) subplotRangesRef.current[col] = next
+        })
       })
     })
-  }, [parquetData, selectedCols, timeCol, insoleSensorNames, hasSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict])
+  }, [parquetData, selectedCols, timeCol, sensorGroups, hasSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict])
 
   const handleUnwrapAngles = useCallback(() => {
     if (!parquetData || !selectedCols.length) return
@@ -2461,9 +2716,23 @@ export default function App() {
   }, [parquetData, selectedCols, renderChart])
 
   useEffect(() => {
-    if (!plotInitRef.current || !parquetData || !selectedCols.length) return
-    renderChart()
-  }, [offsetS1, offsetS2, offsetST, showSpeedTracker, showSensor1, showSensor2, renderChart, parquetData, selectedCols.length])
+    if (!parquetData || !selectedCols.length) {
+      const timeout = window.setTimeout(() => {
+        if (plotInitRef.current && chartDivRef.current) Plotly.purge(chartDivRef.current)
+        plotInitRef.current = false
+        setChartReady(false)
+      }, 0)
+      return () => window.clearTimeout(timeout)
+    }
+    const timeout = window.setTimeout(renderChart, 140)
+    return () => window.clearTimeout(timeout)
+  }, [offsetS1, offsetS2, offsetST, timeUnit, showSpeedTracker, showSensor1, showSensor2, renderChart, parquetData, selectedCols])
+
+  useEffect(() => {
+    if (!chartReady || !chartDivRef.current) return undefined
+    const timeout = window.setTimeout(() => Plotly.Plots.resize(chartDivRef.current), 30)
+    return () => window.clearTimeout(timeout)
+  }, [chartReady, sidebarWidth, videoPanelOpen, videoPanelWidth])
 
   // ── Video timeupdate → move chart cursor ──────────────────────────────────
   const handleTimeUpdate = useCallback(() => {
@@ -2511,6 +2780,7 @@ export default function App() {
   // ── Cleanup ───────────────────────────────────────────────────────────────
   useEffect(() => () => {
     if (videoUrlRef.current) URL.revokeObjectURL(videoUrlRef.current)
+    if (chartReorderRef.current?.previewUrl) URL.revokeObjectURL(chartReorderRef.current.previewUrl)
     if (chartDivRef.current && chartNativeClickRef.current) {
       chartDivRef.current.removeEventListener('click', chartNativeClickRef.current, true)
     }
@@ -2520,6 +2790,104 @@ export default function App() {
   // ── Column toggle ─────────────────────────────────────────────────────────
   const toggleCol = (col) =>
     setSelectedCols(p => p.includes(col) ? p.filter(c => c !== col) : [...p, col])
+
+  const moveSelectedColumn = useCallback((fromIndex, toIndex) => {
+    setSelectedCols((current) => {
+      if (fromIndex === toIndex
+        || fromIndex < 0
+        || toIndex < 0
+        || fromIndex >= current.length
+        || toIndex >= current.length) return current
+      const next = [...current]
+      const [moved] = next.splice(fromIndex, 1)
+      next.splice(toIndex, 0, moved)
+      return next
+    })
+  }, [])
+
+  const beginChartReorder = useCallback((event, fromIndex) => {
+    event.preventDefault()
+    event.stopPropagation()
+    try {
+      event.currentTarget.setPointerCapture?.(event.pointerId)
+    } catch {
+      // Pointer capture can be unavailable for synthetic/assistive input.
+    }
+
+    const chartArea = chartAreaRef.current
+    const chartRect = chartArea?.getBoundingClientRect()
+    const sourceMetrics = chartRect
+      ? chartSubplotMetrics(fromIndex, selectedCols.length, chartRect.height)
+      : { top: 0, height: 1 }
+    let previewUrl = ''
+    const plotSvg = chartDivRef.current?.querySelector('svg.main-svg')
+    if (plotSvg) {
+      try {
+        const clone = plotSvg.cloneNode(true)
+        clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg')
+        const svgText = new XMLSerializer().serializeToString(clone)
+        previewUrl = URL.createObjectURL(new Blob([svgText], { type: 'image/svg+xml' }))
+      } catch {
+        previewUrl = ''
+      }
+    }
+
+    const next = {
+      fromIndex,
+      targetIndex: fromIndex,
+      pointerId: event.pointerId,
+      pointerY: event.clientY,
+      pointerOffsetY: chartRect
+        ? Math.max(0, Math.min(sourceMetrics.height, event.clientY - chartRect.top - sourceMetrics.top))
+        : sourceMetrics.height / 2,
+      areaTop: chartRect?.top || 0,
+      chartWidth: chartRect?.width || 0,
+      chartHeight: chartRect?.height || 0,
+      sourceTop: sourceMetrics.top,
+      sourceHeight: sourceMetrics.height,
+      col: selectedCols[fromIndex],
+      previewUrl,
+    }
+    chartReorderRef.current = next
+    setChartReorder(next)
+  }, [selectedCols])
+
+  const updateChartReorder = useCallback((event) => {
+    const current = chartReorderRef.current
+    const chartArea = chartAreaRef.current
+    if (!current || current.pointerId !== event.pointerId || !chartArea || !selectedCols.length) return
+    event.preventDefault()
+    event.stopPropagation()
+
+    const rect = chartArea.getBoundingClientRect()
+    const plotTop = rect.top + 12
+    const plotHeight = Math.max(1, rect.height - 54)
+    const relativeY = Math.max(0, Math.min(plotHeight - 1, event.clientY - plotTop))
+    const targetIndex = Math.min(selectedCols.length - 1, Math.floor((relativeY / plotHeight) * selectedCols.length))
+    const next = { ...current, targetIndex, pointerY: event.clientY }
+    chartReorderRef.current = next
+    setChartReorder(next)
+  }, [selectedCols.length])
+
+  const finishChartReorder = useCallback((event, cancelled = false) => {
+    const current = chartReorderRef.current
+    if (!current || current.pointerId !== event.pointerId) return
+    event.preventDefault()
+    event.stopPropagation()
+    try {
+      if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId)
+      }
+    } catch {
+      // The pointer may already have been released by the browser.
+    }
+    chartReorderRef.current = null
+    setChartReorder(null)
+    if (current.previewUrl) {
+      window.setTimeout(() => URL.revokeObjectURL(current.previewUrl), 0)
+    }
+    if (!cancelled) moveSelectedColumn(current.fromIndex, current.targetIndex)
+  }, [moveSelectedColumn])
 
   // ── Computed ──────────────────────────────────────────────────────────────
   const cursorPct = videoDuration > 0 ? (currentTime / videoDuration) * 100 : 0
@@ -2578,6 +2946,13 @@ export default function App() {
   }
 
   // ── Main UI ───────────────────────────────────────────────────────────────
+  const activeModelCount = activeCalculators.length
+    + Number(showSpeedPredict)
+    + Number(showDistancePredict)
+  const chartReorderTargetMetrics = chartReorder
+    ? chartSubplotMetrics(chartReorder.targetIndex, selectedCols.length, chartReorder.chartHeight)
+    : null
+
   return (
     <div
       className={`app${dragOver ? ' drag-over' : ''}`}
@@ -2588,23 +2963,31 @@ export default function App() {
       {/* ── Header ── */}
       <header className="header">
         <div className="header-left">
-          <span className="header-icon">🎬</span>
-          <span className="header-title">Видео + IMU Viewer</span>
+          <UiIcon name="video" className="header-icon" />
+          <h1 className="header-title">Видео + IMU Viewer</h1>
         </div>
         <div className="header-right">
-          {videoName    && <FileBadge type="video">📹 {videoName}</FileBadge>}
-          {sessionLabel && <FileBadge type="parquet">📊 {sessionLabel}</FileBadge>}
-          <button className="logout-btn" onClick={handleLogout} title="Выйти">⏏ Выйти</button>
+          {videoName && (
+            <FileBadge type="video"><UiIcon name="video" /> {videoName}</FileBadge>
+          )}
+          {sessionLabel && (
+            <FileBadge type="parquet"><UiIcon name="database" /> {sessionLabel}</FileBadge>
+          )}
+          <button className="logout-btn" onClick={handleLogout} title="Выйти">
+            <UiIcon name="logout" /> <span className="logout-text">Выйти</span>
+          </button>
         </div>
       </header>
 
       <div className={`app-body${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
-        <aside className="sidebar">
+        <aside className="sidebar" style={sidebarCollapsed ? undefined : { width: sidebarWidth }}>
           <button
             type="button"
             className="sidebar-collapse-btn"
             onClick={() => setSidebarCollapsed(v => !v)}
             title={sidebarCollapsed ? 'Развернуть панель' : 'Свернуть панель'}
+            aria-label={sidebarCollapsed ? 'Развернуть боковую панель' : 'Свернуть боковую панель'}
+            aria-expanded={!sidebarCollapsed}
           >
             {sidebarCollapsed ? '▶' : '◀'}
           </button>
@@ -2619,13 +3002,13 @@ export default function App() {
                 <div className="sidebar-actions">
                   <div className="btn-group btn-group-block">
                     <UploadBtn accept="video/*,.mp4,.webm,.mov,.avi" onFile={loadVideo}>
-                      📹 Видео
+                      <UiIcon name="video" /> Видео
                     </UploadBtn>
                     <UploadBtn accept=".parquet" onFile={loadParquetFile}>
-                      📊 Parquet
+                      <UiIcon name="database" /> Parquet
                     </UploadBtn>
                     <UploadBtn accept=".csv,text/csv" onFile={importLabeledCsv}>
-                      📋 CSV
+                      <UiIcon name="file-table" /> CSV
                     </UploadBtn>
                   </div>
 
@@ -2674,19 +3057,26 @@ export default function App() {
                         onClick={() => { setShowSessionDropdown(false); loadSession() }}
                         disabled={!sessionId.trim() || status.type === 'loading'}
                       >
-                        ⬇ Загрузить сессию
+                        <UiIcon name="download" /> Загрузить сессию
                       </button>
                     </div>
                   </div>
 
-                  {status.text && (
-                    <span className={`status-pill status-${status.type} status-block`}>{status.text}</span>
+                  {status.text && status.area !== 'models' && (
+                    <span
+                      className={`status-pill status-${status.type} status-block`}
+                      role={status.type === 'error' ? 'alert' : 'status'}
+                      aria-live={status.type === 'error' ? 'assertive' : 'polite'}
+                    >
+                      {status.text}
+                    </span>
                   )}
                 </div>
               </SidebarSection>
 
               {columns.length > 0 && (
-                <SidebarSection
+                <>
+                  <SidebarSection
                   title="2. График"
                   open={chartPanelOpen}
                   onToggle={() => setChartPanelOpen(v => !v)}
@@ -2695,38 +3085,41 @@ export default function App() {
                     {(insoleSensorNames.length > 0 || hasSpeedTracker) && (
                       <div className="sidebar-block">
                         <span className="sidebar-block-lbl">Сенсоры</span>
-                        <div className="sidebar-chip-list">
-                          {insoleSensorNames.map((name, i) => {
-                            const isS1      = i === 0
-                            const isVisible = isS1 ? showSensor1 : showSensor2
-                            const toggle    = () => isS1 ? setShowSensor1(v => !v) : setShowSensor2(v => !v)
-                            const color     = isS1 ? PALETTE[0] : '#ff7f0e'
-                            const bg        = isS1 ? 'rgba(31,119,180,0.08)' : 'rgba(255,127,14,0.08)'
+                        <div className="sidebar-chip-list sensor-list">
+                          {insoleSensorNames.map(name => {
+                            const foot      = sensorFootForName(name, insoleSensorNames) || 'right'
+                            const isLeft    = foot === 'left'
+                            const isVisible = isLeft ? showSensor1 : showSensor2
+                            const toggle    = () => isLeft ? setShowSensor1(v => !v) : setShowSensor2(v => !v)
+                            const color     = isLeft ? PALETTE[0] : '#ff7f0e'
                             const stats     = checkHzData?.[name]
                             return (
                               <div key={name} className="sensor-group sensor-group-stack">
                                 <button
                                   type="button"
                                   className={`btn-toggle sensor-badge${isVisible ? '' : ' sensor-badge-off'}`}
-                                  style={isVisible ? { borderColor: color, color, background: bg } : {}}
+                                  style={{ '--sensor-color': color }}
                                   onClick={toggle}
-                                  title={isVisible ? `Скрыть ${name}` : `Показать ${name}`}
+                                  aria-pressed={isVisible}
+                                  title={`${isVisible ? 'Скрыть' : 'Показать'} ${isLeft ? 'левую' : 'правую'} ногу · ${name}${stats
+                                    ? ` · интервал ${formatInterval(stats.time_diff_mean)} ${timeUnit} · максимум ${formatInterval(stats.time_diff_max)} ${timeUnit} · пропусков ${stats.gaps?.length || 0}`
+                                    : ''}`}
                                 >
-                                  {isVisible ? '●' : '○'}&nbsp;{name.replace('ESP32_', '')}&nbsp;{i === 0 ? '(L)' : '(R)'}
-                                </button>
-                                {stats && (
-                                  <span className="hz-stats hz-stats-compact" style={{ '--hzc': color }}>
-                                    <span className="hz-stat-item" title="mean">
-                                      <span className="hz-stat-key">μ</span>
-                                      <span className="hz-stat-val">{stats.time_diff_mean ?? '—'}</span>
-                                    </span>
-                                    <span className="hz-stat-sep" />
-                                    <span className="hz-stat-item" title="max">
-                                      <span className="hz-stat-key">max</span>
-                                      <span className="hz-stat-val">{stats.time_diff_max ?? '—'}</span>
-                                    </span>
+                                  <span className="sensor-list-dot" style={{ background: color }} />
+                                  <span className="sensor-list-copy">
+                                    <span className="sensor-list-name">{name.replace('ESP32_', '')}</span>
+                                    {stats && (
+                                      <span className="sensor-list-metrics">
+                                        <span>Δt <b>{formatInterval(stats.time_diff_mean)} {timeUnit}</b></span>
+                                        <span>макс. <b>{formatInterval(stats.time_diff_max)} {timeUnit}</b></span>
+                                        <span className={(stats.gaps?.length || 0) > 0 ? 'has-gaps' : ''}>
+                                          пропуски <b>{stats.gaps?.length || 0}</b>
+                                        </span>
+                                      </span>
+                                    )}
                                   </span>
-                                )}
+                                  <span className="sensor-side-badge">{isLeft ? 'L' : 'R'}</span>
+                                </button>
                               </div>
                             )
                           })}
@@ -2735,33 +3128,95 @@ export default function App() {
                               <button
                                 type="button"
                                 className={`btn-toggle sensor-badge sensor-badge-st${showSpeedTracker ? '' : ' sensor-badge-off'}`}
-                                style={showSpeedTracker
-                                  ? { borderColor: ST_COLOR, color: ST_COLOR, background: 'rgba(44,162,44,0.08)' }
-                                  : {}}
+                                style={{ '--sensor-color': ST_COLOR }}
                                 onClick={() => setShowSpeedTracker(v => !v)}
+                                aria-pressed={showSpeedTracker}
+                                title={`${showSpeedTracker ? 'Скрыть' : 'Показать'} SpeedTracker${checkHzData?.[SPEED_TRACKER]
+                                  ? ` · интервал ${formatInterval(checkHzData[SPEED_TRACKER].time_diff_mean)} ${timeUnit} · максимум ${formatInterval(checkHzData[SPEED_TRACKER].time_diff_max)} ${timeUnit} · пропусков ${checkHzData[SPEED_TRACKER].gaps?.length || 0}`
+                                  : ''}`}
                               >
-                                {showSpeedTracker ? '●' : '○'}&nbsp;SpeedTracker
-                              </button>
-                              {checkHzData?.[SPEED_TRACKER] && (
-                                <span className="hz-stats hz-stats-compact" style={{ '--hzc': ST_COLOR }}>
-                                  <span className="hz-stat-item">
-                                    <span className="hz-stat-key">μ</span>
-                                    <span className="hz-stat-val">{checkHzData[SPEED_TRACKER].time_diff_mean ?? '—'}</span>
-                                  </span>
+                                <span className="sensor-list-dot" style={{ background: ST_COLOR }} />
+                                <span className="sensor-list-copy">
+                                  <span className="sensor-list-name">SpeedTracker</span>
+                                  {checkHzData?.[SPEED_TRACKER] && (
+                                    <span className="sensor-list-metrics">
+                                      <span>Δt <b>{formatInterval(checkHzData[SPEED_TRACKER].time_diff_mean)} {timeUnit}</b></span>
+                                      <span>макс. <b>{formatInterval(checkHzData[SPEED_TRACKER].time_diff_max)} {timeUnit}</b></span>
+                                      <span className={(checkHzData[SPEED_TRACKER].gaps?.length || 0) > 0 ? 'has-gaps' : ''}>
+                                        пропуски <b>{checkHzData[SPEED_TRACKER].gaps?.length || 0}</b>
+                                      </span>
+                                    </span>
+                                  )}
                                 </span>
-                              )}
+                              </button>
                             </div>
                           )}
                         </div>
                       </div>
                     )}
 
+                    <div className="sidebar-block columns-picker">
+                      <button
+                        type="button"
+                        className={`columns-picker-toggle${columnsPanelOpen ? ' open' : ''}`}
+                        onClick={() => setColumnsPanelOpen(open => !open)}
+                        aria-expanded={columnsPanelOpen}
+                        aria-controls="graph-columns-picker"
+                      >
+                        <span className="columns-picker-title">Колонки</span>
+                        <span className="columns-picker-count">Выбрано: {selectedCols.length}</span>
+                        <span className="columns-picker-chevron">⌄</span>
+                      </button>
+
+                      {columnsPanelOpen && (
+                        <div id="graph-columns-picker" className="columns-picker-body">
+                          <div className="sidebar-chip-list">
+                            {columns.map(col => (
+                              <button
+                                type="button"
+                                key={col}
+                                className={`btn-toggle col-chip${selectedCols.includes(col) ? ' active' : ''}`}
+                                style={selectedCols.includes(col)
+                                  ? { '--c': PALETTE[selectedCols.indexOf(col) % PALETTE.length] } : {}}
+                                onClick={() => toggleCol(col)}
+                              >{col}</button>
+                            ))}
+                          </div>
+                          <div className="btn-group btn-group-sm">
+                            <button type="button" className="btn-toggle col-chip ghost" onClick={() => setSelectedCols([...columns])}>все</button>
+                            <button type="button" className="btn-toggle col-chip ghost" onClick={() => setSelectedCols([])}>сброс</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+
+                  </div>
+                  </SidebarSection>
+
+                  <SidebarSection
+                    title={`3. Модели и анализ${activeModelCount > 0 ? ` · ${activeModelCount}` : ''}`}
+                    open={modelsPanelOpen}
+                    onToggle={() => setModelsPanelOpen(v => !v)}
+                  >
+                    <div className="sidebar-actions models-sidebar-actions">
                     {(hasSpeedTracker || insoleSensorNames.length > 0) && (
                       <div className="calculator-panel">
-                        <span className="sidebar-block-lbl">Калькуляторы</span>
+                        <div className="models-panel-intro">
+                          <span>Прогнозы и детекторы</span>
+                          <span>{activeModelCount > 0 ? `Активно: ${activeModelCount}` : 'Выберите модель'}</span>
+                        </div>
+                        {status.text && status.area === 'models' && (
+                          <span
+                            className={`status-pill status-${status.type} status-block model-status`}
+                            role={status.type === 'error' ? 'alert' : 'status'}
+                            aria-live={status.type === 'error' ? 'assertive' : 'polite'}
+                          >
+                            {status.text}
+                          </span>
+                        )}
                         <div className="sidebar-block-row calculator-primary-row">
                         <div className="sidebar-block">
-                          <span className="sidebar-block-lbl">Прогноз скорости · CausalSpeedTCN ensemble</span>
+                          <span className="sidebar-block-lbl">Скорость · CausalSpeedTCN</span>
                           <button
                             type="button"
                             className={`btn-secondary btn-speed-predict${showSpeedPredict ? ' active' : ''}`}
@@ -2773,11 +3228,8 @@ export default function App() {
                                 ? 'Убрать прогноз скорости с графика'
                                 : `Загрузить charts/sprint${hasSpeedTracker ? ' и наложить поверх колонки Speed' : ' для этой сессии'}`}
                           >
-                            {predictLoading
-                              ? '⏳ Загрузка…'
-                              : showSpeedPredict
-                                ? '✕ Убрать speed predict'
-                                : '⚡ Speed predict'}
+                            <UiIcon name={predictLoading ? 'loader' : showSpeedPredict ? 'x' : 'bolt'} />
+                            {predictLoading ? 'Загрузка…' : showSpeedPredict ? 'Убрать speed predict' : 'Speed predict'}
                           </button>
                           {showSpeedPredict && speedPredict?.stat && (
                             <span className="hz-stats hz-stats-compact" style={{ '--hzc': PRED_COLOR }}>
@@ -2810,7 +3262,7 @@ export default function App() {
                         </div>
 
                         <div className="sidebar-block">
-                          <span className="sidebar-block-lbl">Дистанция · CausalSpeedTCN ensemble</span>
+                          <span className="sidebar-block-lbl">Дистанция · CausalSpeedTCN</span>
                           <button
                             type="button"
                             className={`btn-secondary btn-distance-predict${showDistancePredict ? ' active' : ''}`}
@@ -2822,11 +3274,8 @@ export default function App() {
                                 ? 'Убрать прогноз дистанции с графика'
                                 : `Загрузить charts/sprint${hasSpeedTracker ? ' и наложить поверх колонки Distance' : ' для этой сессии'}`}
                           >
-                            {predictLoading
-                              ? '⏳ Загрузка…'
-                              : showDistancePredict
-                                ? '✕ Убрать distance predict'
-                                : '📏 Distance predict'}
+                            <UiIcon name={predictLoading ? 'loader' : showDistancePredict ? 'x' : 'ruler'} />
+                            {predictLoading ? 'Загрузка…' : showDistancePredict ? 'Убрать distance predict' : 'Distance predict'}
                           </button>
                           {showDistancePredict && speedPredict?.stat && (
                             <span className="hz-stats hz-stats-compact" style={{ '--hzc': PRED_COLOR }}>
@@ -2859,9 +3308,9 @@ export default function App() {
                         >
                           <span>
                             Детекторы протоколов
-                            {activeCalculators.some(id => PROTOCOL_DETECTOR_BY_ID[id]) && (
+                            {activeCalculators.some(id => PROTOCOL_SECTION_CALCULATOR_IDS.has(id)) && (
                               <span className="calculator-active-count">
-                                {activeCalculators.filter(id => PROTOCOL_DETECTOR_BY_ID[id]).length}
+                                {activeCalculators.filter(id => PROTOCOL_SECTION_CALCULATOR_IDS.has(id)).length}
                               </span>
                             )}
                           </span>
@@ -2959,8 +3408,9 @@ export default function App() {
                           </div>
                         )}
 
-                        <div className="calculator-options calculator-featured-options">
-                          {FEATURED_EXTRA_CALCULATORS.map(calculator => {
+                        {protocolDetectorsOpen && (
+                          <div className="calculator-options calculator-featured-options">
+                            {FEATURED_EXTRA_CALCULATORS.map(calculator => {
                             const active = activeCalculators.includes(calculator.id)
                             const loading = calculatorLoading === calculator.id
                             const result = calculatorResults[calculator.id]
@@ -3028,26 +3478,9 @@ export default function App() {
                                 )}
                               </div>
                             )
-                          })}
-                        </div>
-
-                        <div className="calculator-model-note">
-                          ML-модели: <b>step_gc_model.pt</b>, <b>speed_cont_v5.pt</b>, <b>jump_bilstm.pt</b> и <b>fz_bilateral.pt</b>
-                        </div>
-
-                        <div className="calculator-weight-row">
-                          <label htmlFor="calculator-weight">Вес для GRF, кг</label>
-                          <input
-                            id="calculator-weight"
-                            type="number"
-                            min="1"
-                            max="300"
-                            step="0.1"
-                            value={weightKg}
-                            onChange={event => setWeightKg(event.target.value)}
-                          />
-                          <span>нужен для Bilateral GRF</span>
-                        </div>
+                            })}
+                          </div>
+                        )}
 
                         {selectedCalculatorContact && (() => {
                           const detail = selectedCalculatorContact.contact
@@ -3118,6 +3551,24 @@ export default function App() {
 
                         {extraCalculatorsOpen && (
                           <div id="extra-calculators" className="calculator-options">
+                            <div className="calculator-advanced-settings">
+                              <div className="calculator-weight-row">
+                                <label htmlFor="calculator-weight">Вес для GRF, кг</label>
+                                <input
+                                  id="calculator-weight"
+                                  type="number"
+                                  min="1"
+                                  max="300"
+                                  step="0.1"
+                                  value={weightKg}
+                                  onChange={event => setWeightKg(event.target.value)}
+                                />
+                                <span>для Bilateral GRF</span>
+                              </div>
+                              <div className="calculator-model-note">
+                                Модели: <b>step_gc_model.pt</b>, <b>jump_bilstm.pt</b>, <b>fz_bilateral.pt</b>
+                              </div>
+                            </div>
                             {COLLAPSIBLE_EXTRA_CALCULATORS.map(calculator => {
                               const active = activeCalculators.includes(calculator.id)
                               const loading = calculatorLoading === calculator.id
@@ -3208,97 +3659,39 @@ export default function App() {
                       </div>
                     )}
 
-                    <div className="sidebar-block">
-                      <span className="sidebar-block-lbl">Колонки</span>
-                      <div className="sidebar-chip-list">
-                        {columns.map(col => (
-                          <button
-                            type="button"
-                            key={col}
-                            className={`btn-toggle col-chip${selectedCols.includes(col) ? ' active' : ''}`}
-                            style={selectedCols.includes(col)
-                              ? { '--c': PALETTE[selectedCols.indexOf(col) % PALETTE.length] } : {}}
-                            onClick={() => toggleCol(col)}
-                          >{col}</button>
-                        ))}
-                      </div>
-                      <div className="btn-group btn-group-sm">
-                        <button type="button" className="btn-toggle col-chip ghost" onClick={() => setSelectedCols([...columns])}>все</button>
-                        <button type="button" className="btn-toggle col-chip ghost" onClick={() => setSelectedCols([])}>сброс</button>
-                      </div>
                     </div>
-
-                    <div className="sidebar-block">
-                      <span className="sidebar-block-lbl">Сдвиги</span>
-                      <div className="offset-grid">
-                        <span className="offset-pair">
-                          <span className="offset-lbl offset-lbl-s1">S1</span>
-                          <OffsetInput
-                            value={offsetS1}
-                            step={timeUnit === 'ms' ? 100 : 0.05}
-                            title="Сдвиг Sensor 1 (левая нога)"
-                            onChange={setOffsetS1}
-                          />
-                        </span>
-                        <span className="offset-pair">
-                          <span className="offset-lbl offset-lbl-s2">S2</span>
-                          <OffsetInput
-                            value={offsetS2}
-                            step={timeUnit === 'ms' ? 100 : 0.05}
-                            title="Сдвиг Sensor 2 (правая нога)"
-                            onChange={setOffsetS2}
-                          />
-                        </span>
-                        {hasSpeedTracker && (
-                          <span className="offset-pair">
-                            <span className="offset-lbl offset-lbl-st">ST</span>
-                            <OffsetInput
-                              value={offsetST}
-                              step={timeUnit === 'ms' ? 100 : 0.05}
-                              title="Сдвиг SpeedTracker"
-                              onChange={setOffsetST}
-                            />
-                          </span>
-                        )}
-                      </div>
-                      <div className="sidebar-row">
-                        <div className="btn-group">
-                          <button type="button" className={`btn-toggle unit-btn${timeUnit === 's'  ? ' active' : ''}`} onClick={() => setTimeUnit('s')}>с</button>
-                          <button type="button" className={`btn-toggle unit-btn${timeUnit === 'ms' ? ' active' : ''}`} onClick={() => setTimeUnit('ms')}>мс</button>
-                        </div>
-                        <button
-                          type="button"
-                          className={`btn-secondary btn-unwrap${anglesUnwrapped ? ' active' : ''}`}
-                          disabled={!selectedCols.length}
-                          onClick={handleUnwrapAngles}
-                          title={anglesUnwrapped ? 'Вернуть исходные углы' : 'Развернуть углы'}
-                        >
-                          ↺ Углы
-                        </button>
-                      </div>
-                    </div>
-
-                    <button
-                      type="button"
-                      className="btn-primary btn-block"
-                      disabled={!selectedCols.length}
-                      onClick={renderChart}
-                    >
-                      ▶ Построить график
-                    </button>
-                  </div>
-                </SidebarSection>
+                  </SidebarSection>
+                </>
               )}
             </div>
           )}
         </aside>
+
+        {!sidebarCollapsed && (
+          <div
+            className="panel-resizer sidebar-panel-resizer"
+            onMouseDown={startSidebarResize}
+            onKeyDown={resizeSidebarWithKeyboard}
+            tabIndex={0}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Изменить ширину боковой панели"
+            aria-valuemin={250}
+            aria-valuemax={460}
+            aria-valuenow={Math.round(sidebarWidth)}
+          />
+        )}
 
         <div className="main-area">
       {/* ── Content ── */}
       <div className="content">
 
         {/* Left: video */}
-        <div className="video-side">
+        <div
+          ref={videoSideRef}
+          className={`video-side${videoPanelOpen ? '' : ' video-side-hidden'}`}
+          style={videoPanelWidth == null ? undefined : { width: videoPanelWidth }}
+        >
           <div
             ref={videoWrapRef}
             className={`video-wrap${zoom > 1 ? ' zoomed' : ''}`}
@@ -3331,11 +3724,11 @@ export default function App() {
 
             {videoUrl && (
               <div className="zoom-overlay">
-                <button className="zoom-btn" onClick={() => changeZoom(1.25)} title="Приблизить">＋</button>
+                <button className="zoom-btn" onClick={() => changeZoom(1.25)} title="Приблизить" aria-label="Приблизить"><UiIcon name="plus" /></button>
                 <span className="zoom-label">{zoom.toFixed(1)}×</span>
-                <button className="zoom-btn" onClick={() => changeZoom(1 / 1.25)} title="Отдалить">－</button>
+                <button className="zoom-btn" onClick={() => changeZoom(1 / 1.25)} title="Отдалить" aria-label="Отдалить"><UiIcon name="minus" /></button>
                 {zoom > 1 && (
-                  <button className="zoom-btn zoom-reset" onClick={resetZoom} title="Сбросить масштаб">⊠</button>
+                  <button className="zoom-btn zoom-reset" onClick={resetZoom} title="Сбросить масштаб" aria-label="Сбросить масштаб"><UiIcon name="maximize" /></button>
                 )}
               </div>
             )}
@@ -3369,6 +3762,21 @@ export default function App() {
           )}
         </div>
 
+        {videoPanelOpen && (
+          <div
+            className="panel-resizer video-panel-resizer"
+            onMouseDown={startVideoResize}
+            onKeyDown={resizeVideoWithKeyboard}
+            tabIndex={0}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Изменить ширину видеопанели"
+            aria-valuemin={280}
+            aria-valuemax={1200}
+            aria-valuenow={Math.round(videoPanelWidth || 480)}
+          />
+        )}
+
         {/* Right: labeling + chart */}
         <div className="chart-side">
           <div className="label-panel">
@@ -3376,12 +3784,23 @@ export default function App() {
               <div className="label-toolbar-group">
                 <button
                   type="button"
+                  className={`btn-toggle video-panel-toggle${videoPanelOpen ? ' active' : ''}`}
+                  onClick={toggleVideoPanel}
+                  aria-pressed={videoPanelOpen}
+                  title={videoPanelOpen ? 'Скрыть видеопанель и расширить график' : 'Показать видеопанель'}
+                >
+                  <UiIcon name="video" />
+                  <span>{videoPanelOpen ? 'Скрыть видео' : videoUrl ? 'Показать видео' : 'Видео'}</span>
+                </button>
+
+                <button
+                  type="button"
                   className={`btn-toggle lab-mode-btn${labelingMode ? ' active' : ''}`}
                   onClick={() => setLabelingMode(m => !m)}
                   aria-pressed={labelingMode}
                   title={labelingMode ? 'Выключить режим разметки' : 'Включить режим разметки'}
                 >
-                  ✏ {labelingMode ? 'Разметка вкл' : 'Разметка'}
+                  <UiIcon name="pencil" /> {labelingMode ? 'Разметка вкл' : 'Разметка'}
                 </button>
 
                 <button
@@ -3400,8 +3819,56 @@ export default function App() {
                           : `Показать ${totalGaps} пропуск(ов) красными отрезками`
                   }
                 >
-                  {showGaps ? '●' : '○'}&nbsp;Пропуски{totalGaps > 0 ? ` (${totalGaps})` : ''}
+                  <UiIcon name="gaps" /> Пропуски{totalGaps > 0 ? ` (${totalGaps})` : ''}
                 </button>
+
+                {parquetData && (
+                  <div className="chart-sync-controls" aria-label="Сдвиги времени и углы">
+                    <span className="chart-sync-title">Сдвиг</span>
+                    <span className="offset-pair">
+                      <span className="offset-lbl offset-lbl-s1">S1</span>
+                      <OffsetInput
+                        value={offsetS1}
+                        step={timeUnit === 'ms' ? 100 : 0.05}
+                        title="Сдвиг Sensor 1 (левая нога)"
+                        onChange={setOffsetS1}
+                      />
+                    </span>
+                    <span className="offset-pair">
+                      <span className="offset-lbl offset-lbl-s2">S2</span>
+                      <OffsetInput
+                        value={offsetS2}
+                        step={timeUnit === 'ms' ? 100 : 0.05}
+                        title="Сдвиг Sensor 2 (правая нога)"
+                        onChange={setOffsetS2}
+                      />
+                    </span>
+                    {hasSpeedTracker && (
+                      <span className="offset-pair">
+                        <span className="offset-lbl offset-lbl-st">ST</span>
+                        <OffsetInput
+                          value={offsetST}
+                          step={timeUnit === 'ms' ? 100 : 0.05}
+                          title="Сдвиг SpeedTracker"
+                          onChange={setOffsetST}
+                        />
+                      </span>
+                    )}
+                    <div className="btn-group chart-sync-units" aria-label="Единицы времени">
+                      <button type="button" className={`btn-toggle unit-btn${timeUnit === 's' ? ' active' : ''}`} aria-pressed={timeUnit === 's'} onClick={() => setTimeUnit('s')}>с</button>
+                      <button type="button" className={`btn-toggle unit-btn${timeUnit === 'ms' ? ' active' : ''}`} aria-pressed={timeUnit === 'ms'} onClick={() => setTimeUnit('ms')}>мс</button>
+                    </div>
+                    <button
+                      type="button"
+                      className={`btn-secondary btn-unwrap${anglesUnwrapped ? ' active' : ''}`}
+                      disabled={!selectedCols.length}
+                      onClick={handleUnwrapAngles}
+                      title={anglesUnwrapped ? 'Вернуть исходные углы' : 'Развернуть углы'}
+                    >
+                      <UiIcon name="rotate" /> Углы
+                    </button>
+                  </div>
+                )}
 
                 {totalContacts > 0 && (
                   <div className="btn-group">
@@ -3463,7 +3930,8 @@ export default function App() {
                       ? 'Parquet найден в GCS, но запись этой сессии отсутствует в БД'
                       : 'Сохранить текущую разметку в БД (сессия #' + sessionId.trim() + ')'}
                 >
-                  {isSaving ? 'Сохранение…' : '💾 Сохранить в БД'}
+                  <UiIcon name={isSaving ? 'loader' : 'database-check'} />
+                  {isSaving ? 'Сохранение…' : 'Сохранить в БД'}
                 </button>
                 <UploadBtn
                   accept=".csv,text/csv"
@@ -3474,7 +3942,7 @@ export default function App() {
                     ? 'Загрузить размеченный CSV (Target) и восстановить интервалы на графике'
                     : 'Сначала загрузите сессию или parquet'}
                 >
-                  ⬆ Импорт CSV
+                  <UiIcon name="upload" /> Импорт CSV
                 </UploadBtn>
                 <button
                   type="button"
@@ -3483,7 +3951,7 @@ export default function App() {
                   disabled={totalContacts === 0}
                   title="Скачать CSV с разметкой Target"
                 >
-                  ⬇ Скачать CSV
+                  <UiIcon name="download" /> Скачать CSV
                 </button>
               </div>
             </div>
@@ -3509,7 +3977,7 @@ export default function App() {
                   </div>
 
                   <button type="button" className="btn-secondary lab-btn" onClick={undoContact} title="Отменить последний клик">
-                    ↩ Отмена
+                    <UiIcon name="undo" /> Отмена
                   </button>
 
                   <div className="lab-menu-wrap" ref={labMenuRef}>
@@ -3675,12 +4143,80 @@ export default function App() {
             )}
           </div>
 
-          <div className="chart-area">
+          <div className="chart-area" ref={chartAreaRef}>
             <div ref={chartDivRef} style={{ width: '100%', height: '100%' }} />
+            {chartReady && selectedCols.length > 1 && (
+              <div className="chart-reorder-layer" aria-label="Изменение порядка графиков">
+                {selectedCols.map((col, index) => (
+                  <button
+                    key={col}
+                    type="button"
+                    className={`chart-reorder-handle${chartReorder?.fromIndex === index ? ' dragging' : ''}${chartReorder?.targetIndex === index ? ' drop-target' : ''}`}
+                    style={{ top: chartSubplotCenterTop(index, selectedCols.length) }}
+                    onPointerDown={(event) => beginChartReorder(event, index)}
+                    onPointerMove={updateChartReorder}
+                    onPointerUp={(event) => finishChartReorder(event)}
+                    onPointerCancel={(event) => finishChartReorder(event, true)}
+                    onKeyDown={(event) => {
+                      if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return
+                      event.preventDefault()
+                      const target = event.key === 'ArrowUp'
+                        ? Math.max(0, index - 1)
+                        : Math.min(selectedCols.length - 1, index + 1)
+                      moveSelectedColumn(index, target)
+                    }}
+                    aria-label={`Перетащить график ${col}`}
+                    title={`Перетащить график ${col} вверх или вниз`}
+                  >
+                    <span className="chart-reorder-arrows" aria-hidden="true">↕</span>
+                    <UiIcon name="grip" />
+                    <span className="chart-reorder-hint" aria-hidden="true">Перетащить</span>
+                  </button>
+                ))}
+                {chartReorder && chartReorderTargetMetrics && (
+                  <>
+                    <div
+                      className="chart-reorder-origin"
+                      style={{ top: chartReorder.sourceTop, height: chartReorder.sourceHeight }}
+                    />
+                    {chartReorder.targetIndex !== chartReorder.fromIndex && (
+                      <div
+                        className="chart-reorder-drop-zone"
+                        style={{ top: chartReorderTargetMetrics.top, height: chartReorderTargetMetrics.height }}
+                      />
+                    )}
+                    <div
+                      className="chart-reorder-ghost"
+                      style={{
+                        top: chartReorder.pointerY - chartReorder.areaTop - chartReorder.pointerOffsetY,
+                        height: chartReorder.sourceHeight,
+                      }}
+                    >
+                      {chartReorder.previewUrl && (
+                        <img
+                          src={chartReorder.previewUrl}
+                          alt=""
+                          draggable={false}
+                          className="chart-reorder-ghost-image"
+                          style={{
+                            top: -chartReorder.sourceTop,
+                            width: chartReorder.chartWidth,
+                            height: chartReorder.chartHeight,
+                          }}
+                        />
+                      )}
+                      <span className="chart-reorder-ghost-label">
+                        <UiIcon name="grip" /> {chartReorder.col}
+                      </span>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
             {!chartReady && (
               <div className="chart-empty">
                 {parquetData
-                  ? <><span>📊</span><p>Выберите колонки и нажмите <b>▶ Построить график</b></p></>
+                  ? <><span>📊</span><p>Выберите хотя бы одну колонку — график построится автоматически</p></>
                   : <><span>📊</span><p>Загрузите <b>.parquet</b>-файл или введите номер сессии</p></>
                 }
               </div>
@@ -3734,6 +4270,82 @@ function UploadBtn({ accept, onFile, children, className = 'btn-upload btn-secon
   )
 }
 
+function UiIcon({ name, className = '' }) {
+  let artwork
+
+  switch (name) {
+    case 'video':
+      artwork = <><rect x="3" y="6" width="13" height="12" rx="2" /><path d="m16 10 5-3v10l-5-3z" /></>
+      break
+    case 'database':
+      artwork = <><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5" /><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6" /></>
+      break
+    case 'database-check':
+      artwork = <><ellipse cx="10" cy="5" rx="7" ry="3" /><path d="M3 5v6c0 1.7 3.1 3 7 3h1" /><path d="M3 11v6c0 1.6 2.8 2.8 6.4 3" /><path d="m14 17 2 2 5-6" /></>
+      break
+    case 'file-table':
+      artwork = <><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h5" /><path d="M9 12h6M9 16h6M12 11v6" /></>
+      break
+    case 'download':
+      artwork = <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></>
+      break
+    case 'upload':
+      artwork = <><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /><path d="M5 3h14" /></>
+      break
+    case 'pencil':
+      artwork = <><path d="m4 20 4.2-1 10.9-10.9a2.1 2.1 0 0 0-3-3L5.2 16z" /><path d="m14.8 6.4 3 3" /></>
+      break
+    case 'gaps':
+      artwork = <><path d="M3 12h6M15 12h6" /><path d="m10 8 4 8M14 8l-4 8" /></>
+      break
+    case 'undo':
+      artwork = <><path d="m8 7-5 5 5 5" /><path d="M3 12h10a6 6 0 0 1 6 6v1" /></>
+      break
+    case 'rotate':
+      artwork = <><path d="M20 7v5h-5" /><path d="M19 12a7 7 0 1 0-2 5" /></>
+      break
+    case 'grip':
+      artwork = <><circle cx="9" cy="6" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="6" r="1" fill="currentColor" stroke="none" /><circle cx="9" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="9" cy="18" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="18" r="1" fill="currentColor" stroke="none" /></>
+      break
+    case 'logout':
+      artwork = <><path d="M10 5H5v14h5" /><path d="M13 8l4 4-4 4M8 12h9" /></>
+      break
+    case 'plus':
+      artwork = <path d="M12 5v14M5 12h14" />
+      break
+    case 'minus':
+      artwork = <path d="M5 12h14" />
+      break
+    case 'maximize':
+      artwork = <><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" /><path d="m4 9 5-5M20 9l-5-5M4 15l5 5M20 15l-5 5" /></>
+      break
+    case 'bolt':
+      artwork = <path d="m13 2-8 12h7l-1 8 8-12h-7z" />
+      break
+    case 'ruler':
+      artwork = <><path d="m4 15 11-11 5 5-11 11H4z" /><path d="m12 7 2 2M9 10l2 2M6 13l2 2" /></>
+      break
+    case 'x':
+      artwork = <path d="m6 6 12 12M18 6 6 18" />
+      break
+    case 'loader':
+      artwork = <><circle cx="12" cy="12" r="9" opacity=".25" /><path d="M21 12a9 9 0 0 0-9-9" /></>
+      break
+    default:
+      artwork = <circle cx="12" cy="12" r="8" />
+  }
+
+  return (
+    <svg
+      className={`ui-icon${name === 'loader' ? ' ui-icon-spin' : ''}${className ? ` ${className}` : ''}`}
+      viewBox="0 0 24 24"
+      aria-hidden="true"
+    >
+      {artwork}
+    </svg>
+  )
+}
+
 function FileBadge({ type, children }) {
   return <span className={`file-badge badge-${type}`}>{children}</span>
 }
@@ -3777,6 +4389,7 @@ function OffsetInput({ value, step, title, onChange }) {
         className="input-sm offset-input-field"
         value={draft}
         title={title}
+        aria-label={title}
         onChange={e => setDraft(e.target.value)}
         onBlur={e => commit(e.target.value)}
         onKeyDown={e => {
@@ -3786,8 +4399,20 @@ function OffsetInput({ value, step, title, onChange }) {
         }}
       />
       <div className="offset-spinners">
-        <button className="offset-spin-btn" tabIndex={-1} onMouseDown={e => { e.preventDefault(); nudge(+1) }}>▲</button>
-        <button className="offset-spin-btn" tabIndex={-1} onMouseDown={e => { e.preventDefault(); nudge(-1) }}>▼</button>
+        <button
+          type="button"
+          className="offset-spin-btn"
+          aria-label={`${title}: увеличить`}
+          onMouseDown={e => e.preventDefault()}
+          onClick={() => nudge(+1)}
+        >▲</button>
+        <button
+          type="button"
+          className="offset-spin-btn"
+          aria-label={`${title}: уменьшить`}
+          onMouseDown={e => e.preventDefault()}
+          onClick={() => nudge(-1)}
+        >▼</button>
       </div>
     </div>
   )
