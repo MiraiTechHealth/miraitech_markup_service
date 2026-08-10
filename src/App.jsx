@@ -7,6 +7,8 @@ import './App.css'
 const API_BASE = import.meta.env.VITE_API_BASE ?? (
   import.meta.env.DEV ? 'http://localhost:8000' : 'https://dev-api.miraitech.health'
 )
+const CALCULATOR_API = import.meta.env.VITE_CALCULATOR_API ?? '/calculator-api'
+const MARKUP_API = `${CALCULATOR_API}/markup`
 
 // Math.max/min(...array) blows the call stack on long sessions (V8 caps spread
 // argument count well below typical sample counts) — reduce instead.
@@ -229,7 +231,7 @@ function calculatorEventLegend(calculator, result) {
       : kind === 'turn'
         ? `Поворот${footSuffix}`
         : kind === 'sprint'
-          ? 'Отрезок 30 м'
+          ? contact?.is_complete === false ? 'Неполный спринт' : 'Отрезок 30 м'
           : kind === 'flight'
             ? `Прыжок ${foot}`
             : kind === 'step'
@@ -261,24 +263,17 @@ function sensorNameForFoot(names, foot) {
   return names[foot === 'left' ? 0 : 1] || ''
 }
 
-function parseSessionRows(raw) {
-  if (Array.isArray(raw)) return raw
-  if (typeof raw !== 'string') throw new Error('Некорректные данные сессии')
-  try {
-    return JSON.parse(raw)
-  } catch {
-    return JSON.parse(
-      raw
-        .replace(/\bNaN\b/g, 'null')
-        .replace(/\b-?Infinity\b/g, 'null')
-    )
-  }
-}
-
 function rowsToColMap(rows) {
   const colMap = {}
-  Object.keys(rows[0]).forEach(k => { colMap[k] = [] })
-  rows.forEach(row => Object.entries(row).forEach(([k, v]) => colMap[k].push(v)))
+  rows.forEach((row, index) => {
+    Object.keys(row).forEach(k => {
+      if (!colMap[k]) colMap[k] = Array(index).fill(null)
+    })
+    Object.keys(colMap).forEach(k => {
+      const value = row[k]
+      colMap[k].push(typeof value === 'bigint' ? Number(value) : (value ?? null))
+    })
+  })
   return colMap
 }
 
@@ -529,6 +524,50 @@ function safeNum(v) {
   return isFinite(n) ? n : null
 }
 
+function computeGapStats(colMap, timeColumn) {
+  const names = colMap?.Name || []
+  const times = colMap?.[timeColumn] || []
+  if (!names.length || !times.length) return {}
+
+  const bySensor = new Map()
+  for (let index = 0; index < Math.min(names.length, times.length); index++) {
+    const name = names[index]
+    const time = safeNum(times[index])
+    if (!name || time === null) continue
+    if (!bySensor.has(name)) bySensor.set(name, [])
+    bySensor.get(name).push(time)
+  }
+
+  const result = {}
+  bySensor.forEach((sensorTimes, name) => {
+    sensorTimes.sort((a, b) => a - b)
+    const diffs = []
+    for (let index = 1; index < sensorTimes.length; index++) {
+      const diff = sensorTimes[index] - sensorTimes[index - 1]
+      if (diff > 0) diffs.push(diff)
+    }
+    const mean = diffs.length
+      ? diffs.reduce((sum, value) => sum + value, 0) / diffs.length
+      : null
+    const threshold = mean === null ? null : mean * 2
+    const gaps = []
+    if (threshold !== null) {
+      for (let index = 1; index < sensorTimes.length; index++) {
+        if (sensorTimes[index] - sensorTimes[index - 1] > threshold) {
+          gaps.push([sensorTimes[index - 1], sensorTimes[index]])
+        }
+      }
+    }
+    result[name] = {
+      count: sensorTimes.length,
+      time_diff_mean: mean,
+      time_diff_max: diffs.length ? arrayMax(diffs) : null,
+      gaps,
+    }
+  })
+  return result
+}
+
 function unwrapAngleDegrees(arr, threshold = 180.0) {
   if (!arr || arr.length === 0) return arr
   const result = new Array(arr.length)
@@ -578,7 +617,10 @@ function protocolDetectorSummary(result) {
     return `${detectionFoot ? `${detectionFoot} · ` : ''}повороты ${summary.turn_count} · беговые фазы ${summary.run_count || 0}`
   }
   if (summary.sprint_count != null) {
-    if (summary.sprint_count === 0) return 'отрезок 30 м не найден'
+    if (summary.sprint_count === 0 && summary.segment_found) {
+      return `неполный спринт ${formatMetric(summary.distance_m, 1, ' м')} · шаги ${summary.step_count || 0} (L ${summary.left_count || 0} / R ${summary.right_count || 0}) · step ${formatMetric(summary.step_length_m, 2, ' м')} · stride ${formatMetric(summary.stride_length_m, 2, ' м')}`
+    }
+    if (summary.sprint_count === 0) return 'старт спринта не найден'
     return `30 м найдено · шаги ${summary.step_count || 0} (L ${summary.left_count || 0} / R ${summary.right_count || 0}) · step ${formatMetric(summary.step_length_m, 2, ' м')} · stride ${formatMetric(summary.stride_length_m, 2, ' м')}`
   }
   if (summary.flight_count != null) {
@@ -778,7 +820,7 @@ export default function App() {
   const [sessionLabel, setSessionLabel] = useState('')
   const [markupFiles, setMarkupFiles]   = useState([])
   const [activeMarkupFileId, setActiveMarkupFileId] = useState('')
-  const [sessionAdditionalInfo, setSessionAdditionalInfo] = useState(null)
+  const [sessionRecordAvailable, setSessionRecordAvailable] = useState(false)
   const [isSaving, setIsSaveLoading]    = useState(false)
   const [pendingImportFilename, setPendingImportFilename] = useState('')
 
@@ -925,7 +967,9 @@ export default function App() {
   useEffect(() => {
     if (!selectedMarkup) return
     const contacts = selectedMarkup.foot === 'left' ? leftContacts : rightContacts
-    if (selectedMarkup.index >= contacts.length) setSelectedMarkup(null)
+    if (selectedMarkup.index < contacts.length) return
+    const timeout = window.setTimeout(() => setSelectedMarkup(null), 0)
+    return () => window.clearTimeout(timeout)
   }, [leftContacts, rightContacts, selectedMarkup])
 
   useEffect(() => {
@@ -969,20 +1013,26 @@ export default function App() {
 
   const handleLogout = useCallback(() => {
     setToken('')
+    setSessionsList([])
+    setSessionsListLoading(false)
     sessionStorage.removeItem('auth_token')
   }, [])
 
   // ── Sessions list fetch ───────────────────────────────────────────────────
   useEffect(() => {
-    if (!token) { setSessionsList([]); return }
-    setSessionsListLoading(true)
-    fetch(`${API_BASE}/api/sessions?page_size=100`, {
+    if (!token) return
+    let cancelled = false
+    queueMicrotask(() => {
+      if (!cancelled) setSessionsListLoading(true)
+    })
+    fetch(`${MARKUP_API}/sessions?page_size=100`, {
       headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
     })
       .then(r => r.ok ? r.json() : Promise.reject())
-      .then(data => setSessionsList(data.items || []))
-      .catch(() => setSessionsList([]))
-      .finally(() => setSessionsListLoading(false))
+      .then(data => { if (!cancelled) setSessionsList(data.items || []) })
+      .catch(() => { if (!cancelled) setSessionsList([]) })
+      .finally(() => { if (!cancelled) setSessionsListLoading(false) })
+    return () => { cancelled = true }
   }, [token])
 
   const filteredSessions = useMemo(() => {
@@ -1019,24 +1069,15 @@ export default function App() {
   }, [labMenuOpen])
 
   const fetchSessionMarkupsFromDb = useCallback(async (sid, { restoreLatest = false } = {}) => {
-    const resp = await fetch(`${API_BASE}/api/sessions/${sid}`, {
-      headers: {
-        'accept': 'application/json',
-        'Authorization': `Bearer ${token}`,
-      },
+    const resp = await fetch(`${MARKUP_API}/sessions/${sid}`, {
+      headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
     })
-    if (resp.status === 401) {
-      setToken('')
-      sessionStorage.removeItem('auth_token')
-      throw new Error('Сессия авторизации истекла — войдите снова')
-    }
     if (!resp.ok) {
       const errData = await resp.json().catch(() => ({}))
       throw new Error(parseApiError(errData, resp.status))
     }
 
     const result = await resp.json()
-    setSessionAdditionalInfo(result.additional_info || null)
     const files = result.additional_info?.markup_files || []
     setMarkupFiles(files)
 
@@ -1066,11 +1107,22 @@ export default function App() {
     setSessionLabel(`Сессия #${sid}`)
     setChartReady(false)
     plotInitRef.current = false
+    if (chartDivRef.current) {
+      if (chartNativeClickRef.current) {
+        chartDivRef.current.removeEventListener('click', chartNativeClickRef.current, true)
+        chartNativeClickRef.current = null
+      }
+      Plotly.purge(chartDivRef.current)
+    }
+    setParquetData(null)
+    setColumns([])
+    setSelectedCols([])
+    setSensorNames([])
     setLeftContacts([])
     setRightContacts([])
     setMarkupFiles([])
     setActiveMarkupFileId('')
-    setSessionAdditionalInfo(null)
+    setSessionRecordAvailable(false)
     setPendingImportFilename('')
     importedCsvTextRef.current = ''
     zoomRangeRef.current = null
@@ -1098,22 +1150,28 @@ export default function App() {
     setAnglesUnwrapped(false)
 
     try {
-      const resp = await fetch(`${API_BASE}/api/sessions/${sid}`, {
-        headers: {
-          'accept': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-      })
-      if (resp.status === 401) {
-        setToken('')
-        sessionStorage.removeItem('auth_token')
-        throw new Error('Сессия авторизации истекла — войдите снова')
+      const [metadataResp, parquetResp] = await Promise.all([
+        fetch(`${MARKUP_API}/sessions/${sid}`, {
+          headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
+        }),
+        fetch(`${MARKUP_API}/sessions/${sid}/parquet`, {
+          headers: {
+            'accept': 'application/vnd.apache.parquet',
+            'Authorization': `Bearer ${token}`,
+          },
+        }),
+      ])
+      if (!parquetResp.ok) {
+        const errData = await parquetResp.json().catch(() => ({}))
+        throw new Error(parseApiError(errData, parquetResp.status))
       }
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`)
 
-      const result = await resp.json()
+      const metadataAvailable = metadataResp.ok
+      const result = metadataAvailable
+        ? await metadataResp.json()
+        : { additional_info: null }
+      setSessionRecordAvailable(metadataAvailable)
 
-      setSessionAdditionalInfo(result.additional_info || null)
       const initialMarkupFiles = result.additional_info?.markup_files || []
       setMarkupFiles(initialMarkupFiles)
       if (initialMarkupFiles.length > 0) {
@@ -1130,7 +1188,7 @@ export default function App() {
         }
       }
 
-      const rows = parseSessionRows(result.data)
+      const rows = await parquetReadObjects({ file: await parquetResp.arrayBuffer() })
 
       if (!rows?.length) { setStatus({ text: 'Сессия пустая', type: 'error' }); return }
 
@@ -1158,19 +1216,22 @@ export default function App() {
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
 
-      const stHint = hasST ? ' · SpeedTracker' : ''
-      setStatus({ text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}${stHint}`, type: 'ok' })
+      const gapStats = computeGapStats(colMap, tCol)
+      const gapCount = Object.values(gapStats)
+        .reduce((count, sensor) => count + sensor.gaps.length, 0)
+      setCheckHzData(gapStats)
+      setShowGaps(gapCount > 0)
 
-      fetch(`${API_BASE}/api/check_hz/${sid}`, {
-        headers: { 'accept': 'application/json', 'Authorization': `Bearer ${token}` },
+      const stHint = hasST ? ' · SpeedTracker' : ''
+      const gapHint = gapCount ? ` · ${gapCount} пропуск(ов)` : ' · без пропусков'
+      setStatus({
+        text: `✓ GCS · ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}${stHint}${gapHint}`,
+        type: 'ok',
       })
-        .then(r => r.ok ? r.json() : Promise.reject())
-        .then(data => setCheckHzData(data))
-        .catch(() => setCheckHzData(null))
     } catch (err) {
       setStatus({ text: `Ошибка: ${err.message}`, type: 'error' })
     }
-  }, [token, sessionId])
+  }, [sessionId, token])
 
   const totalGaps = useMemo(() => {
     if (!checkHzData) return 0
@@ -1270,8 +1331,10 @@ export default function App() {
         if (!gaps?.length) return
         const shift = i === 0 ? offsetS1Ref.current : offsetS2Ref.current
         for (const [startT, endT] of gaps) {
-          const x0 = Math.min(startT, endT) / 1000 + shift
-          const x1 = Math.max(startT, endT) / 1000 + shift
+          // Gap timestamps use the same raw Time units as the plotted traces.
+          // Dividing ms by 1000 here used to place every red band off-chart.
+          const x0 = Math.min(startT, endT) + shift
+          const x1 = Math.max(startT, endT) + shift
           const key = `${x0}|${x1}`
           if (seen.has(key)) continue
           seen.add(key)
@@ -1291,7 +1354,7 @@ export default function App() {
         ...cursorShapesRef.current,
       ],
     })
-  }, [showGaps, checkHzData, insoleSensorNames, showSensor1, showSensor2])
+  }, [checkHzData, insoleSensorNames, showSensor1, showSensor2])
 
   useEffect(() => {
     leftContactsRef.current  = leftContacts
@@ -1439,6 +1502,13 @@ export default function App() {
       setStatus({ text: 'Укажите ID сессии в поле слева', type: 'error' })
       return
     }
+    if (!sessionRecordAvailable) {
+      setStatus({
+        text: 'Данные загружены из GCS, но записи сессии в БД нет — сохранить разметку в БД нельзя',
+        type: 'error',
+      })
+      return
+    }
     if (leftContactsRef.current.length === 0 && rightContactsRef.current.length === 0) {
       setStatus({ text: 'Нет разметки для сохранения', type: 'error' })
       return
@@ -1494,7 +1564,7 @@ export default function App() {
         markup_files: updatedFiles,
       }
 
-      const resp = await fetch(`${API_BASE}/api/sessions/${sid}`, {
+      const resp = await fetch(`${MARKUP_API}/sessions/${sid}/additional-info`, {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json',
@@ -1513,7 +1583,6 @@ export default function App() {
 
       const updatedSession = await resp.json()
 
-      setSessionAdditionalInfo(updatedSession.additional_info || null)
       const nextFiles = updatedSession.additional_info?.markup_files || updatedFiles
       setMarkupFiles(nextFiles)
       setActiveMarkupFileId(fileId)
@@ -1531,6 +1600,7 @@ export default function App() {
     }
   }, [
     sessionId,
+    sessionRecordAvailable,
     activeMarkupFileId,
     generateCsvString,
     token,
@@ -1660,12 +1730,14 @@ export default function App() {
       if (newZ === 1) { setPanX(0); setPanY(0); return 1 }
       setPanX(px => {
         const npx  = px - cx * (1 / newZ - 1 / prevZ)
-        const maxX = videoWrapRef.current?.clientWidth  * (newZ - 1) / (2 * newZ) ?? 9999
+        const width = videoWrapRef.current?.clientWidth
+        const maxX = width == null ? 9999 : width * (newZ - 1) / (2 * newZ)
         return Math.max(-maxX, Math.min(maxX, npx))
       })
       setPanY(py => {
         const npy  = py - cy * (1 / newZ - 1 / prevZ)
-        const maxY = videoWrapRef.current?.clientHeight * (newZ - 1) / (2 * newZ) ?? 9999
+        const height = videoWrapRef.current?.clientHeight
+        const maxY = height == null ? 9999 : height * (newZ - 1) / (2 * newZ)
         return Math.max(-maxY, Math.min(maxY, npy))
       })
       return newZ
@@ -1683,12 +1755,14 @@ export default function App() {
       if (!isVideoPan.current) return
       setPanX(px => {
         const newPx = px + e.movementX / zoom
-        const maxX  = videoWrapRef.current?.clientWidth  * (zoom - 1) / (2 * zoom) ?? 9999
+        const width = videoWrapRef.current?.clientWidth
+        const maxX = width == null ? 9999 : width * (zoom - 1) / (2 * zoom)
         return Math.max(-maxX, Math.min(maxX, newPx))
       })
       setPanY(py => {
         const newPy = py + e.movementY / zoom
-        const maxY  = videoWrapRef.current?.clientHeight * (zoom - 1) / (2 * zoom) ?? 9999
+        const height = videoWrapRef.current?.clientHeight
+        const maxY = height == null ? 9999 : height * (zoom - 1) / (2 * zoom)
         return Math.max(-maxY, Math.min(maxY, newPy))
       })
     }
@@ -1724,6 +1798,13 @@ export default function App() {
     setSessionLabel(file.name)
     setChartReady(false)
     plotInitRef.current = false
+    if (chartDivRef.current) {
+      if (chartNativeClickRef.current) {
+        chartDivRef.current.removeEventListener('click', chartNativeClickRef.current, true)
+        chartNativeClickRef.current = null
+      }
+      Plotly.purge(chartDivRef.current)
+    }
     setLeftContacts([])
     setRightContacts([])
     setShowLeftPatterns(true)
@@ -1750,6 +1831,7 @@ export default function App() {
     importedCsvTextRef.current = ''
     setPendingImportFilename('')
     setActiveMarkupFileId('')
+    setSessionRecordAvailable(false)
 
     try {
       const arrayBuffer = await file.arrayBuffer()
@@ -1757,11 +1839,7 @@ export default function App() {
 
       if (!rows?.length) { setStatus({ text: 'Файл пустой', type: 'error' }); return }
 
-      const colMap = {}
-      Object.keys(rows[0]).forEach(k => { colMap[k] = [] })
-      rows.forEach(row => Object.entries(row).forEach(([k, v]) => {
-        colMap[k].push(typeof v === 'bigint' ? Number(v) : v)
-      }))
+      const colMap = rowsToColMap(rows)
       const tCol = detectTimeCol(Object.keys(colMap))
       addAccTkeoColumn(colMap, tCol)
       setParquetData(colMap)
@@ -1784,13 +1862,24 @@ export default function App() {
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
 
+      const gapStats = computeGapStats(colMap, tCol)
+      const gapCount = Object.values(gapStats)
+        .reduce((count, sensor) => count + sensor.gaps.length, 0)
+      setCheckHzData(gapStats)
+      setShowGaps(gapCount > 0)
+
       const stHint = hasST ? ' · SpeedTracker' : ''
-      setStatus({ text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}${stHint}`, type: 'ok' })
+      const gapHint = gapCount ? ` · ${gapCount} пропуск(ов)` : ' · без пропусков'
+      setStatus({
+        text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}${stHint}${gapHint}`,
+        type: 'ok',
+      })
 
       const sid = sessionId.trim()
-      if (sid && token) {
+      if (sid) {
         try {
           const sess = await fetchSessionMarkupsFromDb(sid)
+          setSessionRecordAvailable(true)
           // The parquet file carries no calibration; if the linked session does,
           // derive the normalized channels now and refresh the column list.
           if (addNormalizedSensorColumns(colMap, sess?.additional_info).length) {
@@ -1799,13 +1888,14 @@ export default function App() {
           }
           setSessionLabel(`Сессия #${sid} · ${file.name}`)
         } catch {
+          setSessionRecordAvailable(false)
           // parquet loaded; markups will load on save
         }
       }
     } catch (err) {
       setStatus({ text: `Ошибка чтения parquet: ${err.message}`, type: 'error' })
     }
-  }, [sessionId, token, fetchSessionMarkupsFromDb])
+  }, [sessionId, fetchSessionMarkupsFromDb])
 
   const handleFiles = useCallback((files) => {
     ;[...files].forEach(f => {
@@ -1851,14 +1941,18 @@ export default function App() {
   }, [speedPredict, sessionId, token])
 
   const fetchSpeedPredict = useCallback(async () => {
-    if (showSpeedPredict) { setShowSpeedPredict(false); return }
+    if (showSpeedPredict) {
+      setShowSpeedPredict(false)
+      if (!columns.some(column => SPEED_PRED_COLS.has(column))) {
+        setSelectedCols(prev => prev.filter(column => !SPEED_PRED_COLS.has(column)))
+      }
+      return
+    }
     try {
       const data = await ensurePredictSeries()
       // Make sure a speed subplot exists to overlay onto.
-      const speedCol = columns.find(c => SPEED_PRED_COLS.has(c))
-      if (speedCol && !selectedCols.includes(speedCol)) {
-        setSelectedCols(prev => [...prev, speedCol])
-      }
+      const speedCol = columns.find(c => SPEED_PRED_COLS.has(c)) || 'Speed'
+      setSelectedCols(prev => prev.includes(speedCol) ? prev : [...prev, speedCol])
       setShowSpeedPredict(true)
       const peak = data.stat?.peak_speed
       setStatus({
@@ -1868,17 +1962,21 @@ export default function App() {
     } catch (err) {
       setStatus({ text: `Ошибка speed predict: ${err.message}`, type: 'error' })
     }
-  }, [showSpeedPredict, ensurePredictSeries, columns, selectedCols])
+  }, [showSpeedPredict, ensurePredictSeries, columns])
 
   const fetchDistancePredict = useCallback(async () => {
-    if (showDistancePredict) { setShowDistancePredict(false); return }
+    if (showDistancePredict) {
+      setShowDistancePredict(false)
+      if (!columns.some(column => DISTANCE_PRED_COLS.has(column))) {
+        setSelectedCols(prev => prev.filter(column => !DISTANCE_PRED_COLS.has(column)))
+      }
+      return
+    }
     try {
       const data = await ensurePredictSeries()
       // Make sure a distance subplot exists to overlay onto.
-      const distCol = columns.find(c => DISTANCE_PRED_COLS.has(c))
-      if (distCol && !selectedCols.includes(distCol)) {
-        setSelectedCols(prev => [...prev, distCol])
-      }
+      const distCol = columns.find(c => DISTANCE_PRED_COLS.has(c)) || 'Distance'
+      setSelectedCols(prev => prev.includes(distCol) ? prev : [...prev, distCol])
       setShowDistancePredict(true)
       const dist = data.stat?.distance_at_peak_speed
       setStatus({
@@ -1888,7 +1986,7 @@ export default function App() {
     } catch (err) {
       setStatus({ text: `Ошибка distance predict: ${err.message}`, type: 'error' })
     }
-  }, [showDistancePredict, ensurePredictSeries, columns, selectedCols])
+  }, [showDistancePredict, ensurePredictSeries, columns])
 
   const toggleAdditionalCalculator = useCallback(async (calculatorId, options = {}) => {
     const force = Boolean(options.force)
@@ -2045,6 +2143,12 @@ export default function App() {
         const stCol = resolveStDataCol(dataST, col)
         vals = [...vals, ...(dataST[stCol] || []).map(safeNum).filter(v => v !== null)]
       }
+      if (showSpeedPredict && SPEED_PRED_COLS.has(col) && speedPredict?.data_points?.length) {
+        vals = [...vals, ...speedPredict.data_points.map(point => safeNum(point.speed)).filter(value => value !== null)]
+      }
+      if (showDistancePredict && DISTANCE_PRED_COLS.has(col) && speedPredict?.data_points?.length) {
+        vals = [...vals, ...speedPredict.data_points.map(point => safeNum(point.distance)).filter(value => value !== null)]
+      }
       if (!vals.length) { yRanges[col] = [-1, 1]; return }
       const mn = arrayMin(vals), mx = arrayMax(vals)
       const p  = Math.max((mx - mn) * 0.08, 0.1)
@@ -2109,11 +2213,11 @@ export default function App() {
       }
 
       // Speed-predict overlay (charts/sprint) on top of the speed subplot.
-      // Backend time is seconds (raw device Time / 1000); the ST trace here plots
-      // rawTime + offsetST, so rawTime = point.time * 1000 realigns the two.
+      // Backend time is seconds; convert it to the raw Time unit used by the chart.
       if (SPEED_PRED_COLS.has(col) && showSpeedPredict && speedPredict?.data_points?.length) {
         const shiftST = offsetSTRef.current
-        const toX = (tSec) => tSec * 1000 + shiftST
+        const predictTimeScale = timeUnitRef.current === 'ms' ? 1000 : 1
+        const toX = (tSec) => tSec * predictTimeScale + shiftST
         traces.push({
           x: speedPredict.data_points.map(p => toX(p.time)),
           y: speedPredict.data_points.map(p => p.speed),
@@ -2141,7 +2245,8 @@ export default function App() {
       // Distance-predict overlay (same fetched series, cumulative distance).
       if (DISTANCE_PRED_COLS.has(col) && showDistancePredict && speedPredict?.data_points?.length) {
         const shiftST = offsetSTRef.current
-        const toX = (tSec) => tSec * 1000 + shiftST
+        const predictTimeScale = timeUnitRef.current === 'ms' ? 1000 : 1
+        const toX = (tSec) => tSec * predictTimeScale + shiftST
         traces.push({
           x: speedPredict.data_points.map(p => toX(p.time)),
           y: speedPredict.data_points.map(p => p.distance),
@@ -2346,7 +2451,7 @@ export default function App() {
         }
       })
     })
-  }, [parquetData, selectedCols, timeCol, insoleSensorNames, hasSpeedTracker, offsetS1, offsetS2, offsetST, showSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict, activeCalculators, calculatorResults])
+  }, [parquetData, selectedCols, timeCol, insoleSensorNames, hasSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict])
 
   const handleUnwrapAngles = useCallback(() => {
     if (!parquetData || !selectedCols.length) return
@@ -2982,6 +3087,9 @@ export default function App() {
                                 )}
                                 {detail.step_length_m != null && <span>step length {formatMetric(detail.step_length_m, 3, ' м')}</span>}
                                 {detail.stride_length_m != null && <span>stride length {formatMetric(detail.stride_length_m, 3, ' м')}</span>}
+                                {detail.distance_m != null && detail.kind === 'sprint' && (
+                                  <span><b>дистанция</b> {formatMetric(detail.distance_m, 2, ' м')}</span>
+                                )}
                                 {detail.distance_m != null && detail.kind === 'step' && (
                                   <span>дистанция {formatMetric(detail.distance_m, 2, ' м')}</span>
                                 )}
@@ -3270,6 +3378,7 @@ export default function App() {
                   type="button"
                   className={`btn-toggle lab-mode-btn${labelingMode ? ' active' : ''}`}
                   onClick={() => setLabelingMode(m => !m)}
+                  aria-pressed={labelingMode}
                   title={labelingMode ? 'Выключить режим разметки' : 'Включить режим разметки'}
                 >
                   ✏ {labelingMode ? 'Разметка вкл' : 'Разметка'}
@@ -3279,6 +3388,7 @@ export default function App() {
                   type="button"
                   className={`btn-toggle gap-vis-btn${showGaps ? ' vis-on' : ''}`}
                   onClick={() => setShowGaps(v => !v)}
+                  aria-pressed={showGaps}
                   disabled={!checkHzData || totalGaps === 0 || !chartReady}
                   title={
                     !checkHzData
@@ -3317,7 +3427,7 @@ export default function App() {
                 )}
               </div>
 
-              <div className="label-toolbar-group label-toolbar-actions">
+              <div className="label-toolbar-group label-toolbar-actions" aria-label="Действия с разметкой">
                 {(markupFiles.length > 0 || activeMarkupFileId === 'new' || pendingImportFilename) && (
                   <select
                     className="select-sm markup-file-select"
@@ -3346,10 +3456,12 @@ export default function App() {
                   type="button"
                   className="btn-primary lab-btn save-db"
                   onClick={saveMarkupToDb}
-                  disabled={isSaving || !sessionId.trim() || totalContacts === 0}
+                  disabled={isSaving || !sessionId.trim() || !sessionRecordAvailable || totalContacts === 0}
                   title={!sessionId.trim()
                     ? 'Укажите ID сессии слева (например 4102)'
-                    : 'Сохранить текущую разметку в БД (сессия #' + sessionId.trim() + ')'}
+                    : !sessionRecordAvailable
+                      ? 'Parquet найден в GCS, но запись этой сессии отсутствует в БД'
+                      : 'Сохранить текущую разметку в БД (сессия #' + sessionId.trim() + ')'}
                 >
                   {isSaving ? 'Сохранение…' : '💾 Сохранить в БД'}
                 </button>
@@ -3362,7 +3474,7 @@ export default function App() {
                     ? 'Загрузить размеченный CSV (Target) и восстановить интервалы на графике'
                     : 'Сначала загрузите сессию или parquet'}
                 >
-                  ⬆ CSV
+                  ⬆ Импорт CSV
                 </UploadBtn>
                 <button
                   type="button"
@@ -3371,7 +3483,7 @@ export default function App() {
                   disabled={totalContacts === 0}
                   title="Скачать CSV с разметкой Target"
                 >
-                  ⬇ CSV
+                  ⬇ Скачать CSV
                 </button>
               </div>
             </div>

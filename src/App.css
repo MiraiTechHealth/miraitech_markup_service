@@ -1041,10 +1041,13 @@ body { background: var(--bg); overflow: hidden }
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 8px 12px;
+  padding: 10px 12px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
+  box-shadow: 0 2px 8px rgba(15, 23, 42, .08);
   flex-shrink: 0;
+  position: relative;
+  z-index: 20;
 }
 
 .label-toolbar-row {
@@ -1069,6 +1072,10 @@ body { background: var(--bg); overflow: hidden }
 
 .label-toolbar-actions {
   margin-left: auto;
+  padding: 4px;
+  border: 1px solid #dbe3ec;
+  border-radius: 8px;
+  background: #f8fafc;
 }
 
 .lab-stat-inline {
@@ -1123,7 +1130,8 @@ body { background: var(--bg); overflow: hidden }
 .lab-menu-item:disabled { opacity: .4; cursor: not-allowed }
 
 .lab-mode-btn {
-  padding: 4px 12px;
+  min-height: 34px;
+  padding: 6px 14px;
   border: 1.5px solid var(--border);
   border-radius: 6px;
   background: var(--surface);
@@ -1223,7 +1231,8 @@ body { background: var(--bg); overflow: hidden }
 }
 
 .gap-vis-btn {
-  padding: 4px 12px;
+  min-height: 34px;
+  padding: 6px 14px;
   border: 1.5px solid #fca5a5;
   border-radius: 6px;
   background: var(--surface);
@@ -1266,7 +1275,8 @@ body { background: var(--bg); overflow: hidden }
 
 /* Labeling action buttons */
 .lab-btn {
-  padding: 3px 9px;
+  min-height: 32px;
+  padding: 6px 11px;
   border: 1.5px solid var(--border);
   border-radius: 5px;
   background: var(--surface);
@@ -1284,7 +1294,8 @@ body { background: var(--bg); overflow: hidden }
 .lab-btn.import:hover   { background: #eff6ff }
 label.lab-btn.import    { display: inline-flex; align-items: center; justify-content: center }
 .lab-btn.save-db        { background: var(--primary); color: #fff; border-color: var(--primary); font-weight: 600 }
-.lab-btn.save-db:hover  { background: #1d4ed8; color: #fff; border-color: #1d4ed8 }
+.lab-btn.save-db        { box-shadow: 0 2px 7px rgba(37,99,235,.28) }
+.lab-btn.save-db:hover  { background: #1d4ed8; color: #fff; border-color: #1d4ed8; box-shadow: 0 3px 10px rgba(37,99,235,.36) }
 .lab-btn.save-db:disabled { opacity: .4; cursor: not-allowed; background: var(--primary); border-color: var(--primary) }
 .lab-btn:disabled       { opacity: .4; cursor: not-allowed }
 

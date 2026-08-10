@@ -8,6 +8,7 @@ not add or change any backend API routes.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from statistics import median
 import sys
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
 import pandas as pd
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response
 
 
 DEFAULT_BACKEND_ROOT = Path(__file__).resolve().parent.parent / "MiraiTech-backend"
@@ -26,6 +27,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from jump_bilstm_runtime import MarkupJumpBiLSTMCalculator  # noqa: E402
+from app.utils.auth import get_current_user  # noqa: E402
 
 
 app = FastAPI(title="MiraiTech Markup Calculators")
@@ -82,6 +84,157 @@ SENSOR_TO_FOOT = {
 }
 
 _markup_jump_bilstm_calculator = None
+
+GOOGLE_CLOUD_AUTH_HINT = (
+    "Нет доступа к Google Cloud. Выполните `gcloud auth application-default login` "
+    "в отдельном терминале, затем перезапустите `npm run dev`."
+)
+
+
+async def _run_markup_io(func, *args):
+    """Run blocking markup storage I/O and turn expired ADC into a useful response."""
+    try:
+        return await asyncio.to_thread(func, *args)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        message = str(exc).lower()
+        auth_markers = (
+            "reauthentication is needed",
+            "default credentials were not found",
+            "could not automatically determine credentials",
+            "invalid_grant",
+        )
+        if any(marker in message for marker in auth_markers):
+            raise HTTPException(status_code=503, detail=GOOGLE_CLOUD_AUTH_HINT) from exc
+        raise HTTPException(
+            status_code=500,
+            detail="Локальный API разметчика не смог получить данные сессии.",
+        ) from exc
+
+
+def _parse_additional_info(raw: Any) -> Dict[str, Any]:
+    """Return a session's additional_info as a plain object."""
+    value = raw
+    try:
+        while isinstance(value, str):
+            value = json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _list_markup_sessions(search: str | None, page_size: int) -> Dict[str, Any]:
+    """List sessions across owners for the internal markup workspace."""
+    from app.core.config import settings
+    from app.db.database import get_db
+
+    where = ""
+    params: list[Any] = []
+    if search:
+        where = """
+            WHERE CAST(s.session_id AS TEXT) LIKE %s
+               OR LOWER(COALESCE(s.session_title, '')) LIKE %s
+               OR LOWER(COALESCE(p.patient_name, '')) LIKE %s
+        """
+        pattern = f"%{search.strip().lower()}%"
+        params.extend([pattern, pattern, pattern])
+    params.append(page_size)
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT s.session_id, s.user_id, s.date, s.time, s.session_title,
+                       p.patient_name
+                FROM {settings.DB_SCHEMA}.sessions s
+                LEFT JOIN {settings.DB_SCHEMA}.members p
+                       ON p.member_id = s.member_id
+                {where}
+                ORDER BY s.session_id DESC
+                LIMIT %s
+                """,
+                tuple(params),
+            )
+            rows = cursor.fetchall()
+
+    return {
+        "items": [
+            {
+                "id": row["session_id"],
+                "owner_id": row.get("user_id"),
+                "member_name": row.get("patient_name") or "—",
+                "session_title": row.get("session_title"),
+                "date": row.get("date"),
+                "time": row.get("time"),
+            }
+            for row in rows
+        ]
+    }
+
+
+def _get_markup_session(session_id: int) -> Dict[str, Any]:
+    """Load lightweight metadata without an owner/account restriction."""
+    from app.core.config import settings
+    from app.db.database import get_db
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT s.session_id, s.user_id, s.date, s.time, s.session_title,
+                       s.additional_info, p.patient_name
+                FROM {settings.DB_SCHEMA}.sessions s
+                LEFT JOIN {settings.DB_SCHEMA}.members p
+                       ON p.member_id = s.member_id
+                WHERE s.session_id = %s
+                """,
+                (session_id,),
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {
+        "id": row["session_id"],
+        "owner_id": row.get("user_id"),
+        "member_name": row.get("patient_name") or "—",
+        "session_title": row.get("session_title"),
+        "date": row.get("date"),
+        "time": row.get("time"),
+        "additional_info": _parse_additional_info(row.get("additional_info")),
+    }
+
+
+def _update_markup_additional_info(
+    session_id: int,
+    additional_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Replace markup metadata without coupling it to the signed-in owner."""
+    from app.core.config import settings
+    from app.db.database import get_db
+    from app.db.redis_sync import invalidate_session_caches
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE {settings.DB_SCHEMA}.sessions
+                SET additional_info = %s
+                WHERE session_id = %s
+                RETURNING additional_info
+                """,
+                (json.dumps(additional_info), session_id),
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    invalidate_session_caches(session_id)
+    return {
+        "id": session_id,
+        "additional_info": _parse_additional_info(row.get("additional_info")),
+    }
 
 
 def _get_markup_jump_calculator():
@@ -638,24 +791,43 @@ def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, An
             None,
         )
 
+    end = finish
+    if start is not None and end is None:
+        end = next(
+            (
+                point for point in reversed(points)
+                if float(point.time) > float(start.time)
+                and float(point.distance) >= float(start.distance)
+            ),
+            None,
+        )
+
     contacts: List[Dict[str, Any]] = []
     step_contacts: List[Dict[str, Any]] = []
     step_lengths: List[float] = []
     stride_lengths: List[float] = []
     stride_lengths_by_foot = {"left": [], "right": []}
     cadence_spm = None
-    if start is not None and finish is not None:
+    segment_distance_m = None
+    if start is not None and end is not None:
         start_time_s = float(start.time) / 1000.0
-        finish_time_s = float(finish.time) / 1000.0
+        end_time_s = float(end.time) / 1000.0
         start_distance = float(start.distance)
+        is_complete = finish is not None
+        segment_distance_m = (
+            30.0
+            if is_complete
+            else max(0.0, float(end.distance) - start_distance)
+        )
         contacts.append({
             "foot": "both",
             "start_time_s": start_time_s,
-            "end_time_s": finish_time_s,
+            "end_time_s": end_time_s,
             "peak_time_s": start_time_s,
-            "duration_ms": float(finish.time) - float(start.time),
+            "duration_ms": float(end.time) - float(start.time),
             "kind": "sprint",
-            "distance_m": 30.0,
+            "distance_m": round(segment_distance_m, 3),
+            "is_complete": is_complete,
             "confidence": None,
         })
 
@@ -665,7 +837,7 @@ def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, An
             (
                 dict(event)
                 for event in cadence_result.get("contacts", [])
-                if start_time_s <= float(event.get("start_time_s", -1)) <= finish_time_s
+                if start_time_s <= float(event.get("start_time_s", -1)) <= end_time_s
             ),
             key=lambda event: float(event["start_time_s"]),
         )
@@ -698,7 +870,7 @@ def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, An
                 if foot in stride_lengths_by_foot:
                     stride_lengths_by_foot[foot].append(stride_length)
 
-            event["end_time_s"] = min(float(event["end_time_s"]), finish_time_s)
+            event["end_time_s"] = min(float(event["end_time_s"]), end_time_s)
             event["duration_ms"] = max(
                 0.0,
                 (float(event["end_time_s"]) - float(event["start_time_s"])) * 1000.0,
@@ -723,6 +895,8 @@ def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, An
         "summary": {
             "event_count": len(contacts),
             "sprint_count": 1 if start is not None and finish is not None else 0,
+            "segment_found": bool(start is not None and end is not None),
+            "distance_m": round(segment_distance_m, 3) if segment_distance_m is not None else None,
             "step_count": len(step_contacts),
             "left_count": sum(1 for event in step_contacts if event.get("foot") == "left"),
             "right_count": sum(1 for event in step_contacts if event.get("foot") == "right"),
@@ -772,6 +946,63 @@ def _calculate(
 @app.get("/health")
 def health() -> Dict[str, bool]:
     return {"ok": True}
+
+
+@app.get("/markup/sessions")
+async def list_markup_sessions(
+    search: str | None = Query(None),
+    page_size: int = Query(100, ge=1, le=500),
+    _current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return sessions from every account for the internal markup tool."""
+    return await _run_markup_io(_list_markup_sessions, search, page_size)
+
+
+@app.get("/markup/sessions/{session_id}")
+async def get_markup_session(
+    session_id: int,
+    _current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Return account-independent session metadata used by the markup UI."""
+    return await _run_markup_io(_get_markup_session, session_id)
+
+
+@app.get("/markup/sessions/{session_id}/parquet")
+async def get_markup_session_parquet(
+    session_id: int,
+    _current_user: dict = Depends(get_current_user),
+) -> Response:
+    """Serve the GCS Parquet object (with the backend's legacy DB fallback)."""
+    from app.services.session_data_storage import get_session_parquet_bytes
+
+    data = await _run_markup_io(get_session_parquet_bytes, session_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Session has no data")
+    return Response(
+        content=data,
+        media_type="application/vnd.apache.parquet",
+        headers={
+            "Content-Disposition": f'attachment; filename="session_{session_id}.parquet"',
+            "X-Markup-Storage": "gcs-first",
+        },
+    )
+
+
+@app.put("/markup/sessions/{session_id}/additional-info")
+async def update_markup_additional_info(
+    session_id: int,
+    payload: Dict[str, Any] = Body(...),
+    _current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Save shared markup metadata independently of the session owner."""
+    additional_info = payload.get("additional_info")
+    if not isinstance(additional_info, dict):
+        raise HTTPException(status_code=422, detail="additional_info must be an object")
+    return await _run_markup_io(
+        _update_markup_additional_info,
+        session_id,
+        additional_info,
+    )
 
 
 @app.post("/calculate/{calculator_id}")
