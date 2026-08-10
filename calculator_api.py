@@ -206,6 +206,15 @@ def _get_markup_session(session_id: int) -> Dict[str, Any]:
     }
 
 
+def _get_markup_sprint_charts(session_id: int) -> Any:
+    """Build sprint charts without restricting the session to the token owner."""
+    from app.services.charts_service import ChartsService
+
+    session = _get_markup_session(session_id)
+    owner_id = session.get("owner_id") or 0
+    return ChartsService().get_sprint_charts(session_id, owner_id)
+
+
 def _update_markup_additional_info(
     session_id: int,
     additional_info: Dict[str, Any],
@@ -986,6 +995,15 @@ async def get_markup_session_parquet(
             "X-Markup-Storage": "gcs-first",
         },
     )
+
+
+@app.get("/markup/sessions/{session_id}/charts/sprint")
+async def get_markup_session_sprint_charts(
+    session_id: int,
+    _current_user: dict = Depends(get_current_user),
+) -> Any:
+    """Return sprint predictions for any session visible to the markup workspace."""
+    return await _run_markup_io(_get_markup_sprint_charts, session_id)
 
 
 @app.put("/markup/sessions/{session_id}/additional-info")
