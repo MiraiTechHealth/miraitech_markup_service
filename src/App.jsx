@@ -1020,6 +1020,7 @@ export default function App() {
   const calculatorDataVersionRef = useRef(0)
   const cursorShapesRef  = useRef([])
   const selectedColsRef  = useRef([])
+  const columnSelectionInitializedRef = useRef(false)
   const anglesUnwrappedRef = useRef(false)
   const isDragging       = useRef(false)
   const isVideoPan      = useRef(false)
@@ -1208,6 +1209,9 @@ export default function App() {
   const loadSession = useCallback(async () => {
     const sid = sessionId.trim()
     if (!sid) { setStatus({ text: 'Введите номер сессии', type: 'error' }); return }
+    const previousSelectedCols = columnSelectionInitializedRef.current
+      ? [...selectedColsRef.current]
+      : null
 
     setStatus({ text: `Загружаю сессию ${sid}…`, type: 'loading' })
     setSessionLabel(`Сессия #${sid}`)
@@ -1222,7 +1226,6 @@ export default function App() {
     }
     setParquetData(null)
     setColumns([])
-    setSelectedCols([])
     setColumnsPanelOpen(false)
     setSensorNames([])
     setLeftContacts([])
@@ -1313,7 +1316,12 @@ export default function App() {
 
       const numCols = computeNumericColumns(colMap, tCol)
       setColumns(numCols)
-      setSelectedCols(buildDefaultCols(numCols, hasST, colMap, insole))
+      const nextSelectedCols = previousSelectedCols === null
+        ? buildDefaultCols(numCols, hasST, colMap, insole)
+        : previousSelectedCols.filter(col => numCols.includes(col))
+      columnSelectionInitializedRef.current = true
+      selectedColsRef.current = nextSelectedCols
+      setSelectedCols(nextSelectedCols)
       setShowSpeedTracker(hasST)
       setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
 
@@ -1441,13 +1449,9 @@ export default function App() {
     if (showGapsRef.current && checkHzData) {
       const seen = new Set()
       const intervals = []
-      insoleSensorNames.forEach(name => {
-        const foot = sensorFootForName(name, insoleSensorNames)
-        const visible = foot === 'left' ? showSensor1 : showSensor2
-        if (!visible) return
+      const addSensorGaps = (name, shift) => {
         const gaps = checkHzData[name]?.gaps
         if (!gaps?.length) return
-        const shift = foot === 'left' ? offsetS1Ref.current : offsetS2Ref.current
         for (const [startT, endT] of gaps) {
           // Gap timestamps use the same raw Time units as the plotted traces.
           // Dividing ms by 1000 here used to place every red band off-chart.
@@ -1458,7 +1462,17 @@ export default function App() {
           seen.add(key)
           intervals.push([x0, x1])
         }
+      }
+
+      insoleSensorNames.forEach(name => {
+        const foot = sensorFootForName(name, insoleSensorNames)
+        const visible = foot === 'left' ? showSensor1 : showSensor2
+        if (!visible) return
+        const shift = foot === 'left' ? offsetS1Ref.current : offsetS2Ref.current
+        addSensorGaps(name, shift)
       })
+      if (showSpeedTracker) addSensorGaps(SPEED_TRACKER, offsetSTRef.current)
+
       const nSubplots = selectedColsRef.current.length || 1
       gapShapes.push(...buildGapBandShapes(intervals, nSubplots))
     }
@@ -1472,7 +1486,7 @@ export default function App() {
         ...cursorShapesRef.current,
       ],
     })
-  }, [checkHzData, insoleSensorNames, showSensor1, showSensor2])
+  }, [checkHzData, insoleSensorNames, showSensor1, showSensor2, showSpeedTracker])
 
   useEffect(() => {
     leftContactsRef.current  = leftContacts
@@ -1982,6 +1996,9 @@ export default function App() {
 
   // ── Parquet loader ────────────────────────────────────────────────────────
   const loadParquetFile = useCallback(async (file) => {
+    const previousSelectedCols = columnSelectionInitializedRef.current
+      ? [...selectedColsRef.current]
+      : null
     setStatus({ text: `Читаю ${file.name}…`, type: 'loading' })
     setSessionLabel(file.name)
     setChartReady(false)
@@ -2042,7 +2059,12 @@ export default function App() {
 
       const numCols = computeNumericColumns(colMap, tCol)
       setColumns(numCols)
-      setSelectedCols(buildDefaultCols(numCols, hasST, colMap, insole))
+      const nextSelectedCols = previousSelectedCols === null
+        ? buildDefaultCols(numCols, hasST, colMap, insole)
+        : previousSelectedCols.filter(col => numCols.includes(col))
+      columnSelectionInitializedRef.current = true
+      selectedColsRef.current = nextSelectedCols
+      setSelectedCols(nextSelectedCols)
       setShowSpeedTracker(hasST)
       setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
 
