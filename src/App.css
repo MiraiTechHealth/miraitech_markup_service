@@ -1403,6 +1403,24 @@ label.lab-btn:has(input:focus-visible) {
   padding: 4px 9px;
 }
 
+/* Yaw-drift toggle: the button plus, when there is nothing to correct, the
+   reason why — a legitimate outcome, so it reads as a note, not an error. */
+.yaw-drift-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.yaw-drift-note {
+  max-width: 34ch;
+  overflow: hidden;
+  color: #64748b;
+  font-size: 11px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .label-toolbar-actions {
   margin-left: auto;
   padding: 4px;
