@@ -1270,6 +1270,24 @@ function parseCsvText(text) {
   return { headers, rows }
 }
 
+// CSV cells arrive as strings; parquet columns are already typed. Convert the
+// columns that hold only numbers so the chart, calculators and gap stats see
+// the same shape from both sources ('' → null, text columns kept as is).
+function coerceCsvColumnsToNumbers(colMap) {
+  Object.keys(colMap).forEach(col => {
+    const arr = colMap[col] || []
+    let hasNumber = false
+    for (let i = 0; i < arr.length; i++) {
+      const v = arr[i]
+      if (v === null || v === undefined || v === '') continue
+      if (safeNum(v) === null) return // non-numeric column (Name, …)
+      hasNumber = true
+    }
+    if (!hasNumber) return
+    colMap[col] = arr.map(v => (v === null || v === undefined || v === '' ? null : safeNum(v)))
+  })
+}
+
 function isTargetOne(v) {
   if (v === 1 || v === '1' || v === 1.0) return true
   const s = String(v ?? '').trim()
@@ -2212,39 +2230,157 @@ export default function App() {
     fetchSessionMarkupsFromDb,
   ])
 
+  // Import works standalone: a CSV that carries sensor channels becomes the
+  // dataset (no session number required, the previous chart is dropped), while
+  // a Target-only CSV stays an overlay on the already loaded data. Target is
+  // optional — an unlabeled CSV just loads as a session to mark up.
   const importLabeledCsv = useCallback(async (file) => {
-    if (!parquetData) {
-      setStatus({ text: 'Сначала загрузите сессию или parquet', type: 'error' })
-      return
-    }
-
+    const previousSelectedCols = columnSelectionInitializedRef.current
+      ? [...selectedColsRef.current]
+      : null
     const sid = sessionId.trim()
-    if (!sid) {
-      setStatus({ text: 'Укажите ID сессии (например 4102) — без него сохранение в БД невозможно', type: 'error' })
-      return
-    }
 
-    setStatus({ text: `Читаю разметку ${file.name}…`, type: 'loading' })
+    setStatus({ text: `Читаю ${file.name}…`, type: 'loading' })
     setRelabelStep(null)
     setSelectedMarkup(null)
 
     try {
-      if (token) {
-        await fetchSessionMarkupsFromDb(sid)
-      }
-
       const text = await file.text()
       const { headers, rows } = parseCsvText(text)
+      if (!rows.length) throw new Error('CSV пустой')
 
       const tCol = headers.find(c => c === 'Time')
         || headers.find(c => ['time', 'timestamp', 'Timestamp', 't'].includes(c))
       if (!tCol) throw new Error('Колонка Time не найдена в CSV')
 
       const hasTarget = headers.some(c => ['Target', 'target', 'Label', 'label'].includes(c))
-      if (!hasTarget) throw new Error('Колонка Target не найдена — это не размеченный CSV')
 
-      if (!sensorGroups.left.length && !sensorGroups.right.length) {
-        throw new Error('В данных сессии нет сенсоров стельки')
+      const colMap = rowsToColMap(rows)
+      coerceCsvColumnsToNumbers(colMap)
+      const isDataset = computeNumericColumns(colMap, tCol).length > 0
+
+      let leftSensors = sensorGroups.left
+      let rightSensors = sensorGroups.right
+      let datasetHint = ''
+
+      if (isDataset) {
+        // ── Replace the current dataset with the CSV ──────────────────────
+        setChartReady(false)
+        plotInitRef.current = false
+        if (chartDivRef.current) {
+          if (chartNativeClickRef.current) {
+            chartDivRef.current.removeEventListener('click', chartNativeClickRef.current, true)
+            chartNativeClickRef.current = null
+          }
+          Plotly.purge(chartDivRef.current)
+        }
+        setColumnsPanelOpen(false)
+        setLeftContacts([])
+        setRightContacts([])
+        setMarkupFiles([])
+        setActiveMarkupFileId('')
+        setPendingImportFilename('')
+        setSessionRecordAvailable(false)
+        setShowLeftPatterns(true)
+        setShowRightPatterns(true)
+        setShowSensor1(true)
+        setShowSensor2(true)
+        setShowSpeedTracker(false)
+        setSpeedPredict(null)
+        setShowSpeedPredict(false)
+        setShowDistancePredict(false)
+        calculatorDataVersionRef.current += 1
+        setCalculatorResults({})
+        setActiveCalculators([])
+        setCalculatorLoading('')
+        setSelectedCalculatorContact(null)
+        setExtraCalculatorsOpen(false)
+        setProtocolDetectorsOpen(false)
+        setOffsetST(0)
+        setShowGaps(false)
+        setCheckHzData(null)
+        anglesUnwrappedRef.current = false
+        setAnglesUnwrapped(false)
+        subplotRangesRef.current = {}
+        importedCsvTextRef.current = ''
+
+        addAccTkeoColumn(colMap, tCol)
+        setParquetData(colMap)
+        setTimeCol(tCol)
+
+        const names = sortSensorNames(colMap)
+        const insole = names.filter(n => n !== SPEED_TRACKER)
+        const hasST = names.includes(SPEED_TRACKER)
+        setSensorNames(names)
+
+        const numCols = computeNumericColumns(colMap, tCol)
+        setColumns(numCols)
+        const keptCols = previousSelectedCols === null
+          ? []
+          : previousSelectedCols.filter(col => numCols.includes(col))
+        // Columns of an unrelated session may not exist here — fall back to
+        // defaults so the new chart is never empty.
+        const nextSelectedCols = keptCols.length
+          ? keptCols
+          : buildDefaultCols(numCols, hasST, colMap, insole)
+        columnSelectionInitializedRef.current = true
+        selectedColsRef.current = nextSelectedCols
+        setSelectedCols(nextSelectedCols)
+        setShowSpeedTracker(hasST)
+        setOffsetST(hasST ? computeAutoOffsetST(colMap, tCol, insole) : 0)
+
+        const tVals = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
+        const tMax = tVals.length ? arrayMax(tVals) : 0
+        const autoUnit = tMax > 3600 ? 'ms' : 's'
+        setTimeUnit(autoUnit)
+        timeUnitRef.current = autoUnit
+
+        const gapStats = computeGapStats(colMap, tCol)
+        const gapCount = Object.values(gapStats)
+          .reduce((count, sensor) => count + sensor.gaps.length, 0)
+        setCheckHzData(gapStats)
+        setShowGaps(gapCount > 0)
+
+        setSessionLabel(sid ? `Сессия #${sid} · ${file.name}` : file.name)
+
+        const groups = groupSensorNamesByFoot(insole)
+        leftSensors = groups.left
+        rightSensors = groups.right
+
+        const stHint = hasST ? ' · SpeedTracker' : ''
+        const gapHint = gapCount ? ` · ${gapCount} пропуск(ов)` : ' · без пропусков'
+        datasetHint = `${rows.length} строк · ${numCols.length} колонок · ${autoUnit}${stHint}${gapHint}`
+
+        // The session number stays optional — it only unlocks saving to the DB.
+        if (sid && token) {
+          try {
+            await fetchSessionMarkupsFromDb(sid)
+            setSessionRecordAvailable(true)
+          } catch {
+            setSessionRecordAvailable(false)
+          }
+        }
+      } else {
+        if (!parquetData) {
+          throw new Error('В CSV нет колонок с данными сенсоров — сначала загрузите сессию или parquet')
+        }
+        if (!hasTarget) {
+          throw new Error('В CSV нет ни данных сенсоров, ни колонки Target')
+        }
+        if (!sensorGroups.left.length && !sensorGroups.right.length) {
+          throw new Error('В данных сессии нет сенсоров стельки')
+        }
+        if (sid && token) {
+          try { await fetchSessionMarkupsFromDb(sid) } catch { /* markups load on save */ }
+        }
+      }
+
+      if (!hasTarget) {
+        setStatus({
+          text: `✓ ${file.name}: ${datasetHint} · разметки (Target) в файле нет`,
+          type: 'ok',
+        })
+        return
       }
 
       const csvNames = new Set(rows.map(r => r.Name || r.name).filter(Boolean))
@@ -2253,8 +2389,8 @@ export default function App() {
         if (matched.length) return matched
         return fallback && csvNames.has(fallback) ? [fallback] : preferred
       }
-      const leftNames = resolveSensors(sensorGroups.left, 'ESP32_Sensor_1')
-      const rightNames = resolveSensors(sensorGroups.right, 'ESP32_Sensor_2')
+      const leftNames = resolveSensors(leftSensors, 'ESP32_Sensor_1')
+      const rightNames = resolveSensors(rightSensors, 'ESP32_Sensor_2')
 
       const { leftContacts: importedLeft, rightContacts: importedRight, leftCount, rightCount } =
         extractContactsFromLabeledCsv(
@@ -2267,6 +2403,13 @@ export default function App() {
         )
 
       if (leftCount === 0 && rightCount === 0) {
+        if (isDataset) {
+          setStatus({
+            text: `✓ ${file.name}: ${datasetHint} · интервалов с Target=1 нет`,
+            type: 'ok',
+          })
+          return
+        }
         throw new Error('В CSV нет интервалов с Target=1')
       }
 
@@ -2279,18 +2422,16 @@ export default function App() {
       setLabelingMode(true)
       setShowLeftPatterns(true)
       setShowRightPatterns(true)
-      if (!sessionLabel.startsWith('Сессия #')) {
-        setSessionLabel(`Сессия #${sid}`)
-      }
 
+      const savePrompt = sid ? ' Нажмите «Сохранить в БД».' : ''
       setStatus({
-        text: `✓ Импорт ${file.name}: S1 ${leftCount} · S2 ${rightCount}. Нажмите «Сохранить в БД».`,
+        text: `✓ Импорт ${file.name}: S1 ${leftCount} · S2 ${rightCount}.${savePrompt}`,
         type: 'ok',
       })
     } catch (err) {
       setStatus({ text: `Ошибка импорта CSV: ${err.message}`, type: 'error' })
     }
-  }, [parquetData, sensorGroups, sessionId, token, fetchSessionMarkupsFromDb, sessionLabel])
+  }, [parquetData, sensorGroups, sessionId, token, fetchSessionMarkupsFromDb])
 
   // ── Video zoom helpers ────────────────────────────────────────────────────
   const clampPan = useCallback((z, px, py) => {
@@ -4486,10 +4627,7 @@ export default function App() {
                   accept=".csv,text/csv"
                   onFile={importLabeledCsv}
                   className="btn-secondary lab-btn import"
-                  disabled={!parquetData}
-                  title={parquetData
-                    ? 'Загрузить размеченный CSV (Target) и восстановить интервалы на графике'
-                    : 'Сначала загрузите сессию или parquet'}
+                  title="Загрузить CSV: данные сессии и, если в файле есть Target, интервалы разметки. Номер сессии не нужен"
                 >
                   <UiIcon name="upload" /> Импорт CSV
                 </UploadBtn>
@@ -4497,8 +4635,10 @@ export default function App() {
                   type="button"
                   className="btn-secondary lab-btn export"
                   onClick={exportLabels}
-                  disabled={totalContacts === 0}
-                  title="Скачать CSV с разметкой Target"
+                  disabled={!parquetData}
+                  title={parquetData
+                    ? 'Скачать CSV данных с колонкой Target (0, если разметки нет)'
+                    : 'Сначала загрузите сессию, parquet или CSV'}
                 >
                   <UiIcon name="download" /> Скачать CSV
                 </button>
