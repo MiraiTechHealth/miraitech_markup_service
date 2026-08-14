@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+import numpy as np
 import pandas as pd
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response
 
@@ -61,7 +62,6 @@ CALCULATOR_MODELS = {
     "protocol-beep-detector": "YoyoTurnCalculator phases",
     "protocol-ttest-detector": "TurnCalculator T-Test phases",
 }
-
 CALCULATOR_MODEL_FILES = {
     "step-cadence": "step_gc_model.pt",
     "jump-metrics": "jump_bilstm.pt",
@@ -952,6 +952,233 @@ def _calculate(
     return _cadence_result(calculator_id, rows)
 
 
+IMU_COLUMNS = ["AcX", "AcY", "AcZ", "XData", "YData", "ZData"]
+
+GRAVITY_MS2 = 9.80665
+
+
+class InsoleAHRS:
+    """Madgwick AHRS that turns raw insole IMU samples into firmware channels.
+
+    Raw sensors report accelerations with gravity still in them and gyroscope
+    rates in dps. The new firmware (miraitech_sensors.h) instead ships linear
+    accelerations in the BLE basis (AcX = linY, AcY = -linX, AcZ = linZ) plus
+    an integrated Heading, Roll and Pitch, each quantised to its own step.
+    """
+
+    def __init__(
+        self,
+        sample_rate: float = 500.0,
+        beta: float = 0.1,
+        initial_yaw: float = 0.0,
+    ):
+        self.dt = 1.0 / sample_rate
+        self.beta = beta
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])
+        self.integrated_yaw = float(initial_yaw)
+        self.initialized = False
+
+    def init_orientation(self, ax: float, ay: float, az: float) -> None:
+        norm_a = np.sqrt(ax * ax + ay * ay + az * az)
+        if norm_a > 1e-4:
+            ax_n, ay_n, az_n = ax / norm_a, ay / norm_a, az / norm_a
+            roll = np.arctan2(ay_n, az_n)
+            pitch = np.arctan2(-ax_n, np.sqrt(ay_n * ay_n + az_n * az_n))
+            cr, sr = np.cos(roll * 0.5), np.sin(roll * 0.5)
+            cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
+            self.q = np.array([cr * cp, sr * cp, cr * sp, -sr * sp])
+            self.q /= np.linalg.norm(self.q)
+        self.initialized = True
+
+    def update(
+        self,
+        ax: float,
+        ay: float,
+        az: float,
+        gx_dps: float,
+        gy_dps: float,
+        gz_dps: float,
+    ):
+        if not self.initialized:
+            self.init_orientation(ax, ay, az)
+
+        gx, gy, gz = np.deg2rad(gx_dps), np.deg2rad(gy_dps), np.deg2rad(gz_dps)
+        q0, q1, q2, q3 = self.q
+
+        # Quaternion rate from the gyroscope
+        qDot1 = 0.5 * (-q1 * gx - q2 * gy - q3 * gz)
+        qDot2 = 0.5 * (q0 * gx + q2 * gz - q3 * gy)
+        qDot3 = 0.5 * (q0 * gy - q1 * gz + q3 * gx)
+        qDot4 = 0.5 * (q0 * gz + q1 * gy - q2 * gx)
+
+        norm_a = np.sqrt(ax * ax + ay * ay + az * az)
+        if norm_a > 1e-4:
+            ax_n, ay_n, az_n = ax / norm_a, ay / norm_a, az / norm_a
+            _2q0, _2q1, _2q2, _2q3 = 2.0 * q0, 2.0 * q1, 2.0 * q2, 2.0 * q3
+            _4q0, _4q1, _4q2 = 4.0 * q0, 4.0 * q1, 4.0 * q2
+            _8q1, _8q2 = 8.0 * q1, 8.0 * q2
+            q0q0, q1q1, q2q2, q3q3 = q0 * q0, q1 * q1, q2 * q2, q3 * q3
+
+            s0 = _4q0 * q2q2 + _2q2 * ax_n + _4q0 * q1q1 - _2q1 * ay_n
+            s1 = (
+                _4q1 * q3q3
+                - _2q3 * ax_n
+                + 4.0 * q0q0 * q1
+                - _2q0 * ay_n
+                - _4q1
+                + _8q1 * q1q1
+                + _8q1 * q2q2
+                + _4q1 * az_n
+            )
+            s2 = (
+                4.0 * q0q0 * q2
+                + _2q0 * ax_n
+                + _4q2 * q3q3
+                - _2q3 * ay_n
+                - _4q2
+                + _8q2 * q1q1
+                + _8q2 * q2q2
+                + _4q2 * az_n
+            )
+            s3 = 4.0 * q1q1 * q3 - _2q1 * ax_n + 4.0 * q2q2 * q3 - _2q2 * ay_n
+
+            norm_s = np.sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3)
+            if norm_s > 1e-4:
+                qDot1 -= self.beta * (s0 / norm_s)
+                qDot2 -= self.beta * (s1 / norm_s)
+                qDot3 -= self.beta * (s2 / norm_s)
+                qDot4 -= self.beta * (s3 / norm_s)
+
+        q0 += qDot1 * self.dt
+        q1 += qDot2 * self.dt
+        q2 += qDot3 * self.dt
+        q3 += qDot4 * self.dt
+        norm_q = np.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3)
+        self.q = np.array([q0, q1, q2, q3]) / norm_q
+        q0, q1, q2, q3 = self.q
+
+        # Gravity vector in the body frame
+        gx_body = 2.0 * (q1 * q3 - q0 * q2)
+        gy_body = 2.0 * (q0 * q1 + q2 * q3)
+        gz_body = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3
+
+        # Linear body accelerations in m/s²
+        lin_ax = ax - gx_body * GRAVITY_MS2
+        lin_ay = ay - gy_body * GRAVITY_MS2
+        lin_az = az - gz_body * GRAVITY_MS2
+
+        # Euler angles
+        sinr_cosp = 2.0 * (q0 * q1 + q2 * q3)
+        cosr_cosp = 1.0 - 2.0 * (q1 * q1 + q2 * q2)
+        roll = np.rad2deg(np.arctan2(sinr_cosp, cosr_cosp))
+
+        sinp = 2.0 * (q0 * q2 - q3 * q1)
+        pitch = (
+            np.sign(sinp) * 90.0
+            if np.abs(sinp) >= 1.0
+            else np.rad2deg(np.arcsin(sinp))
+        )
+
+        # Heading integrated from the gyroscope projected on gravity
+        yawRateDps = gx_dps * gx_body + gy_dps * gy_body + gz_dps * gz_body
+        self.integrated_yaw = (self.integrated_yaw - yawRateDps * self.dt) % 360.0
+
+        # Pack into the miraitech_sensors.h layout and quantisation steps
+        AcX = np.round(lin_ay * 25.0) / 25.0
+        AcY = np.round(-lin_ax * 25.0) / 25.0
+        AcZ = np.round(lin_az * 25.0) / 25.0
+
+        hdg = (int(np.round(self.integrated_yaw)) % 360) - 180
+        XData = float(hdg + 180)
+        YData = float(int(np.round(roll * 0.5)) * 2)
+        ZData = float(int(np.round(-pitch)))
+
+        return AcX, AcY, AcZ, XData, YData, ZData
+
+
+def is_raw_sensor(sensor_df: pd.DataFrame) -> bool:
+    """Report whether a sensor still carries raw IMU signals.
+
+    Raw accelerations keep gravity (|AcZ| stays near 9.8) and raw gyroscope
+    rates go negative and well past the ±90° an angle channel can hold.
+    """
+    if len(sensor_df) == 0:
+        return False
+    if not {"AcZ", "XData", "ZData"}.issubset(sensor_df.columns):
+        return False
+    acz = pd.to_numeric(sensor_df["AcZ"], errors="coerce")
+    xdata = pd.to_numeric(sensor_df["XData"], errors="coerce")
+    zdata = pd.to_numeric(sensor_df["ZData"], errors="coerce")
+    has_gravity = bool(acz.abs().median() > 5.0)
+    has_raw_gyro = bool((xdata.min() < -5.0) or (zdata.abs().max() > 95.0))
+    return has_gravity or has_raw_gyro
+
+
+def _preprocess_imu_dataframe(
+    df: pd.DataFrame,
+    target_sensor: str = "auto",
+    sample_rate: float = 500.0,
+) -> tuple[pd.DataFrame, List[str]]:
+    df_out = df.copy()
+    processed_sensors: List[str] = []
+
+    # Seed the heading from a sensor that already runs the new firmware, so
+    # both feet share one course reference.
+    initial_yaw = 0.0
+    for _name, group in df_out.groupby("Name"):
+        if "XData" in group.columns and not is_raw_sensor(group):
+            seed = pd.to_numeric(group["XData"], errors="coerce").dropna()
+            if not seed.empty:
+                initial_yaw = float(seed.iloc[0])
+                break
+
+    for name, group in df_out.groupby("Name"):
+        name_str = str(name)
+        if target_sensor == "auto":
+            needs_processing = is_raw_sensor(group)
+        elif target_sensor == "all":
+            needs_processing = True
+        else:
+            needs_processing = name_str == target_sensor
+        if not needs_processing:
+            continue
+
+        ordered = group.sort_values("Time") if "Time" in group.columns else group
+        channels = {}
+        for column in IMU_COLUMNS:
+            if column in ordered.columns:
+                values = pd.to_numeric(ordered[column], errors="coerce")
+                channels[column] = values.fillna(0.0).to_numpy(dtype=float)
+            else:
+                channels[column] = np.zeros(len(ordered))
+
+        ahrs = InsoleAHRS(
+            sample_rate=sample_rate,
+            beta=0.1,
+            initial_yaw=initial_yaw,
+        )
+        processed_rows = [
+            ahrs.update(
+                ax=channels["AcX"][index],
+                ay=channels["AcY"][index],
+                az=channels["AcZ"][index],
+                gx_dps=channels["XData"][index],
+                gy_dps=channels["YData"][index],
+                gz_dps=channels["ZData"][index],
+            )
+            for index in range(len(ordered))
+        ]
+        if not processed_rows:
+            continue
+
+        # Assign by the sorted index: rows of a sensor are not necessarily
+        # stored in time order inside the session frame.
+        df_out.loc[ordered.index, IMU_COLUMNS] = np.array(processed_rows, dtype=float)
+        processed_sensors.append(name_str)
+
+    return df_out, processed_sensors
+
+
 @app.get("/health")
 def health() -> Dict[str, bool]:
     return {"ok": True}
@@ -1021,6 +1248,52 @@ async def update_markup_additional_info(
         session_id,
         additional_info,
     )
+
+
+@app.post("/markup/preprocess-imu")
+async def preprocess_imu(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Convert raw IMU channels of a session into the new firmware format."""
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise HTTPException(status_code=422, detail="Session rows are required")
+
+    target_sensor = str(payload.get("target_sensor") or "auto")
+    raw_sample_rate = payload.get("sample_rate")
+    try:
+        sample_rate = 500.0 if raw_sample_rate is None else float(raw_sample_rate)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="sample_rate must be a number")
+    if sample_rate <= 0:
+        raise HTTPException(status_code=422, detail="sample_rate must be positive")
+
+    df = pd.DataFrame(rows)
+    if "Name" not in df.columns:
+        raise HTTPException(status_code=422, detail="Session rows have no Name column")
+    if target_sensor not in {"auto", "all"}:
+        known = {str(name) for name in df["Name"].dropna().unique()}
+        if target_sensor not in known:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Датчик {target_sensor} отсутствует в данных сессии",
+            )
+
+    try:
+        df_processed, processed_sensors = await asyncio.to_thread(
+            _preprocess_imu_dataframe,
+            df,
+            target_sensor,
+            sample_rate,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # NaN is not valid JSON — hand missing cells back as null.
+    df_processed = df_processed.astype(object).where(pd.notna(df_processed), None)
+    return {
+        "rows": df_processed.to_dict(orient="records"),
+        "processed_sensors": processed_sensors,
+        "success": True,
+    }
 
 
 @app.post("/calculate/{calculator_id}")

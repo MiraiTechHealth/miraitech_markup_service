@@ -642,6 +642,8 @@ function unwrapAngleDegrees(arr, threshold = 180.0) {
 }
 
 const UNWRAPPABLE_ANGLE_COLUMNS = new Set(['XData', 'YData', 'ZData'])
+// Channels the IMU postprocessing rewrites — snapshotted so it can be undone.
+const IMU_SNAPSHOT_COLUMNS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'acc_tkeo']
 
 // ── Gyro yaw drift ───────────────────────────────────────────────────────────
 // A port of the backend's app/services/calculators/yaw_drift_calculator.py,
@@ -1079,6 +1081,7 @@ function correctedXData(colMap, drift) {
   }
   return out
 }
+
 function formatTime(s) {
   if (!isFinite(s) || s < 0) return '0:00.0'
   const m = Math.floor(s / 60)
@@ -1406,6 +1409,9 @@ export default function App() {
     'protocol-ttest-detector': 'both',
   })
   const [weightKg, setWeightKg] = useState('70')
+  const [imuTargetSensor, setImuTargetSensor] = useState('auto')
+  const [imuProcessing, setImuProcessing] = useState(false)
+  const [imuApplied, setImuApplied] = useState(false)
   const [checkHzData, setCheckHzData]   = useState(null)
   const [selectedCols, setSelectedCols] = useState([])
   const [timeCol, setTimeCol]           = useState('Time')
@@ -1502,6 +1508,8 @@ export default function App() {
   const chartReorderRef  = useRef(null)
   const importedCsvTextRef = useRef('')
   const skipClearImportCsvRef = useRef(false)
+  // Raw IMU channels as loaded, kept until the postprocessing is undone.
+  const imuOriginalRef = useRef(null)
 
   const insoleSensorNames = useMemo(
     () => sensorNames.filter(n => n !== SPEED_TRACKER),
@@ -1717,6 +1725,8 @@ export default function App() {
     setSessionRecordAvailable(false)
     setPendingImportFilename('')
     importedCsvTextRef.current = ''
+    imuOriginalRef.current = null
+    setImuApplied(false)
     subplotRangesRef.current = {}
     setRelabelStep(null)
     setShowLeftPatterns(true)
@@ -2301,12 +2311,16 @@ export default function App() {
         setCheckHzData(null)
         anglesUnwrappedRef.current = false
         setAnglesUnwrapped(false)
+        resetYawDrift()
         subplotRangesRef.current = {}
         importedCsvTextRef.current = ''
+        imuOriginalRef.current = null
+        setImuApplied(false)
 
         addAccTkeoColumn(colMap, tCol)
         setParquetData(colMap)
         setTimeCol(tCol)
+        prepareYawDrift(colMap)
 
         const names = sortSensorNames(colMap)
         const insole = names.filter(n => n !== SPEED_TRACKER)
@@ -2431,7 +2445,118 @@ export default function App() {
     } catch (err) {
       setStatus({ text: `Ошибка импорта CSV: ${err.message}`, type: 'error' })
     }
-  }, [parquetData, sensorGroups, sessionId, token, fetchSessionMarkupsFromDb])
+  }, [
+    parquetData,
+    sensorGroups,
+    sessionId,
+    token,
+    fetchSessionMarkupsFromDb,
+    prepareYawDrift,
+    resetYawDrift,
+  ])
+
+  // ── Raw IMU postprocessing ────────────────────────────────────────────────
+  // Swap in a version of the session with rewritten IMU channels and drop
+  // everything derived from the previous signals.
+  const applyImuColMap = useCallback((colMap) => {
+    const numCols = computeNumericColumns(colMap, timeCol)
+    setParquetData(colMap)
+    setColumns(numCols)
+    const keptCols = selectedColsRef.current.filter(col => numCols.includes(col))
+    if (keptCols.length && keptCols.length !== selectedColsRef.current.length) {
+      selectedColsRef.current = keptCols
+      setSelectedCols(keptCols)
+    }
+    // Cached calculator results were computed on the previous signals.
+    calculatorDataVersionRef.current += 1
+    setCalculatorResults({})
+    setActiveCalculators([])
+    setCalculatorLoading('')
+    setSelectedCalculatorContact(null)
+    anglesUnwrappedRef.current = false
+    setAnglesUnwrapped(false)
+    // XData was rewritten, so the cached drift estimate no longer matches it.
+    prepareYawDrift(colMap)
+  }, [timeCol, prepareYawDrift])
+
+
+  // Older sessions ship accelerations with gravity still in them and the
+  // gyroscope in dps. The backend converts those to the new firmware channels
+  // (linear acceleration in the BLE basis + Heading/Roll/Pitch) so the chart
+  // and the calculators see the same shape as a modern session.
+  const handlePreprocessImu = useCallback(async () => {
+    if (!parquetData || imuProcessing) return
+
+    setImuProcessing(true)
+    setStatus({ text: 'Постпроцессинг IMU…', type: 'loading' })
+    try {
+      const resp = await fetch(`${CALCULATOR_API}/markup/preprocess-imu`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'accept': 'application/json' },
+        body: JSON.stringify({
+          rows: colMapToRows(parquetData),
+          target_sensor: imuTargetSensor,
+        }),
+      })
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}))
+        throw new Error(parseApiError(errData, resp.status))
+      }
+
+      const data = await resp.json()
+      const rows = data.rows || []
+      if (!rows.length) throw new Error('Сервис вернул пустой результат')
+
+      const processed = data.processed_sensors || []
+      if (!processed.length) {
+        setStatus({
+          text: 'Сырых IMU-данных не найдено — сессия уже в формате новой прошивки',
+          type: 'ok',
+        })
+        return
+      }
+
+      // Snapshot the channels as loaded — the backend returns the rows in the
+      // order they were sent, so the arrays stay index-aligned. Taken once, so
+      // undo returns to the original data even after several runs.
+      if (!imuOriginalRef.current) {
+        imuOriginalRef.current = Object.fromEntries(
+          IMU_SNAPSHOT_COLUMNS.map(col => [col, parquetData[col]]),
+        )
+      }
+
+      const colMap = rowsToColMap(rows)
+      // Accelerations changed, so the derived TKEO channel is rebuilt.
+      delete colMap['acc_tkeo']
+      addAccTkeoColumn(colMap, timeCol)
+      applyImuColMap(colMap)
+      setImuApplied(true)
+
+      setStatus({
+        text: `✓ Постпроцессинг IMU · обработано датчиков: ${processed.length} (${processed.join(', ')})`,
+        type: 'ok',
+      })
+    } catch (err) {
+      setStatus({ text: `Ошибка обработки IMU: ${err.message}`, type: 'error' })
+    } finally {
+      setImuProcessing(false)
+    }
+  }, [parquetData, imuProcessing, imuTargetSensor, timeCol, applyImuColMap])
+
+  const handleRevertImu = useCallback(() => {
+    const snapshot = imuOriginalRef.current
+    if (!parquetData || !snapshot || imuProcessing) return
+
+    const colMap = { ...parquetData }
+    Object.entries(snapshot).forEach(([col, values]) => {
+      if (values === undefined) delete colMap[col]
+      else colMap[col] = values
+    })
+    applyImuColMap(colMap)
+    imuOriginalRef.current = null
+    setImuApplied(false)
+    setStatus({ text: '✓ Постпроцессинг IMU откачен — данные сессии исходные', type: 'ok' })
+  }, [parquetData, imuProcessing, applyImuColMap])
 
   // ── Video zoom helpers ────────────────────────────────────────────────────
   const clampPan = useCallback((z, px, py) => {
@@ -2647,6 +2772,8 @@ export default function App() {
     resetYawDrift()
     subplotRangesRef.current = {}
     importedCsvTextRef.current = ''
+    imuOriginalRef.current = null
+    setImuApplied(false)
     setPendingImportFilename('')
     setActiveMarkupFileId('')
     setSessionRecordAvailable(false)
@@ -3734,6 +3861,48 @@ export default function App() {
                       </button>
                     </div>
                   </div>
+
+                  {parquetData && (
+                    <div className="sidebar-block imu-preprocess-block">
+                      <span className="sidebar-block-lbl">Постпроцессинг сырых IMU</span>
+                      <select
+                        className="select-sm imu-target-select"
+                        value={imuTargetSensor}
+                        onChange={e => setImuTargetSensor(e.target.value)}
+                        disabled={imuProcessing}
+                        title="Какие датчики обрабатывать"
+                      >
+                        <option value="auto">Автодетекция (по гравитации)</option>
+                        {insoleSensorNames.map(name => (
+                          <option key={name} value={name}>
+                            {sensorFootForName(name, insoleSensorNames) === 'left' ? 'Левая стопа' : 'Правая стопа'} ({name})
+                          </option>
+                        ))}
+                        <option value="all">Все датчики</option>
+                      </select>
+                      <button
+                        type="button"
+                        className="btn-secondary btn-block"
+                        onClick={handlePreprocessImu}
+                        disabled={imuProcessing}
+                        title="Удаляет гравитацию, согласует оси linX/linY и пересчитывает Heading/Roll/Pitch в формат новой прошивки"
+                      >
+                        <UiIcon name={imuProcessing ? 'loader' : 'rotate'} />
+                        {imuProcessing ? 'Обработка IMU…' : 'Применить к сессии'}
+                      </button>
+                      {imuApplied && (
+                        <button
+                          type="button"
+                          className="btn-secondary btn-block"
+                          onClick={handleRevertImu}
+                          disabled={imuProcessing}
+                          title="Вернуть исходные каналы IMU, как они были загружены"
+                        >
+                          <UiIcon name="undo" /> Откатить
+                        </button>
+                      )}
+                    </div>
+                  )}
 
                   {status.text && status.area !== 'models' && (
                     <span
