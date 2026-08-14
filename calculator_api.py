@@ -53,9 +53,9 @@ CALCULATOR_MODELS = {
     "tkeo-cadence": "TKEO + peak detection",
     "step-cadence": "StepResUNet",
     "jump-metrics": "JumpBiLSTM",
-    "force-jump": "BiLSTMCNNRegressor",
-    "protocol-walking-detector": "StepResUNet contacts",
-    "protocol-running-detector": "StepResUNet contacts",
+    "force-jump": "JumpForceBW regressor",
+    "protocol-walking-detector": "WalkBiLSTM contacts",
+    "protocol-running-detector": "WalkBiLSTM contacts",
     "protocol-jumping-detector": "JumpBiLSTM flight detector",
     "protocol-shuttle-detector": "TurnCalculator shuttle phases",
     "protocol-sprint-detector": "CausalSpeedTCN + StepResUNet sprint steps",
@@ -65,9 +65,9 @@ CALCULATOR_MODELS = {
 CALCULATOR_MODEL_FILES = {
     "step-cadence": "step_gc_model.pt",
     "jump-metrics": "jump_bilstm.pt",
-    "force-jump": "fz_bilateral.pt",
-    "protocol-walking-detector": "step_gc_model.pt",
-    "protocol-running-detector": "step_gc_model.pt",
+    "force-jump": "jump_force_total.pt",
+    "protocol-walking-detector": "walk_gc_bilstm.pt",
+    "protocol-running-detector": "walk_gc_bilstm.pt",
     "protocol-jumping-detector": "jump_bilstm.pt",
     "protocol-sprint-detector": "speed_cont_v5.pt + step_gc_model.pt",
 }
@@ -311,15 +311,25 @@ def _rows_with_time_in_ms(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return normalised
 
 
-def _cadence_result(calculator_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if calculator_id == "tkeo-cadence":
-        from app.services.calculators.tkeo_cadence_calculator import TkeoCadenceCalculator
+def _cadence_result(
+    calculator_id: str,
+    rows: List[Dict[str, Any]],
+    calculator: Any = None,
+) -> Dict[str, Any]:
+    """Turn a cadence detector's contact regions into markup overlays.
 
-        calculator = TkeoCadenceCalculator()
-    else:
-        from app.services.calculators.step_cadence_calculator import StepCadenceCalculator
+    ``calculator`` lets a caller supply its own detector; walking and running
+    pass the WalkBiLSTM-backed adapter the backend uses for those protocols.
+    """
+    if calculator is None:
+        if calculator_id == "tkeo-cadence":
+            from app.services.calculators.tkeo_cadence_calculator import TkeoCadenceCalculator
 
-        calculator = StepCadenceCalculator()
+            calculator = TkeoCadenceCalculator()
+        else:
+            from app.services.calculators.step_cadence_calculator import StepCadenceCalculator
+
+            calculator = StepCadenceCalculator()
 
     result = calculator.calculate(rows)
     events_by_sensor = {
@@ -472,31 +482,63 @@ def _jump_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _force_units(units: Any) -> Dict[str, Any] | None:
+    """Flatten a JumpForceUnits into the markup response's scalar fields."""
+    if units is None:
+        return None
+    return {
+        "percent_bw": _round_or_none(units.percent_bw, 1),
+        "bw": _round_or_none(units.bw, 3),
+        "n": _round_or_none(units.n, 1),
+        "kg": _round_or_none(units.kg, 1),
+        "lb": _round_or_none(units.lb, 1),
+    }
+
+
 def _force_result(rows: List[Dict[str, Any]], weight_kg: float) -> Dict[str, Any]:
-    """Run bilateral Fz regression and expose peak/flight metrics."""
-    from app.services.calculators.force_jump_calculator import get_force_jump_calculator
+    """Run bilateral Fz regression and expose peak/flight metrics.
+
+    Forces come out of the model as % of body weight; the calculator derives N,
+    kgf and lbf from the weight passed here, so the absolute units are only as
+    good as that weight. Jump instants come from the jump detector, not from the
+    force curve, so the events line up one-for-one with the jump metrics.
+    """
+    from app.services.calculators.jump_force_bw_calculator import (
+        get_jump_force_bw_calculator,
+    )
 
     rows = _rows_with_time_in_ms(rows)
-    calculator = get_force_jump_calculator()
+    calculator = get_jump_force_bw_calculator()
     result = calculator.calculate(rows, weight_kg=weight_kg)
+    peak = result.peak_force
     return {
         "calculator": "force-jump",
         "label": CALCULATOR_LABELS["force-jump"],
-        "model": CALCULATOR_MODELS["force-jump"],
+        "model": f"{CALCULATOR_MODELS['force-jump']} · {calculator.arch}",
         "model_file": CALCULATOR_MODEL_FILES["force-jump"],
         "events": [
             {
+                "jump_index": event.jump_index,
                 "takeoff_time_ms": _round_or_none(event.takeoff_time_ms),
                 "landing_time_ms": _round_or_none(event.landing_time_ms),
                 "flight_time_ms": _round_or_none(event.flight_time_ms),
+                "feet": list(event.feet),
+                "takeoff_force": _force_units(event.takeoff_force),
+                "landing_force": _force_units(event.landing_force),
             }
-            for event in result.jump_events
+            for event in result.events
         ],
         "summary": {
-            "peak_force_n": _round_or_none(result.peak_force_n),
-            "peak_force_bw": _round_or_none(result.peak_force_bw, 3),
-            "jump_count": len(result.jump_events),
+            "peak_force_n": _round_or_none(peak.n, 1) if peak else None,
+            "peak_force_bw": _round_or_none(peak.bw, 3) if peak else None,
+            "peak_force_percent_bw": _round_or_none(peak.percent_bw, 1) if peak else None,
+            "peak_takeoff_force": _force_units(result.peak_takeoff_force),
+            "peak_landing_force": _force_units(result.peak_landing_force),
+            "avg_takeoff_force": _force_units(result.avg_takeoff_force),
+            "avg_landing_force": _force_units(result.avg_landing_force),
+            "jump_count": result.n_jumps,
             "weight_kg": _round_or_none(result.weight_kg),
+            "weight_source": result.weight_source,
             "is_valid": bool(result.is_valid),
         },
     }
@@ -506,8 +548,10 @@ def _protocol_contact_detector_result(
     calculator_id: str,
     rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Expose StepResUNet contact regions as walking/running detections."""
-    base = _cadence_result("step-cadence", rows)
+    """Expose WalkBiLSTM contact regions as walking/running detections."""
+    from app.services.calculators.step_cadence_calculator import get_walk_cadence_calculator
+
+    base = _cadence_result("step-cadence", rows, get_walk_cadence_calculator())
     contacts = list(base.get("contacts") or [])
     left_count = sum(1 for event in contacts if event.get("foot") == "left")
     right_count = sum(1 for event in contacts if event.get("foot") == "right")

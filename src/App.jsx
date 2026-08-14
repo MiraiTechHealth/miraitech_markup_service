@@ -4408,7 +4408,7 @@ export default function App() {
                                 <span>для Bilateral GRF</span>
                               </div>
                               <div className="calculator-model-note">
-                                Модели: <b>step_gc_model.pt</b>, <b>jump_bilstm.pt</b>, <b>fz_bilateral.pt</b>
+                                Модели: <b>step_gc_model.pt</b>, <b>jump_bilstm.pt</b>, <b>jump_force_total.pt</b>
                               </div>
                             </div>
                             {COLLAPSIBLE_EXTRA_CALCULATORS.map(calculator => {
