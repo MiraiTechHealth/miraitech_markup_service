@@ -208,6 +208,14 @@ label.lab-btn:has(input:focus-visible) {
   gap: 6px;
 }
 
+.imu-preprocess-block {
+  padding: 8px;
+  border: 1.5px solid var(--border);
+  border-radius: 7px;
+}
+
+.imu-target-select { width: 100% }
+
 .sidebar-block-row {
   display: flex;
   flex-direction: row;
