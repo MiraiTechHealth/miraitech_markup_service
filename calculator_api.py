@@ -289,7 +289,7 @@ def _round_or_none(value: Any, digits: int = 2) -> float | None:
 def _rows_with_time_in_ms(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalise second-based markup files to the backend models' ms contract."""
     times = []
-    for row in rows:
+    for row in rows[:300]:
         try:
             times.append(float(row.get("Time")))
         except (TypeError, ValueError):
@@ -667,7 +667,7 @@ def _rows_for_detection_foot(
 
     available_names = list(dict.fromkeys(
         str(row.get("Name"))
-        for row in rows
+        for row in rows[:500]
         if row.get("Name") not in (None, "")
     ))
     selected_name = sensor_name if sensor_name in available_names else None
@@ -709,9 +709,10 @@ def _protocol_turn_detector_result(
 
     def create_calculator():
         if calculator_id == "protocol-beep-detector":
-            from app.services.calculators.yoyo_turn_calculator import YoyoTurnCalculator
-
-            return YoyoTurnCalculator()
+            return TurnCalculator(
+                min_change_deg=100,
+                max_duration_ms=2000,
+            )
         if calculator_id == "protocol-ttest-detector":
             from app.services.ttest_analysis import TTEST_TURN_PARAMS
 
@@ -1294,12 +1295,30 @@ async def update_markup_additional_info(
     )
 
 
+def _extract_session_dataframe(payload: Dict[str, Any]) -> pd.DataFrame:
+    columns = payload.get("columns")
+    if isinstance(columns, dict) and columns:
+        return pd.DataFrame(columns)
+    rows = payload.get("rows")
+    if isinstance(rows, list) and rows:
+        return pd.DataFrame(rows)
+    raise HTTPException(status_code=422, detail="Session columns or rows are required")
+
+
+def _extract_session_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    columns = payload.get("columns")
+    if isinstance(columns, dict) and columns:
+        return pd.DataFrame(columns).to_dict(orient="records")
+    rows = payload.get("rows")
+    if isinstance(rows, list) and rows:
+        return rows
+    raise HTTPException(status_code=422, detail="Session columns or rows are required")
+
+
 @app.post("/markup/preprocess-imu")
 async def preprocess_imu(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """Convert raw IMU channels of a session into the new firmware format."""
-    rows = payload.get("rows")
-    if not isinstance(rows, list) or not rows:
-        raise HTTPException(status_code=422, detail="Session rows are required")
+    df = _extract_session_dataframe(payload)
 
     target_sensor = str(payload.get("target_sensor") or "auto")
     raw_sample_rate = payload.get("sample_rate")
@@ -1310,9 +1329,8 @@ async def preprocess_imu(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     if sample_rate <= 0:
         raise HTTPException(status_code=422, detail="sample_rate must be positive")
 
-    df = pd.DataFrame(rows)
     if "Name" not in df.columns:
-        raise HTTPException(status_code=422, detail="Session rows have no Name column")
+        raise HTTPException(status_code=422, detail="Session data has no Name column")
     if target_sensor not in {"auto", "all"}:
         known = {str(name) for name in df["Name"].dropna().unique()}
         if target_sensor not in known:
@@ -1334,6 +1352,7 @@ async def preprocess_imu(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     # NaN is not valid JSON — hand missing cells back as null.
     df_processed = df_processed.astype(object).where(pd.notna(df_processed), None)
     return {
+        "columns": {col: df_processed[col].tolist() for col in df_processed.columns},
         "rows": df_processed.to_dict(orient="records"),
         "processed_sensors": processed_sensors,
         "success": True,
@@ -1348,9 +1367,7 @@ async def calculate(
     if calculator_id not in CALCULATOR_LABELS:
         raise HTTPException(status_code=404, detail="Unknown calculator")
 
-    rows = payload.get("rows")
-    if not isinstance(rows, list) or not rows:
-        raise HTTPException(status_code=422, detail="Session rows are required")
+    rows = _extract_session_rows(payload)
 
     if calculator_id == "force-jump":
         try:

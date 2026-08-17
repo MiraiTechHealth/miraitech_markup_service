@@ -2494,7 +2494,7 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'accept': 'application/json' },
         body: JSON.stringify({
-          rows: colMapToRows(parquetData),
+          columns: parquetData,
           target_sensor: imuTargetSensor,
         }),
       })
@@ -2505,7 +2505,8 @@ export default function App() {
 
       const data = await resp.json()
       const rows = data.rows || []
-      if (!rows.length) throw new Error('Сервис вернул пустой результат')
+      const colMapFromResp = data.columns || (rows.length ? rowsToColMap(rows) : null)
+      if (!colMapFromResp) throw new Error('Сервис вернул пустой результат')
 
       const processed = data.processed_sensors || []
       if (!processed.length) {
@@ -2525,7 +2526,7 @@ export default function App() {
         )
       }
 
-      const colMap = rowsToColMap(rows)
+      const colMap = { ...colMapFromResp }
       // Accelerations changed, so the derived TKEO channel is rebuilt.
       delete colMap['acc_tkeo']
       addAccTkeoColumn(colMap, timeCol)
@@ -2982,7 +2983,7 @@ export default function App() {
     const dataVersion = calculatorDataVersionRef.current
     setCalculatorLoading(calculatorId)
     try {
-      const payload = { rows: colMapToRows(parquetData) }
+      const payload = { columns: parquetData }
       if (calculatorId === 'force-jump') payload.weight_kg = parsedWeight
       if (PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)) {
         const selectedSensorName = requestedDetectionFoot === 'both'
