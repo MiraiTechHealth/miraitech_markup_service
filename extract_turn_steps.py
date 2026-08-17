@@ -283,39 +283,74 @@ def load_session_df(session_id: Optional[int], file_path: Optional[str]) -> pd.D
             raise ValueError(f"Unsupported file format: {path.suffix}")
 
     if session_id is not None:
+        errors = []
         # 1. Try backend storage function if available
         try:
             from app.services.session_data_storage import load_session_dataframe
             df = load_session_dataframe(session_id)
             if df is not None and not df.empty:
                 return df
-        except Exception:
-            pass
-
-        # 2. Direct GCS download using google.cloud.storage
-        try:
-            from google.cloud import storage
-            bucket_name = os.environ.get("GCS_BUCKET_NAME", "miraitech-sessions")
-            prefix = os.environ.get("GCS_SESSION_PREFIX", "sessions")
-            client = storage.Client()
-            bucket = client.bucket(bucket_name)
-            blob = bucket.blob(f"{prefix}/{session_id}.parquet")
-            if blob.exists():
-                data_bytes = blob.download_as_bytes()
-                return pd.read_parquet(io.BytesIO(data_bytes))
         except Exception as exc:
-            print(f"GCS download notice: {exc}")
+            errors.append(f"load_session_dataframe: {exc}")
 
-        # 3. Try load_session_data
+        # 2. Try load_session_data
         try:
             from app.services.session_data_storage import load_session_data
             rows = load_session_data(session_id)
             if rows:
                 return pd.DataFrame(rows)
-        except Exception:
-            pass
+        except Exception as exc:
+            errors.append(f"load_session_data: {exc}")
 
-        raise RuntimeError(f"Could not load data for session {session_id} from GCS or storage")
+        # 3. Direct GCS download using google.cloud.storage across all potential prefixes
+        try:
+            from google.cloud import storage
+            bucket_name = os.environ.get("GCS_BUCKET_NAME", "miraitech-sessions")
+            client = storage.Client()
+            bucket = client.bucket(bucket_name)
+            candidate_prefixes = [
+                os.environ.get("GCS_SESSION_PREFIX"),
+                "dev_sessions",
+                "sessions",
+                "prod_sessions",
+                "",
+            ]
+            for pr in candidate_prefixes:
+                if pr is None:
+                    continue
+                blob_name = f"{pr}/{session_id}.parquet" if pr else f"{session_id}.parquet"
+                try:
+                    blob = bucket.blob(blob_name)
+                    if blob.exists():
+                        data_bytes = blob.download_as_bytes()
+                        return pd.read_parquet(io.BytesIO(data_bytes))
+                except Exception as b_exc:
+                    errors.append(f"GCS {blob_name}: {b_exc}")
+        except Exception as exc:
+            errors.append(f"Direct GCS client: {exc}")
+
+        # 4. Direct DB query fallback (if session data is in PostgreSQL column)
+        try:
+            from app.db.database import get_db
+            from app.core.config import settings
+            with get_db() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"SELECT data FROM {settings.DB_SCHEMA}.sessions WHERE session_id = %s",
+                        (session_id,),
+                    )
+                    row = cursor.fetchone()
+                    if row and row.get("data"):
+                        raw_data = row["data"]
+                        if isinstance(raw_data, str):
+                            raw_data = json.loads(raw_data)
+                        if isinstance(raw_data, list):
+                            return pd.DataFrame(raw_data)
+        except Exception as exc:
+            errors.append(f"Direct DB: {exc}")
+
+        err_summary = "\n  - ".join(errors)
+        raise RuntimeError(f"Could not load data for session {session_id}. Details:\n  - {err_summary}")
 
     raise ValueError("Either --session or --file must be specified")
 
