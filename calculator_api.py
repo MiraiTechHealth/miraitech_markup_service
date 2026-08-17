@@ -700,7 +700,7 @@ def _rows_for_detection_foot(
 
 def _protocol_turn_detector_result(
     calculator_id: str,
-    rows: List[Dict[str, Any]],
+    data: Union[pd.DataFrame, List[Dict[str, Any]]],
     detection_foot: str = "both",
     sensor_name: str | None = None,
 ) -> Dict[str, Any]:
@@ -726,27 +726,46 @@ def _protocol_turn_detector_result(
             fast_rate_deg_per_ms=0.14,
         )
 
+    df = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+    if "Time" in df.columns or "time" in df.columns:
+        tcol = "Time" if "Time" in df.columns else "time"
+        s = pd.to_numeric(df[tcol].iloc[:300], errors="coerce").dropna()
+        if not s.empty:
+            diffs = np.diff(np.sort(s.values))
+            diffs = diffs[diffs > 0]
+            if len(diffs) and np.median(diffs) < 0.5:
+                df = df.copy()
+                df[tcol] = pd.to_numeric(df[tcol], errors="coerce") * 1000.0
+
     requested_feet = ["left", "right"] if detection_foot == "both" else [detection_foot]
     contacts: List[Dict[str, Any]] = []
     foot_summaries: Dict[str, Dict[str, Any]] = {}
     sensor_names: Dict[str, str] = {}
 
+    available_names = [str(n) for n in df["Name"].dropna().unique()] if "Name" in df.columns else []
+
     for foot in requested_feet:
-        requested_sensor = sensor_name if detection_foot != "both" else None
-        try:
-            foot_rows, selected_sensor_name = _rows_for_detection_foot(
-                rows,
-                foot,
-                requested_sensor,
-            )
-        except ValueError:
+        selected_sensor_name = sensor_name if detection_foot != "both" else None
+        if selected_sensor_name is None:
+            expected_name = "ESP32_Sensor_1" if foot == "left" else "ESP32_Sensor_2"
+            if expected_name in available_names:
+                selected_sensor_name = expected_name
+            elif len(available_names) > 0:
+                idx = 0 if foot == "left" else min(1, len(available_names) - 1)
+                selected_sensor_name = available_names[idx]
+
+        if selected_sensor_name is not None and "Name" in df.columns:
+            foot_df = df[df["Name"] == selected_sensor_name]
+        else:
+            foot_df = df
+
+        if foot_df.empty:
             if detection_foot != "both":
-                raise
+                raise ValueError(f"No sensor data available for {foot} foot")
             continue
 
-        normalised_rows = _rows_with_time_in_ms(foot_rows)
         calculator = create_calculator()
-        raw_turns = calculator.identify(normalised_rows, group_sensors=False)
+        raw_turns = calculator.identify(foot_df, group_sensors=False)
 
         turn_events: List[Any] = []
         for t in raw_turns:
@@ -774,7 +793,14 @@ def _protocol_turn_detector_result(
         if calculator.max_turns is not None and len(turn_events) > calculator.max_turns:
             turn_events = calculator._trim_to_max_turns(turn_events)
 
-        start_ms, end_ms = _session_time_bounds_ms(normalised_rows)
+        tcol = "Time" if "Time" in foot_df.columns else ("time" if "time" in foot_df.columns else None)
+        if tcol and not foot_df[tcol].empty:
+            s_t = pd.to_numeric(foot_df[tcol], errors="coerce").dropna()
+            start_ms = float(s_t.min()) if not s_t.empty else None
+            end_ms = float(s_t.max()) if not s_t.empty else None
+        else:
+            start_ms = end_ms = None
+
         foot_contacts = _turn_phase_contacts(
             turn_events,
             start_ms,
@@ -1000,11 +1026,20 @@ def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, An
 
 def _calculate(
     calculator_id: str,
-    rows: List[Dict[str, Any]],
+    data: Union[pd.DataFrame, List[Dict[str, Any]]],
     *,
     detection_foot: str = "both",
     sensor_name: str | None = None,
 ) -> Dict[str, Any]:
+    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
+        return _protocol_turn_detector_result(
+            calculator_id,
+            data,
+            detection_foot=detection_foot,
+            sensor_name=sensor_name,
+        )
+
+    rows = data if isinstance(data, list) else data.to_dict(orient="records")
     if calculator_id == "step-detector-ttest":
         return _ttest_result(rows)
     if calculator_id == "jump-metrics":
@@ -1013,13 +1048,6 @@ def _calculate(
         return _protocol_contact_detector_result(calculator_id, rows)
     if calculator_id == "protocol-jumping-detector":
         return _protocol_jump_detector_result(rows)
-    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
-        return _protocol_turn_detector_result(
-            calculator_id,
-            rows,
-            detection_foot=detection_foot,
-            sensor_name=sensor_name,
-        )
     if calculator_id == "protocol-sprint-detector":
         return _protocol_sprint_detector_result(rows)
     return _cadence_result(calculator_id, rows)
@@ -1395,7 +1423,10 @@ async def calculate(
     if calculator_id not in CALCULATOR_LABELS:
         raise HTTPException(status_code=404, detail="Unknown calculator")
 
-    rows = _extract_session_rows(payload)
+    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
+        data = _extract_session_dataframe(payload)
+    else:
+        data = _extract_session_rows(payload)
 
     if calculator_id == "force-jump":
         try:
@@ -1405,7 +1436,7 @@ async def calculate(
         if weight_kg <= 0:
             raise HTTPException(status_code=422, detail="weight_kg must be positive")
         try:
-            return await asyncio.to_thread(_force_result, rows, weight_kg)
+            return await asyncio.to_thread(_force_result, data, weight_kg)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -1425,7 +1456,7 @@ async def calculate(
         return await asyncio.to_thread(
             _calculate,
             calculator_id,
-            rows,
+            data,
             detection_foot=detection_foot,
             sensor_name=sensor_name,
         )
