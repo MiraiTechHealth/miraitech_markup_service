@@ -62,17 +62,17 @@ LEFT_FOOT = "ESP32_Sensor_1"
 RIGHT_FOOT = "ESP32_Sensor_2"
 
 class StandaloneTurnCalculator:
-    """Self-contained Net-Rotation + Rise-Fraction turn detector."""
+    """Self-contained Net-Rotation + Rise-Fraction turn detector for 180° shuttle turns."""
 
     def __init__(
         self,
-        min_net_deg: float = 28.62,
-        win_ms: float = 420.2,
+        min_net_deg: float = 35.0,
+        win_ms: float = 450.0,
         grid_ms: float = 2.0,
-        pad_ms: float = 392.2,
-        q_rise: float = 0.078,
-        min_amp_deg: float = 24.71,
-        merge_gap_ms: float = 120.2,
+        pad_ms: float = 400.0,
+        q_rise: float = 0.08,
+        min_amp_deg: float = 100.0,  # 100° threshold for 180° Yo-Yo / Beep turns
+        merge_gap_ms: float = 400.0,
         sg_window_length: int = 277,
         sg_polyorder: int = 2,
     ):
