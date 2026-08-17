@@ -255,14 +255,30 @@ function getCalculatorColumns(calculatorId, data) {
   let needed = []
   if (PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)) {
     needed = [...ALWAYS, 'XData', 'Yaw', 'yaw', 'Heading', 'heading']
-  } else if (['jump-metrics', 'protocol-jumping-detector'].includes(calculatorId)) {
-    needed = [...ALWAYS, 'AcX', 'AcY', 'AcZ']
   } else if (['force-jump'].includes(calculatorId)) {
-    needed = [...ALWAYS, 'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4', 'Sensor_5', 'Sensor_6', 'Sensor_7', 'Sensor_8']
+    needed = [
+      ...ALWAYS,
+      'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4',
+      'Sensor_5', 'Sensor_6', 'Sensor_7', 'Sensor_8',
+    ]
   } else if (calculatorId === 'protocol-sprint-detector') {
-    needed = [...ALWAYS, 'AcX', 'AcY', 'AcZ', 'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4', 'Distance', 'Speed', 'DistanceM', 'VelocityMs']
+    needed = [
+      ...ALWAYS,
+      'AcX', 'AcY', 'AcZ', 'GravityZ',
+      'XData', 'YData', 'ZData',
+      'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4',
+      'Distance', 'Speed', 'DistanceM', 'VelocityMs',
+    ]
   } else {
-    needed = [...ALWAYS, 'AcX', 'AcY', 'AcZ', 'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4', 'Sensor_5', 'Sensor_6', 'Sensor_7', 'Sensor_8']
+    // Walking, Running, Jump, Step Cadence, TKEO Cadence need full IMU (accel + gyro) and pressure pads
+    needed = [
+      ...ALWAYS,
+      'AcX', 'AcY', 'AcZ', 'GravityZ',
+      'XData', 'YData', 'ZData',
+      'Roll', 'Pitch', 'Heading',
+      'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4',
+      'Sensor_5', 'Sensor_6', 'Sensor_7', 'Sensor_8',
+    ]
   }
   const filtered = {}
   for (const col of needed) {

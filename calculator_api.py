@@ -1040,6 +1040,9 @@ def _calculate(
         )
 
     rows = data if isinstance(data, list) else data.to_dict(orient="records")
+    if rows and "GravityZ" not in rows[0]:
+        for r in rows:
+            r["GravityZ"] = 0.0
     if calculator_id == "step-detector-ttest":
         return _ttest_result(rows)
     if calculator_id == "jump-metrics":
