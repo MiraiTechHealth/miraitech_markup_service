@@ -361,6 +361,7 @@ def load_session_df(session_id: Optional[int], file_path: Optional[str]) -> pd.D
 def extract_turns_and_steps(
     df: pd.DataFrame,
     weight_kg: float = 70.0,
+    detection_foot: str = "left",
 ) -> Tuple[List[Dict[str, Any]], pd.DataFrame, Dict[str, Any]]:
     """Detect turns, ground contacts, and associate steps around each turn."""
 
@@ -376,9 +377,23 @@ def extract_turns_and_steps(
         df = df.copy()
         df[t_col] = pd.to_numeric(df[t_col], errors="coerce") * 1000.0
 
-    # 1. Detect Turns
-    turn_calc = StandaloneTurnCalculator()
-    raw_turns = turn_calc.identify(df, group_sensors=True)
+    # 1. Detect Turns (matching UI: default 'left' foot = ESP32_Sensor_1)
+    turn_calc = StandaloneTurnCalculator(
+        min_net_deg=35.0,
+        win_ms=450.0,
+        grid_ms=2.0,
+        pad_ms=400.0,
+        q_rise=0.08,
+        min_amp_deg=100.0,
+        merge_gap_ms=400.0,
+    )
+
+    if detection_foot == "both":
+        raw_turns = turn_calc.identify(df, group_sensors=True)
+    else:
+        sensor_target = "ESP32_Sensor_1" if detection_foot == "left" else "ESP32_Sensor_2"
+        foot_df = df[df["Name"] == sensor_target] if "Name" in df.columns else df
+        raw_turns = turn_calc.identify(foot_df, group_sensors=False)
 
     turns = []
     for t in raw_turns:
@@ -666,6 +681,7 @@ def main():
     parser.add_argument("--session", type=int, default=6546, help="Session ID (default: 6546)")
     parser.add_argument("--file", type=str, default=None, help="Path to parquet or csv file")
     parser.add_argument("--weight", type=float, default=70.0, help="Subject weight in kg (default: 70.0)")
+    parser.add_argument("--detection-foot", type=str, default="left", choices=["left", "right", "both"], help="Foot sensor for turn detection (default: left, matching UI)")
     parser.add_argument("--output-csv", type=str, default="turn_steps_session_6546.csv", help="Output CSV path")
     parser.add_argument("--output-json", type=str, default="turn_steps_summary_6546.json", help="Output summary JSON path")
 
@@ -675,8 +691,12 @@ def main():
     df = load_session_df(args.session, args.file)
     print(f"Dataset loaded: {df.shape[0]} rows, {df.shape[1]} columns")
 
-    print("Running turn detection, step detection, and force analysis...")
-    turn_records, df_results, stats = extract_turns_and_steps(df, weight_kg=args.weight)
+    print(f"Running turn detection (foot={args.detection_foot}), step detection, and force analysis...")
+    turn_records, df_results, stats = extract_turns_and_steps(
+        df,
+        weight_kg=args.weight,
+        detection_foot=args.detection_foot,
+    )
 
     print(f"\n--- Результаты анализа сессии {args.session} ({stats['total_turns']} поворотов) ---")
     print(f"{'Шаг (фаза)':<22} | {'GCT (мс)':<16} | {'Step Time (мс)':<18} | {'Support Force (BW / N)':<24} | {'Peak Force Kin (BW)':<20} | {'IMU AcZ Peak (BW)':<18}")
