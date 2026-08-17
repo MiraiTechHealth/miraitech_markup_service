@@ -33,6 +33,16 @@ CANDIDATE_BACKEND_PATHS = [
     Path("/home/miraitech/app"),
 ]
 
+# Auto-load .env file from backend directory so Settings() does not error
+try:
+    from dotenv import load_dotenv
+    for p in CANDIDATE_BACKEND_PATHS:
+        if p and (p / ".env").exists():
+            load_dotenv(p / ".env")
+            break
+except ImportError:
+    pass
+
 for p in CANDIDATE_BACKEND_PATHS:
     if p and p.exists() and str(p) not in sys.path:
         sys.path.insert(0, str(p))
