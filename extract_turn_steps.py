@@ -396,54 +396,136 @@ def extract_turns_and_steps(
             "direction": "left" if t["angle"] < 0 else "right" if t["angle"] > 0 else "unknown",
         })
 
-    # 2. Detect Steps / Ground Contacts via ML Cadence Model
+    # 2. Detect Steps / Ground Contacts via ML or Cadence Models
+    all_contacts: List[Dict[str, Any]] = []
+    rows = df.to_dict(orient="records")
+
+    def _extract_from_viz(viz_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+        extracted = []
+        for sensor, foot in (("ESP32_Sensor_1", "left"), ("ESP32_Sensor_2", "right")):
+            foot_viz = viz_dict.get(sensor, {})
+            events = foot_viz.get("contact_events", [])
+            times_s = np.asarray(foot_viz.get("t", [])) / 1000.0 if "t" in foot_viz else np.array([])
+            acz = np.asarray(foot_viz.get("acz", []))
+            for event in events:
+                c_start = float(event["timestep_s"])
+                c_dur = float(event["contact_time_s"])
+                c_end = c_start + c_dur
+                pad = 0.1 * c_dur
+                w_start, w_end = c_start - pad, c_end + pad
+                if times_s.size and acz.size:
+                    mask = (times_s >= w_start) & (times_s <= w_end)
+                    peak_abs_acz = float(np.max(np.abs(acz[mask]))) if np.any(mask) else 0.0
+                else:
+                    peak_abs_acz = 0.0
+
+                imu_peak_force_n = float(weight_kg * (peak_abs_acz / 10.0) * 9.80665)
+                imu_peak_force_bw = peak_abs_acz / 10.0
+                extracted.append({
+                    "foot": foot,
+                    "start_time_s": c_start,
+                    "end_time_s": c_end,
+                    "duration_ms": c_dur * 1000.0,
+                    "peak_force_n": round(imu_peak_force_n, 1),
+                    "peak_force_bw": round(imu_peak_force_bw, 2),
+                    "confidence": event.get("confidence"),
+                })
+        return extracted
+
+    # Attempt 1: StepCadenceCalculator
     try:
         from app.services.calculators.step_cadence_calculator import get_walk_cadence_calculator
-        cadence_calc = get_walk_cadence_calculator()
-    except ImportError:
-        from app.services.calculators.step_calculator import get_step_calculator
-        cadence_calc = get_step_calculator()
+        c_calc = get_walk_cadence_calculator()
+        c_calc.calculate(rows)
+        if getattr(c_calc, "_viz_data", None):
+            all_contacts = _extract_from_viz(c_calc._viz_data)
+    except Exception:
+        pass
 
-    rows = df.to_dict(orient="records")
-    cadence_calc.calculate(rows)
+    # Attempt 2: WalkGCCalculator directly
+    if not all_contacts:
+        try:
+            from app.services.calculators.walk_gc_calculator import get_walk_gc_calculator
+            w_calc = get_walk_gc_calculator()
+            w_calc.calculate(rows)
+            if getattr(w_calc, "_viz_data", None):
+                all_contacts = _extract_from_viz(w_calc._viz_data)
+        except Exception:
+            pass
 
-    viz = getattr(cadence_calc, "_viz_data", {})
-    all_contacts: List[Dict[str, Any]] = []
+    # Attempt 3: MLSprintCalculator / TkeoCadenceCalculator
+    if not all_contacts:
+        try:
+            from app.services.calculators.ml_sprint_calculator import MLSprintCalculator
+            s_calc = MLSprintCalculator()
+            s_calc.calculate(rows)
+            if getattr(s_calc, "_viz_data", None):
+                all_contacts = _extract_from_viz(s_calc._viz_data)
+        except Exception:
+            pass
 
-    bw_n = weight_kg * 9.80665
+    if not all_contacts:
+        try:
+            from app.services.calculators.tkeo_cadence_calculator import TkeoCadenceCalculator
+            t_calc = TkeoCadenceCalculator()
+            t_calc.calculate(rows)
+            if getattr(t_calc, "_viz_data", None):
+                all_contacts = _extract_from_viz(t_calc._viz_data)
+        except Exception:
+            pass
 
-    for sensor, foot in (("ESP32_Sensor_1", "left"), ("ESP32_Sensor_2", "right")):
-        foot_viz = viz.get(sensor, {})
-        events = foot_viz.get("contact_events", [])
-        times_s = np.asarray(foot_viz.get("t", [])) / 1000.0 if "t" in foot_viz else np.array([])
-        acz = np.asarray(foot_viz.get("acz", []))
+    # Attempt 4: StepDetectorTTest
+    if not all_contacts:
+        try:
+            from app.services.calculators.step_detector_ttest import StepDetectorTTest
+            steps = StepDetectorTTest().calculate(df)
+            for row in steps.itertuples(index=False):
+                all_contacts.append({
+                    "foot": str(row.foot),
+                    "start_time_s": float(row.t_start),
+                    "end_time_s": float(row.t_end),
+                    "duration_ms": float(row.contact_ms),
+                    "peak_force_n": 0.0,
+                    "peak_force_bw": 0.0,
+                    "confidence": float(getattr(row, "peak_z", 1.0)),
+                })
+        except Exception:
+            pass
 
-        for event in events:
-            c_start = float(event["timestep_s"])
-            c_dur = float(event["contact_time_s"])
-            c_end = c_start + c_dur
-
-            # Peak AcZ in extended contact window (10% padding)
-            pad = 0.1 * c_dur
-            w_start, w_end = c_start - pad, c_end + pad
-            if times_s.size and acz.size:
-                mask = (times_s >= w_start) & (times_s <= w_end)
-                peak_abs_acz = float(np.max(np.abs(acz[mask]))) if np.any(mask) else 0.0
-            else:
-                peak_abs_acz = 0.0
-
-            imu_peak_force_n = float(weight_kg * (peak_abs_acz / 10.0) * 9.80665)
-            imu_peak_force_bw = peak_abs_acz / 10.0
-
-            all_contacts.append({
-                "foot": foot,
-                "start_time_s": c_start,
-                "end_time_s": c_end,
-                "duration_ms": c_dur * 1000.0,
-                "peak_force_n": round(imu_peak_force_n, 1),
-                "peak_force_bw": round(imu_peak_force_bw, 2),
-                "confidence": event.get("confidence"),
-            })
+    # Attempt 5: Standalone pure NumPy TKEO fallback
+    if not all_contacts:
+        sensor_col = "Name" if "Name" in df.columns else None
+        for sensor, foot in (("ESP32_Sensor_1", "left"), ("ESP32_Sensor_2", "right")):
+            sdf = df[df[sensor_col] == sensor] if sensor_col and sensor_col in df.columns else df
+            if sdf.empty:
+                continue
+            t_arr = pd.to_numeric(sdf[t_col], errors="coerce").to_numpy(dtype=float) / 1000.0
+            acz_arr = pd.to_numeric(sdf["AcZ"], errors="coerce").fillna(0.0).to_numpy(dtype=float) if "AcZ" in sdf.columns else np.zeros(len(sdf))
+            psi = np.zeros_like(acz_arr)
+            if len(acz_arr) >= 3:
+                psi[1:-1] = acz_arr[1:-1]**2 - acz_arr[:-2] * acz_arr[2:]
+                psi = np.maximum(psi, 0.0)
+            win = 15
+            smoothed = np.convolve(psi, np.ones(win) / win, mode="same") if len(psi) >= win else psi
+            thresh = float(np.percentile(smoothed, 65)) if len(smoothed) else 0.5
+            active = smoothed > thresh
+            diff_m = np.diff(np.concatenate(([0], active.astype(int), [0])))
+            starts_idx = np.where(diff_m == 1)[0]
+            ends_idx = np.where(diff_m == -1)[0]
+            for s_idx, e_idx in zip(starts_idx, ends_idx):
+                if e_idx > s_idx and e_idx < len(t_arr):
+                    dur_s = t_arr[e_idx - 1] - t_arr[s_idx]
+                    if 0.08 <= dur_s <= 0.8:
+                        pk_acz = float(np.max(np.abs(acz_arr[s_idx:e_idx])))
+                        all_contacts.append({
+                            "foot": foot,
+                            "start_time_s": float(t_arr[s_idx]),
+                            "end_time_s": float(t_arr[e_idx - 1]),
+                            "duration_ms": float(dur_s * 1000.0),
+                            "peak_force_n": round(float(weight_kg * (pk_acz / 10.0) * 9.80665), 1),
+                            "peak_force_bw": round(float(pk_acz / 10.0), 2),
+                            "confidence": 0.9,
+                        })
 
     # Sort contacts chronologically
     all_contacts.sort(key=lambda c: c["start_time_s"])
