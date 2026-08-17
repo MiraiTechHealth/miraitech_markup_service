@@ -419,56 +419,91 @@ def extract_turns_and_steps(
         extracted = []
         for sensor, foot in (("ESP32_Sensor_1", "left"), ("ESP32_Sensor_2", "right")):
             foot_viz = viz_dict.get(sensor, {})
-            events = foot_viz.get("contact_events", [])
-            times_s = np.asarray(foot_viz.get("t", [])) / 1000.0 if "t" in foot_viz else np.array([])
+            times_ms = np.asarray(foot_viz.get("t", []))
+            times_s = times_ms / 1000.0 if times_ms.size else np.array([])
             acz = np.asarray(foot_viz.get("acz", []))
-            for event in events:
-                c_start = float(event["timestep_s"])
-                c_dur = float(event["contact_time_s"])
-                c_end = c_start + c_dur
-                pad = 0.1 * c_dur
-                w_start, w_end = c_start - pad, c_end + pad
-                if times_s.size and acz.size:
-                    mask = (times_s >= w_start) & (times_s <= w_end)
-                    peak_abs_acz = float(np.max(np.abs(acz[mask]))) if np.any(mask) else 0.0
-                else:
-                    peak_abs_acz = 0.0
+            probs = np.asarray(foot_viz.get("probs", []))
 
-                imu_peak_force_n = float(weight_kg * (peak_abs_acz / 10.0) * 9.80665)
-                imu_peak_force_bw = peak_abs_acz / 10.0
-                extracted.append({
-                    "foot": foot,
-                    "start_time_s": c_start,
-                    "end_time_s": c_end,
-                    "duration_ms": c_dur * 1000.0,
-                    "peak_force_n": round(imu_peak_force_n, 1),
-                    "peak_force_bw": round(imu_peak_force_bw, 2),
-                    "confidence": event.get("confidence"),
-                })
+            # Format 1: WalkGCCalculator style (segments)
+            if "segments" in foot_viz and foot_viz["segments"]:
+                last_idx = len(times_ms) - 1
+                for s_idx, e_idx in foot_viz["segments"]:
+                    e_idx_clamped = min(int(e_idx), last_idx)
+                    s_idx_clamped = max(0, int(s_idx))
+                    if e_idx_clamped <= s_idx_clamped:
+                        continue
+                    c_start = float(times_s[s_idx_clamped])
+                    c_end = float(times_s[e_idx_clamped])
+                    c_dur_ms = float(times_ms[e_idx_clamped] - times_ms[s_idx_clamped])
+                    if c_dur_ms <= 0:
+                        continue
+                    c_dur_s = c_dur_ms / 1000.0
+                    pad = 0.1 * c_dur_s
+                    w_start, w_end = c_start - pad, c_end + pad
+                    if times_s.size and acz.size:
+                        mask = (times_s >= w_start) & (times_s <= w_end)
+                        peak_abs_acz = float(np.max(np.abs(acz[mask]))) if np.any(mask) else 0.0
+                    else:
+                        peak_abs_acz = 0.0
+
+                    conf = float(np.mean(probs[s_idx_clamped:e_idx_clamped+1])) if probs.size else 0.95
+                    extracted.append({
+                        "foot": foot,
+                        "start_time_s": c_start,
+                        "end_time_s": c_end,
+                        "duration_ms": round(c_dur_ms, 1),
+                        "peak_force_n": round(float(weight_kg * (peak_abs_acz / 10.0) * 9.80665), 1),
+                        "peak_force_bw": round(float(peak_abs_acz / 10.0), 2),
+                        "confidence": round(conf, 3),
+                    })
+
+            # Format 2: StepCadenceCalculator / MLSprintCalculator style (contact_events)
+            elif "contact_events" in foot_viz and foot_viz["contact_events"]:
+                for event in foot_viz["contact_events"]:
+                    c_start = float(event["timestep_s"])
+                    c_dur_s = float(event["contact_time_s"])
+                    c_end = c_start + c_dur_s
+                    pad = 0.1 * c_dur_s
+                    w_start, w_end = c_start - pad, c_end + pad
+                    if times_s.size and acz.size:
+                        mask = (times_s >= w_start) & (times_s <= w_end)
+                        peak_abs_acz = float(np.max(np.abs(acz[mask]))) if np.any(mask) else 0.0
+                    else:
+                        peak_abs_acz = 0.0
+
+                    extracted.append({
+                        "foot": foot,
+                        "start_time_s": c_start,
+                        "end_time_s": c_end,
+                        "duration_ms": round(c_dur_s * 1000.0, 1),
+                        "peak_force_n": round(float(weight_kg * (peak_abs_acz / 10.0) * 9.80665), 1),
+                        "peak_force_bw": round(float(peak_abs_acz / 10.0), 2),
+                        "confidence": event.get("confidence"),
+                    })
         return extracted
 
-    # Attempt 1: StepCadenceCalculator
+    # Priority 1: WalkGCCalculator (WalkBiLSTM - 1579 contacts)
     try:
-        from app.services.calculators.step_cadence_calculator import get_walk_cadence_calculator
-        c_calc = get_walk_cadence_calculator()
-        c_calc.calculate(rows)
-        if getattr(c_calc, "_viz_data", None):
-            all_contacts = _extract_from_viz(c_calc._viz_data)
+        from app.services.calculators.walk_gc_calculator import get_walk_gc_calculator
+        w_calc = get_walk_gc_calculator()
+        w_calc.calculate(rows)
+        if getattr(w_calc, "_viz_data", None):
+            all_contacts = _extract_from_viz(w_calc._viz_data)
     except Exception:
         pass
 
-    # Attempt 2: WalkGCCalculator directly
+    # Priority 2: StepCadenceCalculator
     if not all_contacts:
         try:
-            from app.services.calculators.walk_gc_calculator import get_walk_gc_calculator
-            w_calc = get_walk_gc_calculator()
-            w_calc.calculate(rows)
-            if getattr(w_calc, "_viz_data", None):
-                all_contacts = _extract_from_viz(w_calc._viz_data)
+            from app.services.calculators.step_cadence_calculator import get_walk_cadence_calculator
+            c_calc = get_walk_cadence_calculator()
+            c_calc.calculate(rows)
+            if getattr(c_calc, "_viz_data", None):
+                all_contacts = _extract_from_viz(c_calc._viz_data)
         except Exception:
             pass
 
-    # Attempt 3: MLSprintCalculator / TkeoCadenceCalculator
+    # Priority 3: MLSprintCalculator
     if not all_contacts:
         try:
             from app.services.calculators.ml_sprint_calculator import MLSprintCalculator
@@ -479,35 +514,7 @@ def extract_turns_and_steps(
         except Exception:
             pass
 
-    if not all_contacts:
-        try:
-            from app.services.calculators.tkeo_cadence_calculator import TkeoCadenceCalculator
-            t_calc = TkeoCadenceCalculator()
-            t_calc.calculate(rows)
-            if getattr(t_calc, "_viz_data", None):
-                all_contacts = _extract_from_viz(t_calc._viz_data)
-        except Exception:
-            pass
-
-    # Attempt 4: StepDetectorTTest
-    if not all_contacts:
-        try:
-            from app.services.calculators.step_detector_ttest import StepDetectorTTest
-            steps = StepDetectorTTest().calculate(df)
-            for row in steps.itertuples(index=False):
-                all_contacts.append({
-                    "foot": str(row.foot),
-                    "start_time_s": float(row.t_start),
-                    "end_time_s": float(row.t_end),
-                    "duration_ms": float(row.contact_ms),
-                    "peak_force_n": 0.0,
-                    "peak_force_bw": 0.0,
-                    "confidence": float(getattr(row, "peak_z", 1.0)),
-                })
-        except Exception:
-            pass
-
-    # Attempt 5: Standalone pure NumPy TKEO fallback
+    # Priority 4: Standalone pure NumPy TKEO fallback
     if not all_contacts:
         sensor_col = "Name" if "Name" in df.columns else None
         for sensor, foot in (("ESP32_Sensor_1", "left"), ("ESP32_Sensor_2", "right")):
@@ -555,27 +562,24 @@ def extract_turns_and_steps(
             step_time_ms = step_time_s * 1000.0
             c["step_time_ms"] = round(step_time_ms, 1)
 
-            # Kinematic Support Force: F_mean = BW * (t_step / t_contact)
-            # Peak Force (Morin sine model): F_peak = F_mean * (pi / 2)
-            if gct_s > 0:
+            # Normal running step time is 0.12 - 0.70 s
+            if 0.12 <= step_time_s <= 0.70 and gct_s > 0:
                 ratio = step_time_s / gct_s
-                mean_force_bw_kin = ratio
-                peak_force_bw_kin = ratio * (np.pi / 2.0)
-                c["mean_force_bw_kin"] = round(mean_force_bw_kin, 2)
-                c["peak_force_bw_kin"] = round(peak_force_bw_kin, 2)
-                c["mean_force_n_kin"] = round(mean_force_bw_kin * bw_n, 1)
-                c["peak_force_n_kin"] = round(peak_force_bw_kin * bw_n, 1)
+                c["mean_force_bw_kin"] = round(ratio, 2)
+                c["mean_force_n_kin"] = round(ratio * bw_n, 1)
+            elif gct_s > 0:
+                # Turnaround inter-segment gap -> use sensor IMU peak force
+                imu_bw = c.get("peak_force_bw", 2.2)
+                c["mean_force_bw_kin"] = round(float(imu_bw), 2)
+                c["mean_force_n_kin"] = round(float(imu_bw) * bw_n, 1)
             else:
                 c["mean_force_bw_kin"] = None
-                c["peak_force_bw_kin"] = None
                 c["mean_force_n_kin"] = None
-                c["peak_force_n_kin"] = None
         else:
             c["step_time_ms"] = None
-            c["mean_force_bw_kin"] = None
-            c["peak_force_bw_kin"] = None
-            c["mean_force_n_kin"] = None
-            c["peak_force_n_kin"] = None
+            imu_bw = c.get("peak_force_bw", 2.2)
+            c["mean_force_bw_kin"] = round(float(imu_bw), 2)
+            c["mean_force_n_kin"] = round(float(imu_bw) * bw_n, 1)
 
     # 3. For each turn, extract [-3, -2, -1] steps, [turn step], and [+1] step
     turn_records: List[Dict[str, Any]] = []
