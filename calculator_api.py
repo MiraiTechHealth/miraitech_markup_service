@@ -321,6 +321,7 @@ def _cadence_result(
     ``calculator`` lets a caller supply its own detector; walking and running
     pass the WalkBiLSTM-backed adapter the backend uses for those protocols.
     """
+    rows = _rows_with_time_in_ms(rows)
     if calculator is None:
         if calculator_id == "tkeo-cadence":
             from app.services.calculators.tkeo_cadence_calculator import TkeoCadenceCalculator
@@ -378,6 +379,7 @@ def _cadence_result(
 def _ttest_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     from app.services.calculators.step_detector_ttest import StepDetectorTTest
 
+    rows = _rows_with_time_in_ms(rows)
     steps = StepDetectorTTest().calculate(pd.DataFrame(rows))
     contacts = [
         {

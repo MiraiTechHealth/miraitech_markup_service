@@ -2911,7 +2911,7 @@ export default function App() {
   const ensurePredictSeries = useCallback(async () => {
     if (speedPredict) return speedPredict
 
-    const sid = sessionId.trim()
+    const sid = (loadedSessionId || sessionId).trim()
     if (!sid) throw new Error('Укажите ID сессии — прогноз берётся по сессии')
 
     setPredictLoading(true)
@@ -2937,7 +2937,7 @@ export default function App() {
     } finally {
       setPredictLoading(false)
     }
-  }, [speedPredict, sessionId, token])
+  }, [speedPredict, loadedSessionId, sessionId, token])
 
   const fetchSpeedPredict = useCallback(async () => {
     if (showSpeedPredict) {
