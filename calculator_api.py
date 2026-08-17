@@ -705,6 +705,7 @@ def _protocol_turn_detector_result(
     sensor_name: str | None = None,
 ) -> Dict[str, Any]:
     """Run one detector per requested foot; ``both`` overlays L and R results."""
+    from app.schemas.turn_cod import TurnEvent
     from app.services.calculators.turn_calculator import TurnCalculator
 
     def create_calculator():
@@ -745,10 +746,37 @@ def _protocol_turn_detector_result(
 
         normalised_rows = _rows_with_time_in_ms(foot_rows)
         calculator = create_calculator()
-        result = calculator.calculate(normalised_rows)
+        raw_turns = calculator.identify(normalised_rows, group_sensors=False)
+
+        turn_events: List[Any] = []
+        for t in raw_turns:
+            duration = t["end_time"] - t["start_time"]
+            if duration <= 0:
+                continue
+            angle = t["angle"]
+            direction = "left" if angle < 0 else "right" if angle > 0 else "unknown"
+            mean_vel = (angle / (duration / 1000.0)) if duration > 0 else 0.0
+            turn_events.append(TurnEvent(
+                index=t["index"],
+                start_time_ms=t["start_time"],
+                end_time_ms=t["end_time"],
+                duration_ms=duration,
+                angle_deg=angle,
+                direction=direction,
+                mean_angular_velocity_deg_s=round(mean_vel, 2),
+                pivot_foot=foot,
+                turning_foot="right" if foot == "left" else "left",
+                sensor_name=selected_sensor_name,
+            ))
+
+        if calculator.merge_close_turns_ms is not None and calculator.merge_close_turns_ms > 0:
+            turn_events = calculator._merge_close_turns(turn_events)
+        if calculator.max_turns is not None and len(turn_events) > calculator.max_turns:
+            turn_events = calculator._trim_to_max_turns(turn_events)
+
         start_ms, end_ms = _session_time_bounds_ms(normalised_rows)
         foot_contacts = _turn_phase_contacts(
-            result.turns,
+            turn_events,
             start_ms,
             end_ms,
             event_foot=foot,
@@ -762,7 +790,7 @@ def _protocol_turn_detector_result(
             "event_count": len(foot_contacts),
             "turn_count": turn_count,
             "run_count": run_count,
-            "is_valid": bool(result.is_valid),
+            "is_valid": len(turn_events) > 0,
         }
 
     if not foot_summaries:
