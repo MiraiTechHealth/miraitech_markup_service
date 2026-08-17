@@ -531,6 +531,7 @@ def extract_turns_and_steps(
     all_contacts.sort(key=lambda c: c["start_time_s"])
 
     # Compute step time and Kinematic Support Force (Step Time / GCT)
+    bw_n = weight_kg * 9.80665
     for i in range(len(all_contacts)):
         c = all_contacts[i]
         gct_s = c["duration_ms"] / 1000.0
