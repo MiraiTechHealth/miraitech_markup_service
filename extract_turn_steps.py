@@ -65,19 +65,38 @@ def load_session_df(session_id: Optional[int], file_path: Optional[str]) -> pd.D
             raise ValueError(f"Unsupported file format: {path.suffix}")
 
     if session_id is not None:
-        from app.services.session_data_storage import get_session_parquet_bytes, load_session_dataframe
-
         try:
+            from app.services.session_data_storage import load_session_dataframe
             df = load_session_dataframe(session_id)
             if df is not None and not df.empty:
                 return df
+        except Exception as exc:
+            print(f"Direct load_session_dataframe notice: {exc}")
+
+        # Fallback: direct GCS read with google-cloud-storage
+        try:
+            from google.cloud import storage
+            from app.core.config import settings
+            client = storage.Client()
+            bucket = client.bucket(settings.GCS_BUCKET_NAME)
+            blob_name = f"{settings.GCS_SESSION_PREFIX}/{session_id}.parquet"
+            blob = bucket.blob(blob_name)
+            if blob.exists():
+                data_bytes = blob.download_as_bytes()
+                return pd.read_parquet(io.BytesIO(data_bytes))
+        except Exception as exc:
+            print(f"Direct GCS download notice: {exc}")
+
+        # Fallback 2: load_session_data
+        try:
+            from app.services.session_data_storage import load_session_data
+            rows = load_session_data(session_id)
+            if rows:
+                return pd.DataFrame(rows)
         except Exception:
             pass
 
-        raw_bytes = get_session_parquet_bytes(session_id)
-        if raw_bytes is None:
-            raise RuntimeError(f"Could not load data for session {session_id} from storage")
-        return pd.read_parquet(io.BytesIO(raw_bytes))
+        raise RuntimeError(f"Could not load data for session {session_id} from storage")
 
     raise ValueError("Either --session or --file must be specified")
 
