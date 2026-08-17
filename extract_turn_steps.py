@@ -22,10 +22,21 @@ import pandas as pd
 
 # Set up paths to import MiraiTech backend
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_BACKEND_ROOT = SCRIPT_DIR.parent / "MiraiTech-backend"
-BACKEND_ROOT = Path(os.environ.get("MIRAITECH_BACKEND_ROOT", str(DEFAULT_BACKEND_ROOT))).expanduser().resolve()
-if str(BACKEND_ROOT) not in sys.path:
-    sys.path.insert(0, str(BACKEND_ROOT))
+CANDIDATE_BACKEND_PATHS = [
+    Path(os.environ.get("MIRAITECH_BACKEND_ROOT", "")),
+    SCRIPT_DIR.parent / "MiraiTech-backend",
+    SCRIPT_DIR.parent / "miraitech-backend",
+    Path("/home/shared_folder/MiraiTech-backend"),
+    Path("/home/shared_folder/miraitech-backend"),
+    Path("/home/miraitech/MiraiTech-backend"),
+    Path("/home/miraitech/miraitech-backend"),
+    Path("/home/miraitech/app"),
+]
+
+for p in CANDIDATE_BACKEND_PATHS:
+    if p and p.exists() and str(p) not in sys.path:
+        sys.path.insert(0, str(p))
+
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
