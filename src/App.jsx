@@ -249,6 +249,30 @@ function calculatorEventLegend(calculator, result) {
   return [...items.values()]
 }
 
+function getCalculatorColumns(calculatorId, data) {
+  if (!data) return {}
+  const ALWAYS = ['Time', 'time', 'timestamp', 'Timestamp', 'Name']
+  let needed = []
+  if (PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)) {
+    needed = [...ALWAYS, 'XData', 'Yaw', 'yaw', 'Heading', 'heading']
+  } else if (['jump-metrics', 'protocol-jumping-detector'].includes(calculatorId)) {
+    needed = [...ALWAYS, 'AcX', 'AcY', 'AcZ']
+  } else if (['force-jump'].includes(calculatorId)) {
+    needed = [...ALWAYS, 'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4', 'Sensor_5', 'Sensor_6', 'Sensor_7', 'Sensor_8']
+  } else if (calculatorId === 'protocol-sprint-detector') {
+    needed = [...ALWAYS, 'AcX', 'AcY', 'AcZ', 'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4', 'Distance', 'Speed', 'DistanceM', 'VelocityMs']
+  } else {
+    needed = [...ALWAYS, 'AcX', 'AcY', 'AcZ', 'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4', 'Sensor_5', 'Sensor_6', 'Sensor_7', 'Sensor_8']
+  }
+  const filtered = {}
+  for (const col of needed) {
+    if (data[col] != null) {
+      filtered[col] = data[col]
+    }
+  }
+  return filtered
+}
+
 // Insole pressure channels and the device-name → foot mapping used for
 // per-foot calibration/normalization (mirrors the backend: ESP32_Sensor_1 is
 // the left insole, ESP32_Sensor_2 the right).
@@ -1368,6 +1392,7 @@ export default function App() {
 
   // Session
   const [sessionId, setSessionId]       = useState('')
+  const [loadedSessionId, setLoadedSessionId] = useState(null)
   const [sessionLabel, setSessionLabel] = useState('')
   const [markupFiles, setMarkupFiles]   = useState([])
   const [activeMarkupFileId, setActiveMarkupFileId] = useState('')
@@ -1774,6 +1799,7 @@ export default function App() {
         ? await metadataResp.json()
         : { additional_info: null }
       setSessionRecordAvailable(metadataAvailable)
+      setLoadedSessionId(sid)
 
       const initialMarkupFiles = result.additional_info?.markup_files || []
       setMarkupFiles(initialMarkupFiles)
@@ -2291,6 +2317,7 @@ export default function App() {
         setActiveMarkupFileId('')
         setPendingImportFilename('')
         setSessionRecordAvailable(false)
+        setLoadedSessionId(null)
         setShowLeftPatterns(true)
         setShowRightPatterns(true)
         setShowSensor1(true)
@@ -2778,6 +2805,7 @@ export default function App() {
     setPendingImportFilename('')
     setActiveMarkupFileId('')
     setSessionRecordAvailable(false)
+    setLoadedSessionId(null)
 
     try {
       const arrayBuffer = await file.arrayBuffer()
@@ -2945,6 +2973,17 @@ export default function App() {
     }
   }, [showDistancePredict, ensurePredictSeries, columns])
 
+  /**
+   * What the chart plots: the raw columns, or the same columns with XData
+   * swapped for the drift-corrected yaw. Swapping a cached array reference is
+   * all the toggle costs — the estimate already ran at load time.
+   */
+  const chartData = useMemo(() => (
+    parquetData && yawFixed && correctedXDataCol
+      ? { ...parquetData, XData: correctedXDataCol }
+      : parquetData
+  ), [parquetData, yawFixed, correctedXDataCol])
+
   const toggleAdditionalCalculator = useCallback(async (calculatorId, options = {}) => {
     const force = Boolean(options.force)
     const requestedDetectionFoot = PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)
@@ -2983,7 +3022,16 @@ export default function App() {
     const dataVersion = calculatorDataVersionRef.current
     setCalculatorLoading(calculatorId)
     try {
-      const payload = { columns: parquetData }
+      const canUseSessionId = loadedSessionId
+        && sessionRecordAvailable
+        && !yawFixed
+        && !imuApplied
+        && !importedCsvTextRef.current
+
+      const payload = canUseSessionId
+        ? { session_id: Number(loadedSessionId) }
+        : { columns: getCalculatorColumns(calculatorId, chartData) }
+
       if (calculatorId === 'force-jump') payload.weight_kg = parsedWeight
       if (PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)) {
         const selectedSensorName = requestedDetectionFoot === 'both'
@@ -3036,18 +3084,7 @@ export default function App() {
     } finally {
       if (dataVersion === calculatorDataVersionRef.current) setCalculatorLoading('')
     }
-  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg, turnDetectionFeet, insoleSensorNames])
-
-  /**
-   * What the chart plots: the raw columns, or the same columns with XData
-   * swapped for the drift-corrected yaw. Swapping a cached array reference is
-   * all the toggle costs — the estimate already ran at load time.
-   */
-  const chartData = useMemo(() => (
-    parquetData && yawFixed && correctedXDataCol
-      ? { ...parquetData, XData: correctedXDataCol }
-      : parquetData
-  ), [parquetData, yawFixed, correctedXDataCol])
+  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg, turnDetectionFeet, insoleSensorNames, loadedSessionId, sessionRecordAvailable, yawFixed, imuApplied, chartData])
 
   // ── Build Plotly chart ────────────────────────────────────────────────────
   const renderChart = useCallback(() => {

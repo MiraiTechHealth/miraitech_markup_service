@@ -1423,10 +1423,25 @@ async def calculate(
     if calculator_id not in CALCULATOR_LABELS:
         raise HTTPException(status_code=404, detail="Unknown calculator")
 
-    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
-        data = _extract_session_dataframe(payload)
+    session_id = payload.get("session_id")
+    if session_id and not payload.get("columns") and not payload.get("rows"):
+        try:
+            sid = int(session_id)
+            from app.services.session_data_storage import get_session_parquet_bytes
+            import io
+            raw_bytes = await _run_markup_io(get_session_parquet_bytes, sid)
+            if raw_bytes is None:
+                raise HTTPException(status_code=404, detail=f"Session {sid} has no parquet data")
+            data = await asyncio.to_thread(pd.read_parquet, io.BytesIO(raw_bytes))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Failed to load session {session_id}: {exc}")
     else:
-        data = _extract_session_rows(payload)
+        if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
+            data = _extract_session_dataframe(payload)
+        else:
+            data = _extract_session_rows(payload)
 
     if calculator_id == "force-jump":
         try:
@@ -1435,8 +1450,9 @@ async def calculate(
             raise HTTPException(status_code=422, detail="weight_kg is required for Bilateral GRF")
         if weight_kg <= 0:
             raise HTTPException(status_code=422, detail="weight_kg must be positive")
+        rows = data if isinstance(data, list) else data.to_dict(orient="records")
         try:
-            return await asyncio.to_thread(_force_result, data, weight_kg)
+            return await asyncio.to_thread(_force_result, rows, weight_kg)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
