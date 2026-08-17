@@ -175,13 +175,37 @@ def extract_turns_and_steps(
     # Sort all contacts chronologically
     all_contacts.sort(key=lambda c: c["start_time_s"])
 
-    # Compute step time (inter-contact onset time)
+    # Compute step time (inter-contact onset time) and Kinematic Support Force (Step Time / GCT)
+    bw_n = weight_kg * 9.80665
     for i in range(len(all_contacts)):
+        c = all_contacts[i]
+        gct_s = c["duration_ms"] / 1000.0
         if i > 0:
-            step_time_ms = (all_contacts[i]["start_time_s"] - all_contacts[i - 1]["start_time_s"]) * 1000.0
-            all_contacts[i]["step_time_ms"] = round(step_time_ms, 1)
+            step_time_s = all_contacts[i]["start_time_s"] - all_contacts[i - 1]["start_time_s"]
+            step_time_ms = step_time_s * 1000.0
+            c["step_time_ms"] = round(step_time_ms, 1)
+
+            # Kinematic Support Force: F_mean = BW * (t_step / t_contact)
+            # Peak Force (Morin sine model): F_peak = F_mean * (pi / 2)
+            if gct_s > 0:
+                ratio = step_time_s / gct_s
+                mean_force_bw_kin = ratio
+                peak_force_bw_kin = ratio * (np.pi / 2.0)
+                c["mean_force_bw_kin"] = round(mean_force_bw_kin, 2)
+                c["peak_force_bw_kin"] = round(peak_force_bw_kin, 2)
+                c["mean_force_n_kin"] = round(mean_force_bw_kin * bw_n, 1)
+                c["peak_force_n_kin"] = round(peak_force_bw_kin * bw_n, 1)
+            else:
+                c["mean_force_bw_kin"] = None
+                c["peak_force_bw_kin"] = None
+                c["mean_force_n_kin"] = None
+                c["peak_force_n_kin"] = None
         else:
-            all_contacts[i]["step_time_ms"] = None
+            c["step_time_ms"] = None
+            c["mean_force_bw_kin"] = None
+            c["peak_force_bw_kin"] = None
+            c["mean_force_n_kin"] = None
+            c["peak_force_n_kin"] = None
 
     # 3. For each turn, extract [-3, -2, -1] steps, [turn step], and [+1] step
     turn_records: List[Dict[str, Any]] = []
@@ -229,19 +253,25 @@ def extract_turns_and_steps(
                 record[f"{prefix}_time_s"] = round(st["start_time_s"], 3)
                 record[f"{prefix}_gct_ms"] = round(st["duration_ms"], 1)
                 record[f"{prefix}_step_time_ms"] = st["step_time_ms"]
-                record[f"{prefix}_peak_force_n"] = st["peak_force_n"]
-                record[f"{prefix}_peak_force_bw"] = st["peak_force_bw"]
-                record[f"{prefix}_mean_force_n"] = st["mean_force_n"]
-                record[f"{prefix}_mean_force_bw"] = st["mean_force_bw"]
+                # Kinematic Support Force (Step Time / GCT)
+                record[f"{prefix}_support_force_bw"] = st["mean_force_bw_kin"]
+                record[f"{prefix}_support_force_n"] = st["mean_force_n_kin"]
+                record[f"{prefix}_peak_force_bw_kin"] = st["peak_force_bw_kin"]
+                record[f"{prefix}_peak_force_n_kin"] = st["peak_force_n_kin"]
+                # IMU AcZ Force
+                record[f"{prefix}_imu_peak_force_n"] = st["peak_force_n"]
+                record[f"{prefix}_imu_peak_force_bw"] = st["peak_force_bw"]
             else:
                 record[f"{prefix}_foot"] = None
                 record[f"{prefix}_time_s"] = None
                 record[f"{prefix}_gct_ms"] = None
                 record[f"{prefix}_step_time_ms"] = None
-                record[f"{prefix}_peak_force_n"] = None
-                record[f"{prefix}_peak_force_bw"] = None
-                record[f"{prefix}_mean_force_n"] = None
-                record[f"{prefix}_mean_force_bw"] = None
+                record[f"{prefix}_support_force_bw"] = None
+                record[f"{prefix}_support_force_n"] = None
+                record[f"{prefix}_peak_force_bw_kin"] = None
+                record[f"{prefix}_peak_force_n_kin"] = None
+                record[f"{prefix}_imu_peak_force_n"] = None
+                record[f"{prefix}_imu_peak_force_bw"] = None
 
         turn_records.append(record)
 
@@ -257,18 +287,30 @@ def extract_turns_and_steps(
     for role in STEP_ROLES:
         gct_col = f"{role}_gct_ms"
         st_col = f"{role}_step_time_ms"
-        pf_n_col = f"{role}_peak_force_n"
-        pf_bw_col = f"{role}_peak_force_bw"
-        mf_n_col = f"{role}_mean_force_n"
+        sup_bw_col = f"{role}_support_force_bw"
+        sup_n_col = f"{role}_support_force_n"
+        pk_kin_bw_col = f"{role}_peak_force_bw_kin"
+        pk_kin_n_col = f"{role}_peak_force_n_kin"
+        imu_n_col = f"{role}_imu_peak_force_n"
+        imu_bw_col = f"{role}_imu_peak_force_bw"
+
+        def _mean(col):
+            return round(float(df_results[col].dropna().mean()), 2) if col in df_results and not df_results[col].dropna().empty else None
+
+        def _std(col):
+            return round(float(df_results[col].dropna().std()), 2) if col in df_results and not df_results[col].dropna().empty else None
 
         stats["roles"][role] = {
-            "gct_ms_mean": round(float(df_results[gct_col].dropna().mean()), 1) if gct_col in df_results and not df_results[gct_col].dropna().empty else None,
-            "gct_ms_std": round(float(df_results[gct_col].dropna().std()), 1) if gct_col in df_results and not df_results[gct_col].dropna().empty else None,
-            "step_time_ms_mean": round(float(df_results[st_col].dropna().mean()), 1) if st_col in df_results and not df_results[st_col].dropna().empty else None,
-            "step_time_ms_std": round(float(df_results[st_col].dropna().std()), 1) if st_col in df_results and not df_results[st_col].dropna().empty else None,
-            "peak_force_n_mean": round(float(df_results[pf_n_col].dropna().mean()), 1) if pf_n_col in df_results and not df_results[pf_n_col].dropna().empty else None,
-            "peak_force_bw_mean": round(float(df_results[pf_bw_col].dropna().mean()), 2) if pf_bw_col in df_results and not df_results[pf_bw_col].dropna().empty else None,
-            "mean_force_n_mean": round(float(df_results[mf_n_col].dropna().mean()), 1) if mf_n_col in df_results and not df_results[mf_n_col].dropna().empty else None,
+            "gct_ms_mean": _mean(gct_col),
+            "gct_ms_std": _std(gct_col),
+            "step_time_ms_mean": _mean(st_col),
+            "step_time_ms_std": _std(st_col),
+            "support_force_bw_mean": _mean(sup_bw_col),
+            "support_force_n_mean": _mean(sup_n_col),
+            "peak_force_kin_bw_mean": _mean(pk_kin_bw_col),
+            "peak_force_kin_n_mean": _mean(pk_kin_n_col),
+            "imu_peak_force_n_mean": _mean(imu_n_col),
+            "imu_peak_force_bw_mean": _mean(imu_bw_col),
         }
 
     return turn_records, df_results, stats
@@ -292,8 +334,8 @@ def main():
     turn_records, df_results, stats = extract_turns_and_steps(df, weight_kg=args.weight)
 
     print(f"\n--- Результаты анализа сессии {args.session} ({stats['total_turns']} поворотов) ---")
-    print(f"{'Шаг (фаза)':<22} | {'GCT (мс)':<16} | {'Step Time (мс)':<18} | {'Пиковая сила (Н / BW)':<22} | {'Ср. сила (Н)':<12}")
-    print("-" * 100)
+    print(f"{'Шаг (фаза)':<22} | {'GCT (мс)':<16} | {'Step Time (мс)':<18} | {'Support Force (BW / N)':<24} | {'Peak Force Kin (BW)':<20} | {'IMU AcZ Peak (BW)':<18}")
+    print("-" * 128)
 
     role_names = {
         "step_-3": "3-й шаг до (N-3)",
@@ -304,12 +346,13 @@ def main():
     }
 
     for role, label in role_names.items():
-        r_stats = stats["roles"][role]
-        gct_str = f"{r_stats['gct_ms_mean']} ± {r_stats['gct_ms_std']}" if r_stats['gct_ms_mean'] is not None else "—"
-        st_str = f"{r_stats['step_time_ms_mean']} ± {r_stats['step_time_ms_std']}" if r_stats['step_time_ms_mean'] is not None else "—"
-        pf_str = f"{r_stats['peak_force_n_mean']} Н ({r_stats['peak_force_bw_mean']} BW)" if r_stats['peak_force_n_mean'] is not None else "—"
-        mf_str = f"{r_stats['mean_force_n_mean']} Н" if r_stats['mean_force_n_mean'] is not None else "—"
-        print(f"{label:<22} | {gct_str:<16} | {st_str:<18} | {pf_str:<22} | {mf_str:<12}")
+        r = stats["roles"][role]
+        gct_str = f"{r['gct_ms_mean']} ± {r['gct_ms_std']}" if r['gct_ms_mean'] is not None else "—"
+        st_str = f"{r['step_time_ms_mean']} ± {r['step_time_ms_std']}" if r['step_time_ms_mean'] is not None else "—"
+        sup_str = f"{r['support_force_bw_mean']} BW ({r['support_force_n_mean']} Н)" if r['support_force_bw_mean'] is not None else "—"
+        pk_kin_str = f"{r['peak_force_kin_bw_mean']} BW ({r['peak_force_kin_n_mean']} Н)" if r['peak_force_kin_bw_mean'] is not None else "—"
+        imu_str = f"{r['imu_peak_force_bw_mean']} BW ({r['imu_peak_force_n_mean']} Н)" if r['imu_peak_force_bw_mean'] is not None else "—"
+        print(f"{label:<22} | {gct_str:<16} | {st_str:<18} | {sup_str:<24} | {pk_kin_str:<20} | {imu_str:<18}")
 
     # Save outputs
     df_results.to_csv(args.output_csv, index=False)
