@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Extract 3 steps before turn, 1 step after turn, and calculate GCT, Step Time, and Force.
+Extract 3 steps before turn, 1 step after turn, and calculate GCT, Step Time, and Force for session data.
+
+Self-contained script that runs without depending on specific backend repository branch versions.
 
 Usage:
     python extract_turn_steps.py --session 6546 [--weight 70.0] [--output-csv turn_steps_session_6546.csv]
@@ -12,15 +14,17 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+from scipy.signal import savgol_filter
 
-# Set up paths to import MiraiTech backend
+# Set up paths to import MiraiTech backend if available
 SCRIPT_DIR = Path(__file__).resolve().parent
 CANDIDATE_BACKEND_PATHS = [
     Path(os.environ.get("MIRAITECH_BACKEND_ROOT", "")),
@@ -33,7 +37,7 @@ CANDIDATE_BACKEND_PATHS = [
     Path("/home/miraitech/app"),
 ]
 
-# Auto-load .env file from backend directory so Settings() does not error
+# Auto-load .env file from backend directory so GCS / Settings can be read
 try:
     from dotenv import load_dotenv
     for p in CANDIDATE_BACKEND_PATHS:
@@ -51,8 +55,222 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Standalone Turn Detection (Yo-Yo / Beep Test detector)
+# ─────────────────────────────────────────────────────────────────────────────
+LEFT_FOOT = "ESP32_Sensor_1"
+RIGHT_FOOT = "ESP32_Sensor_2"
+
+class StandaloneTurnCalculator:
+    """Self-contained Net-Rotation + Rise-Fraction turn detector."""
+
+    def __init__(
+        self,
+        min_net_deg: float = 28.62,
+        win_ms: float = 420.2,
+        grid_ms: float = 2.0,
+        pad_ms: float = 392.2,
+        q_rise: float = 0.078,
+        min_amp_deg: float = 24.71,
+        merge_gap_ms: float = 120.2,
+        sg_window_length: int = 277,
+        sg_polyorder: int = 2,
+    ):
+        self.min_net_deg = min_net_deg
+        self.win_ms = win_ms
+        self.grid_ms = grid_ms
+        self.pad_ms = pad_ms
+        self.q_rise = q_rise
+        self.min_amp_deg = min_amp_deg
+        self.merge_gap_ms = merge_gap_ms
+        self.sg_window_length = sg_window_length
+        self.sg_polyorder = sg_polyorder
+
+    @staticmethod
+    def unwrap_angle_degrees(values: np.ndarray, threshold: float = 180.0) -> np.ndarray:
+        if len(values) == 0:
+            return values.astype(np.float64, copy=True)
+        result = values.astype(np.float64, copy=True)
+        offset = 0.0
+        for i in range(1, len(values)):
+            curr = values[i]
+            prev = values[i - 1]
+            if np.isnan(curr) or np.isnan(prev):
+                continue
+            diff = curr - prev
+            if diff > threshold:
+                offset -= 360.0
+            elif diff < -threshold:
+                offset += 360.0
+            result[i] = float(values[i]) + offset
+        return result
+
+    def _savgol_smooth(self, th: np.ndarray) -> np.ndarray:
+        n = len(th)
+        poly = self.sg_polyorder
+        wl = self.sg_window_length
+        if wl > n:
+            wl = n
+        if wl % 2 == 0:
+            wl -= 1
+        if wl <= poly:
+            wl = poly + 1
+            if wl % 2 == 0:
+                wl += 1
+        if wl < 3 or wl > n or wl <= poly:
+            return th
+        return savgol_filter(th, window_length=wl, polyorder=poly)
+
+    def _prepare_grid(self, time_arr: np.ndarray, angle_arr: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
+        t = pd.to_numeric(pd.Series(time_arr), errors="coerce").to_numpy(dtype=float)
+        a = pd.to_numeric(pd.Series(angle_arr), errors="coerce").to_numpy(dtype=float)
+        valid = np.isfinite(t) & np.isfinite(a)
+        t, a = t[valid], a[valid]
+        if len(t) < 10:
+            return None
+
+        order = np.argsort(t, kind="stable")
+        t, a = t[order], a[order]
+        theta = self.unwrap_angle_degrees(a)
+
+        t_u, idx = np.unique(t, return_index=True)
+        theta_u = theta[idx]
+        if len(t_u) < 10 or t_u[-1] <= t_u[0]:
+            return None
+
+        unit = 1.0 if np.max(t_u) > 3600 else 1e-3
+        grid_step = self.grid_ms * unit
+        if grid_step <= 0:
+            return None
+
+        tg = np.arange(t_u[0], t_u[-1], grid_step)
+        if len(tg) < 10:
+            return None
+        th = np.interp(tg, t_u, theta_u)
+        th = self._savgol_smooth(th)
+        return tg, th, unit
+
+    def _locate_regions(self, tg: np.ndarray, th: np.ndarray, unit: float) -> List[Tuple[int, int]]:
+        k = max(int(self.win_ms / self.grid_ms), 1)
+        if k >= len(th):
+            return []
+
+        net = np.abs(th[k:] - th[:-k])
+        mask = np.zeros(len(tg), dtype=bool)
+        for i in np.flatnonzero(net >= self.min_net_deg):
+            mask[i:i + k + 1] = True
+
+        m = np.concatenate([[0], mask.astype(int), [0]])
+        edges = np.flatnonzero(np.diff(m))
+        regions = list(zip(edges[::2], edges[1::2] - 1))
+
+        merge_gap = self.merge_gap_ms * unit
+        merged: List[Tuple[int, int]] = []
+        for s, e in regions:
+            if merged and (tg[s] - tg[merged[-1][1]]) < merge_gap:
+                merged[-1] = (merged[-1][0], e)
+            else:
+                merged.append((s, e))
+        return merged
+
+    def _rise_boundaries(self, tg: np.ndarray, th: np.ndarray, s: int, e: int) -> Optional[Tuple[float, float, float]]:
+        pad = int(self.pad_ms / self.grid_ms)
+        q = self.q_rise
+        lo_seg = th[max(s - pad, 0):s]
+        hi_seg = th[e + 1:e + 1 + pad]
+        if len(lo_seg) < 10 or len(hi_seg) < 10:
+            return None
+
+        lo, hi = float(np.median(lo_seg)), float(np.median(hi_seg))
+        amp = hi - lo
+        if abs(amp) < self.min_amp_deg:
+            return None
+
+        base = max(s - pad, 0)
+        x = (th[base:e + 1 + pad] - lo) / amp
+        mid = np.flatnonzero(x >= 0.5)
+        if not len(mid):
+            return None
+
+        i = j = int(mid[0])
+        while i > 0 and x[i] > q:
+            i -= 1
+        while j < len(x) - 1 and x[j] < 1 - q:
+            j += 1
+        return float(tg[base + i]), float(tg[base + j]), float(amp)
+
+    def detect_turn_regions(self, time_arr: np.ndarray, angle_arr: np.ndarray) -> List[Tuple[float, float, float]]:
+        prepared = self._prepare_grid(time_arr, angle_arr)
+        if prepared is None:
+            return []
+        tg, th, unit = prepared
+        out = []
+        for s, e in self._locate_regions(tg, th, unit):
+            bounds = self._rise_boundaries(tg, th, s, e)
+            if bounds is not None:
+                out.append(bounds)
+        return out
+
+    def identify(self, df: pd.DataFrame, group_sensors: bool = True) -> List[Dict[str, Any]]:
+        tcol = "Time" if "Time" in df.columns else ("time" if "time" in df.columns else None)
+        turn_col = "XData" if "XData" in df.columns else None
+        if not tcol or not turn_col:
+            return []
+
+        if group_sensors and "Name" in df.columns:
+            groups = [(name, group.sort_values(tcol).reset_index(drop=True)) for name, group in df.groupby("Name")]
+        else:
+            groups = [(None, df.sort_values(tcol).reset_index(drop=True))]
+
+        per_sensor = []
+        for name, group in groups:
+            time_arr = group[tcol].to_numpy()
+            angle_arr = group[turn_col].to_numpy()
+            per_sensor.append({
+                "name": name,
+                "regions": self.detect_turn_regions(time_arr, angle_arr),
+                "grid": self._prepare_grid(time_arr, angle_arr),
+            })
+
+        tagged = [
+            {"start": s, "end": e, "angle": a, "grid": entry["grid"]}
+            for entry in per_sensor
+            for s, e, a in entry["regions"]
+            if e > s
+        ]
+        if not tagged:
+            return []
+        tagged.sort(key=lambda t: t["start"])
+
+        groups_tagged = [[tagged[0]]]
+        group_end = tagged[0]["end"]
+        for t in tagged[1:]:
+            if t["start"] <= group_end:
+                groups_tagged[-1].append(t)
+                group_end = max(group_end, t["end"])
+            else:
+                groups_tagged.append([t])
+                group_end = t["end"]
+
+        results = []
+        for i, grp in enumerate(groups_tagged):
+            start = min(t["start"] for t in grp)
+            end = max(t["end"] for t in grp)
+            angle = grp[0]["angle"] if len(grp) == 1 else max(grp, key=lambda t: abs(t["angle"]))["angle"]
+            results.append({
+                "index": i,
+                "start_time": int(round(start)),
+                "end_time": int(round(end)),
+                "angle": int(round(angle)),
+            })
+        return results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Session Data Loader
+# ─────────────────────────────────────────────────────────────────────────────
 def load_session_df(session_id: Optional[int], file_path: Optional[str]) -> pd.DataFrame:
-    """Load session dataframe from file or storage."""
+    """Load session dataframe from file, backend service or direct GCS."""
     if file_path:
         path = Path(file_path)
         if not path.exists():
@@ -65,29 +283,30 @@ def load_session_df(session_id: Optional[int], file_path: Optional[str]) -> pd.D
             raise ValueError(f"Unsupported file format: {path.suffix}")
 
     if session_id is not None:
+        # 1. Try backend storage function if available
         try:
             from app.services.session_data_storage import load_session_dataframe
             df = load_session_dataframe(session_id)
             if df is not None and not df.empty:
                 return df
-        except Exception as exc:
-            print(f"Direct load_session_dataframe notice: {exc}")
+        except Exception:
+            pass
 
-        # Fallback: direct GCS read with google-cloud-storage
+        # 2. Direct GCS download using google.cloud.storage
         try:
             from google.cloud import storage
-            from app.core.config import settings
+            bucket_name = os.environ.get("GCS_BUCKET_NAME", "miraitech-sessions")
+            prefix = os.environ.get("GCS_SESSION_PREFIX", "sessions")
             client = storage.Client()
-            bucket = client.bucket(settings.GCS_BUCKET_NAME)
-            blob_name = f"{settings.GCS_SESSION_PREFIX}/{session_id}.parquet"
-            blob = bucket.blob(blob_name)
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(f"{prefix}/{session_id}.parquet")
             if blob.exists():
                 data_bytes = blob.download_as_bytes()
                 return pd.read_parquet(io.BytesIO(data_bytes))
         except Exception as exc:
-            print(f"Direct GCS download notice: {exc}")
+            print(f"GCS download notice: {exc}")
 
-        # Fallback 2: load_session_data
+        # 3. Try load_session_data
         try:
             from app.services.session_data_storage import load_session_data
             rows = load_session_data(session_id)
@@ -96,21 +315,20 @@ def load_session_df(session_id: Optional[int], file_path: Optional[str]) -> pd.D
         except Exception:
             pass
 
-        raise RuntimeError(f"Could not load data for session {session_id} from storage")
+        raise RuntimeError(f"Could not load data for session {session_id} from GCS or storage")
 
     raise ValueError("Either --session or --file must be specified")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Ground Contacts and Force Pipeline
+# ─────────────────────────────────────────────────────────────────────────────
 def extract_turns_and_steps(
     df: pd.DataFrame,
     weight_kg: float = 70.0,
 ) -> Tuple[List[Dict[str, Any]], pd.DataFrame, Dict[str, Any]]:
-    """Detect turns and steps, then match steps around each turn."""
-    from app.services.calculators.turn_calculator import TurnCalculator
-    from app.services.calculators.step_cadence_calculator import get_walk_cadence_calculator
-    from app.services.calculators.ground_contact_force_calculator import GroundContactForceCalculator
+    """Detect turns, ground contacts, and associate steps around each turn."""
 
-    # Normalise Time to milliseconds
     t_col = "Time" if "Time" in df.columns else ("time" if "time" in df.columns else None)
     if not t_col:
         raise ValueError("Missing 'Time' column in dataset")
@@ -123,11 +341,10 @@ def extract_turns_and_steps(
         df = df.copy()
         df[t_col] = pd.to_numeric(df[t_col], errors="coerce") * 1000.0
 
-    # 1. Detect Turns (Yo-Yo / Beep Test detector)
-    turn_calc = TurnCalculator(min_change_deg=100, max_duration_ms=2000)
+    # 1. Detect Turns
+    turn_calc = StandaloneTurnCalculator()
     raw_turns = turn_calc.identify(df, group_sensors=True)
 
-    # Convert turn timestamps to seconds
     turns = []
     for t in raw_turns:
         t_start_s = t["start_time"] / 1000.0
@@ -144,15 +361,21 @@ def extract_turns_and_steps(
             "direction": "left" if t["angle"] < 0 else "right" if t["angle"] > 0 else "unknown",
         })
 
-    # 2. Detect Ground Contacts (Walk/Run BiLSTM cadence model)
-    cadence_calc = get_walk_cadence_calculator()
+    # 2. Detect Steps / Ground Contacts via ML Cadence Model
+    try:
+        from app.services.calculators.step_cadence_calculator import get_walk_cadence_calculator
+        cadence_calc = get_walk_cadence_calculator()
+    except ImportError:
+        from app.services.calculators.step_calculator import get_step_calculator
+        cadence_calc = get_step_calculator()
+
     rows = df.to_dict(orient="records")
     cadence_calc.calculate(rows)
 
     viz = getattr(cadence_calc, "_viz_data", {})
     all_contacts: List[Dict[str, Any]] = []
 
-    force_calc = GroundContactForceCalculator()
+    bw_n = weight_kg * 9.80665
 
     for sensor, foot in (("ESP32_Sensor_1", "left"), ("ESP32_Sensor_2", "right")):
         foot_viz = viz.get(sensor, {})
@@ -160,63 +383,37 @@ def extract_turns_and_steps(
         times_s = np.asarray(foot_viz.get("t", [])) / 1000.0 if "t" in foot_viz else np.array([])
         acz = np.asarray(foot_viz.get("acz", []))
 
-        # Sensor data slice for pressure sum
-        sensor_foot_df = df[df["Name"] == sensor] if "Name" in df.columns else df
-        sensor_t = pd.to_numeric(sensor_foot_df[t_col], errors="coerce").to_numpy(dtype=float) / 1000.0
-        p_cols = [c for c in ["Sensor_1", "Sensor_2", "Sensor_3", "Sensor_4"] if c in sensor_foot_df.columns]
-        p_data = sensor_foot_df[p_cols].to_numpy(dtype=float) if p_cols else np.zeros((len(sensor_foot_df), 1))
-        p_total = p_data.sum(axis=1) if len(p_data) else np.zeros(len(sensor_foot_df))
-
         for event in events:
             c_start = float(event["timestep_s"])
             c_dur = float(event["contact_time_s"])
             c_end = c_start + c_dur
 
-            # Force calculation from AcZ in extended contact window
-            w_start, w_end = force_calc.extended_contact_window(c_start, c_dur)
-            peak_acz = force_calc.peak_abs_acz_in_window(times_s, acz, w_start, w_end)
-            peak_force_n = force_calc.peak_force_n_from_abs_acz(peak_abs_acz=peak_acz, weight_kg=weight_kg)
-            peak_force_bw = peak_force_n / (weight_kg * 9.80665) if weight_kg > 0 else 0.0
-
-            # Mean force over contact window
+            # Peak AcZ in extended contact window (10% padding)
+            pad = 0.1 * c_dur
+            w_start, w_end = c_start - pad, c_end + pad
             if times_s.size and acz.size:
-                mask = (times_s >= c_start) & (times_s <= c_end)
-                if np.any(mask):
-                    mean_acz = float(np.mean(np.abs(acz[mask])))
-                    mean_force_n = force_calc.peak_force_n_from_abs_acz(mean_acz, weight_kg)
-                    mean_force_bw = mean_force_n / (weight_kg * 9.80665) if weight_kg > 0 else 0.0
-                else:
-                    mean_force_n = peak_force_n * 0.6
-                    mean_force_bw = peak_force_bw * 0.6
+                mask = (times_s >= w_start) & (times_s <= w_end)
+                peak_abs_acz = float(np.max(np.abs(acz[mask]))) if np.any(mask) else 0.0
             else:
-                mean_force_n = peak_force_n * 0.6
-                mean_force_bw = peak_force_bw * 0.6
+                peak_abs_acz = 0.0
 
-            # Sensor pressure sum
-            if sensor_t.size and p_total.size:
-                p_mask = (sensor_t >= c_start) & (sensor_t <= c_end)
-                mean_pressure = float(np.mean(p_total[p_mask])) if np.any(p_mask) else 0.0
-            else:
-                mean_pressure = 0.0
+            imu_peak_force_n = float(weight_kg * (peak_abs_acz / 10.0) * 9.80665)
+            imu_peak_force_bw = peak_abs_acz / 10.0
 
             all_contacts.append({
                 "foot": foot,
                 "start_time_s": c_start,
                 "end_time_s": c_end,
                 "duration_ms": c_dur * 1000.0,
-                "peak_force_n": round(peak_force_n, 1),
-                "peak_force_bw": round(peak_force_bw, 2),
-                "mean_force_n": round(mean_force_n, 1),
-                "mean_force_bw": round(mean_force_bw, 2),
-                "mean_pressure": round(mean_pressure, 1),
+                "peak_force_n": round(imu_peak_force_n, 1),
+                "peak_force_bw": round(imu_peak_force_bw, 2),
                 "confidence": event.get("confidence"),
             })
 
-    # Sort all contacts chronologically
+    # Sort contacts chronologically
     all_contacts.sort(key=lambda c: c["start_time_s"])
 
-    # Compute step time (inter-contact onset time) and Kinematic Support Force (Step Time / GCT)
-    bw_n = weight_kg * 9.80665
+    # Compute step time and Kinematic Support Force (Step Time / GCT)
     for i in range(len(all_contacts)):
         c = all_contacts[i]
         gct_s = c["duration_ms"] / 1000.0
@@ -249,21 +446,14 @@ def extract_turns_and_steps(
 
     # 3. For each turn, extract [-3, -2, -1] steps, [turn step], and [+1] step
     turn_records: List[Dict[str, Any]] = []
-
     STEP_ROLES = ["step_-3", "step_-2", "step_-1", "turn_step", "step_+1"]
 
     for turn in turns:
         t_start = turn["start_time_s"]
         t_end = turn["end_time_s"]
 
-        # Steps strictly before turn start
         pre_steps = [c for c in all_contacts if c["start_time_s"] < t_start]
-        # Step during turn (overlapping with [t_start, t_end])
-        turn_steps = [
-            c for c in all_contacts
-            if (c["start_time_s"] <= t_end and c["end_time_s"] >= t_start)
-        ]
-        # Steps after turn end
+        turn_steps = [c for c in all_contacts if (c["start_time_s"] <= t_end and c["end_time_s"] >= t_start)]
         post_steps = [c for c in all_contacts if c["start_time_s"] >= t_end]
 
         selected: Dict[str, Optional[Dict[str, Any]]] = {
@@ -283,7 +473,6 @@ def extract_turns_and_steps(
             "turn_direction": turn["direction"],
         }
 
-        # Flat record for CSV export
         record = dict(row_base)
         for role in STEP_ROLES:
             st = selected[role]
@@ -293,12 +482,10 @@ def extract_turns_and_steps(
                 record[f"{prefix}_time_s"] = round(st["start_time_s"], 3)
                 record[f"{prefix}_gct_ms"] = round(st["duration_ms"], 1)
                 record[f"{prefix}_step_time_ms"] = st["step_time_ms"]
-                # Kinematic Support Force (Step Time / GCT)
                 record[f"{prefix}_support_force_bw"] = st["mean_force_bw_kin"]
                 record[f"{prefix}_support_force_n"] = st["mean_force_n_kin"]
                 record[f"{prefix}_peak_force_bw_kin"] = st["peak_force_bw_kin"]
                 record[f"{prefix}_peak_force_n_kin"] = st["peak_force_n_kin"]
-                # IMU AcZ Force
                 record[f"{prefix}_imu_peak_force_n"] = st["peak_force_n"]
                 record[f"{prefix}_imu_peak_force_bw"] = st["peak_force_bw"]
             else:
