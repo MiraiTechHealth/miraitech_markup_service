@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
+import numpy as np
 import pandas as pd
 from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response
 
@@ -52,22 +53,21 @@ CALCULATOR_MODELS = {
     "tkeo-cadence": "TKEO + peak detection",
     "step-cadence": "StepResUNet",
     "jump-metrics": "JumpBiLSTM",
-    "force-jump": "BiLSTMCNNRegressor",
-    "protocol-walking-detector": "StepResUNet contacts",
-    "protocol-running-detector": "StepResUNet contacts",
+    "force-jump": "JumpForceBW regressor",
+    "protocol-walking-detector": "WalkBiLSTM contacts",
+    "protocol-running-detector": "WalkBiLSTM contacts",
     "protocol-jumping-detector": "JumpBiLSTM flight detector",
     "protocol-shuttle-detector": "TurnCalculator shuttle phases",
     "protocol-sprint-detector": "CausalSpeedTCN + StepResUNet sprint steps",
     "protocol-beep-detector": "YoyoTurnCalculator phases",
     "protocol-ttest-detector": "TurnCalculator T-Test phases",
 }
-
 CALCULATOR_MODEL_FILES = {
     "step-cadence": "step_gc_model.pt",
     "jump-metrics": "jump_bilstm.pt",
-    "force-jump": "fz_bilateral.pt",
-    "protocol-walking-detector": "step_gc_model.pt",
-    "protocol-running-detector": "step_gc_model.pt",
+    "force-jump": "jump_force_total.pt",
+    "protocol-walking-detector": "walk_gc_bilstm.pt",
+    "protocol-running-detector": "walk_gc_bilstm.pt",
     "protocol-jumping-detector": "jump_bilstm.pt",
     "protocol-sprint-detector": "speed_cont_v5.pt + step_gc_model.pt",
 }
@@ -289,7 +289,7 @@ def _round_or_none(value: Any, digits: int = 2) -> float | None:
 def _rows_with_time_in_ms(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Normalise second-based markup files to the backend models' ms contract."""
     times = []
-    for row in rows:
+    for row in rows[:300]:
         try:
             times.append(float(row.get("Time")))
         except (TypeError, ValueError):
@@ -311,15 +311,25 @@ def _rows_with_time_in_ms(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return normalised
 
 
-def _cadence_result(calculator_id: str, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if calculator_id == "tkeo-cadence":
-        from app.services.calculators.tkeo_cadence_calculator import TkeoCadenceCalculator
+def _cadence_result(
+    calculator_id: str,
+    rows: List[Dict[str, Any]],
+    calculator: Any = None,
+) -> Dict[str, Any]:
+    """Turn a cadence detector's contact regions into markup overlays.
 
-        calculator = TkeoCadenceCalculator()
-    else:
-        from app.services.calculators.step_cadence_calculator import StepCadenceCalculator
+    ``calculator`` lets a caller supply its own detector; walking and running
+    pass the WalkBiLSTM-backed adapter the backend uses for those protocols.
+    """
+    if calculator is None:
+        if calculator_id == "tkeo-cadence":
+            from app.services.calculators.tkeo_cadence_calculator import TkeoCadenceCalculator
 
-        calculator = StepCadenceCalculator()
+            calculator = TkeoCadenceCalculator()
+        else:
+            from app.services.calculators.step_cadence_calculator import StepCadenceCalculator
+
+            calculator = StepCadenceCalculator()
 
     result = calculator.calculate(rows)
     events_by_sensor = {
@@ -472,31 +482,63 @@ def _jump_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _force_units(units: Any) -> Dict[str, Any] | None:
+    """Flatten a JumpForceUnits into the markup response's scalar fields."""
+    if units is None:
+        return None
+    return {
+        "percent_bw": _round_or_none(units.percent_bw, 1),
+        "bw": _round_or_none(units.bw, 3),
+        "n": _round_or_none(units.n, 1),
+        "kg": _round_or_none(units.kg, 1),
+        "lb": _round_or_none(units.lb, 1),
+    }
+
+
 def _force_result(rows: List[Dict[str, Any]], weight_kg: float) -> Dict[str, Any]:
-    """Run bilateral Fz regression and expose peak/flight metrics."""
-    from app.services.calculators.force_jump_calculator import get_force_jump_calculator
+    """Run bilateral Fz regression and expose peak/flight metrics.
+
+    Forces come out of the model as % of body weight; the calculator derives N,
+    kgf and lbf from the weight passed here, so the absolute units are only as
+    good as that weight. Jump instants come from the jump detector, not from the
+    force curve, so the events line up one-for-one with the jump metrics.
+    """
+    from app.services.calculators.jump_force_bw_calculator import (
+        get_jump_force_bw_calculator,
+    )
 
     rows = _rows_with_time_in_ms(rows)
-    calculator = get_force_jump_calculator()
+    calculator = get_jump_force_bw_calculator()
     result = calculator.calculate(rows, weight_kg=weight_kg)
+    peak = result.peak_force
     return {
         "calculator": "force-jump",
         "label": CALCULATOR_LABELS["force-jump"],
-        "model": CALCULATOR_MODELS["force-jump"],
+        "model": f"{CALCULATOR_MODELS['force-jump']} · {calculator.arch}",
         "model_file": CALCULATOR_MODEL_FILES["force-jump"],
         "events": [
             {
+                "jump_index": event.jump_index,
                 "takeoff_time_ms": _round_or_none(event.takeoff_time_ms),
                 "landing_time_ms": _round_or_none(event.landing_time_ms),
                 "flight_time_ms": _round_or_none(event.flight_time_ms),
+                "feet": list(event.feet),
+                "takeoff_force": _force_units(event.takeoff_force),
+                "landing_force": _force_units(event.landing_force),
             }
-            for event in result.jump_events
+            for event in result.events
         ],
         "summary": {
-            "peak_force_n": _round_or_none(result.peak_force_n),
-            "peak_force_bw": _round_or_none(result.peak_force_bw, 3),
-            "jump_count": len(result.jump_events),
+            "peak_force_n": _round_or_none(peak.n, 1) if peak else None,
+            "peak_force_bw": _round_or_none(peak.bw, 3) if peak else None,
+            "peak_force_percent_bw": _round_or_none(peak.percent_bw, 1) if peak else None,
+            "peak_takeoff_force": _force_units(result.peak_takeoff_force),
+            "peak_landing_force": _force_units(result.peak_landing_force),
+            "avg_takeoff_force": _force_units(result.avg_takeoff_force),
+            "avg_landing_force": _force_units(result.avg_landing_force),
+            "jump_count": result.n_jumps,
             "weight_kg": _round_or_none(result.weight_kg),
+            "weight_source": result.weight_source,
             "is_valid": bool(result.is_valid),
         },
     }
@@ -506,8 +548,10 @@ def _protocol_contact_detector_result(
     calculator_id: str,
     rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Expose StepResUNet contact regions as walking/running detections."""
-    base = _cadence_result("step-cadence", rows)
+    """Expose WalkBiLSTM contact regions as walking/running detections."""
+    from app.services.calculators.step_cadence_calculator import get_walk_cadence_calculator
+
+    base = _cadence_result("step-cadence", rows, get_walk_cadence_calculator())
     contacts = list(base.get("contacts") or [])
     left_count = sum(1 for event in contacts if event.get("foot") == "left")
     right_count = sum(1 for event in contacts if event.get("foot") == "right")
@@ -623,7 +667,7 @@ def _rows_for_detection_foot(
 
     available_names = list(dict.fromkeys(
         str(row.get("Name"))
-        for row in rows
+        for row in rows[:500]
         if row.get("Name") not in (None, "")
     ))
     selected_name = sensor_name if sensor_name in available_names else None
@@ -656,18 +700,20 @@ def _rows_for_detection_foot(
 
 def _protocol_turn_detector_result(
     calculator_id: str,
-    rows: List[Dict[str, Any]],
+    data: Union[pd.DataFrame, List[Dict[str, Any]]],
     detection_foot: str = "both",
     sensor_name: str | None = None,
 ) -> Dict[str, Any]:
     """Run one detector per requested foot; ``both`` overlays L and R results."""
+    from app.schemas.turn_cod import TurnEvent
     from app.services.calculators.turn_calculator import TurnCalculator
 
     def create_calculator():
         if calculator_id == "protocol-beep-detector":
-            from app.services.calculators.yoyo_turn_calculator import YoyoTurnCalculator
-
-            return YoyoTurnCalculator()
+            return TurnCalculator(
+                min_change_deg=100,
+                max_duration_ms=2000,
+            )
         if calculator_id == "protocol-ttest-detector":
             from app.services.ttest_analysis import TTEST_TURN_PARAMS
 
@@ -680,30 +726,83 @@ def _protocol_turn_detector_result(
             fast_rate_deg_per_ms=0.14,
         )
 
+    df = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
+    if "Time" in df.columns or "time" in df.columns:
+        tcol = "Time" if "Time" in df.columns else "time"
+        s = pd.to_numeric(df[tcol].iloc[:300], errors="coerce").dropna()
+        if not s.empty:
+            diffs = np.diff(np.sort(s.values))
+            diffs = diffs[diffs > 0]
+            if len(diffs) and np.median(diffs) < 0.5:
+                df = df.copy()
+                df[tcol] = pd.to_numeric(df[tcol], errors="coerce") * 1000.0
+
     requested_feet = ["left", "right"] if detection_foot == "both" else [detection_foot]
     contacts: List[Dict[str, Any]] = []
     foot_summaries: Dict[str, Dict[str, Any]] = {}
     sensor_names: Dict[str, str] = {}
 
+    available_names = [str(n) for n in df["Name"].dropna().unique()] if "Name" in df.columns else []
+
     for foot in requested_feet:
-        requested_sensor = sensor_name if detection_foot != "both" else None
-        try:
-            foot_rows, selected_sensor_name = _rows_for_detection_foot(
-                rows,
-                foot,
-                requested_sensor,
-            )
-        except ValueError:
+        selected_sensor_name = sensor_name if detection_foot != "both" else None
+        if selected_sensor_name is None:
+            expected_name = "ESP32_Sensor_1" if foot == "left" else "ESP32_Sensor_2"
+            if expected_name in available_names:
+                selected_sensor_name = expected_name
+            elif len(available_names) > 0:
+                idx = 0 if foot == "left" else min(1, len(available_names) - 1)
+                selected_sensor_name = available_names[idx]
+
+        if selected_sensor_name is not None and "Name" in df.columns:
+            foot_df = df[df["Name"] == selected_sensor_name]
+        else:
+            foot_df = df
+
+        if foot_df.empty:
             if detection_foot != "both":
-                raise
+                raise ValueError(f"No sensor data available for {foot} foot")
             continue
 
-        normalised_rows = _rows_with_time_in_ms(foot_rows)
         calculator = create_calculator()
-        result = calculator.calculate(normalised_rows)
-        start_ms, end_ms = _session_time_bounds_ms(normalised_rows)
+        raw_turns = calculator.identify(foot_df, group_sensors=False)
+
+        turn_events: List[Any] = []
+        for t in raw_turns:
+            duration = t["end_time"] - t["start_time"]
+            if duration <= 0:
+                continue
+            angle = t["angle"]
+            direction = "left" if angle < 0 else "right" if angle > 0 else "unknown"
+            mean_vel = (angle / (duration / 1000.0)) if duration > 0 else 0.0
+            turn_events.append(TurnEvent(
+                index=t["index"],
+                start_time_ms=t["start_time"],
+                end_time_ms=t["end_time"],
+                duration_ms=duration,
+                angle_deg=angle,
+                direction=direction,
+                mean_angular_velocity_deg_s=round(mean_vel, 2),
+                pivot_foot=foot,
+                turning_foot="right" if foot == "left" else "left",
+                sensor_name=selected_sensor_name,
+            ))
+
+        if calculator.merge_close_turns_ms is not None and calculator.merge_close_turns_ms > 0:
+            turn_events = calculator._merge_close_turns(turn_events)
+        if calculator.max_turns is not None and len(turn_events) > calculator.max_turns:
+            turn_events = calculator._trim_to_max_turns(turn_events)
+
+        tcol = "Time" if "Time" in foot_df.columns else ("time" if "time" in foot_df.columns else None)
+        if tcol and not foot_df[tcol].empty:
+            s_t = pd.to_numeric(foot_df[tcol], errors="coerce").dropna()
+            start_ms = float(s_t.min()) if not s_t.empty else None
+            end_ms = float(s_t.max()) if not s_t.empty else None
+        else:
+            start_ms = end_ms = None
+
         foot_contacts = _turn_phase_contacts(
-            result.turns,
+            turn_events,
             start_ms,
             end_ms,
             event_foot=foot,
@@ -717,7 +816,7 @@ def _protocol_turn_detector_result(
             "event_count": len(foot_contacts),
             "turn_count": turn_count,
             "run_count": run_count,
-            "is_valid": bool(result.is_valid),
+            "is_valid": len(turn_events) > 0,
         }
 
     if not foot_summaries:
@@ -927,11 +1026,20 @@ def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, An
 
 def _calculate(
     calculator_id: str,
-    rows: List[Dict[str, Any]],
+    data: Union[pd.DataFrame, List[Dict[str, Any]]],
     *,
     detection_foot: str = "both",
     sensor_name: str | None = None,
 ) -> Dict[str, Any]:
+    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
+        return _protocol_turn_detector_result(
+            calculator_id,
+            data,
+            detection_foot=detection_foot,
+            sensor_name=sensor_name,
+        )
+
+    rows = data if isinstance(data, list) else data.to_dict(orient="records")
     if calculator_id == "step-detector-ttest":
         return _ttest_result(rows)
     if calculator_id == "jump-metrics":
@@ -940,16 +1048,236 @@ def _calculate(
         return _protocol_contact_detector_result(calculator_id, rows)
     if calculator_id == "protocol-jumping-detector":
         return _protocol_jump_detector_result(rows)
-    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
-        return _protocol_turn_detector_result(
-            calculator_id,
-            rows,
-            detection_foot=detection_foot,
-            sensor_name=sensor_name,
-        )
     if calculator_id == "protocol-sprint-detector":
         return _protocol_sprint_detector_result(rows)
     return _cadence_result(calculator_id, rows)
+
+
+IMU_COLUMNS = ["AcX", "AcY", "AcZ", "XData", "YData", "ZData"]
+
+GRAVITY_MS2 = 9.80665
+
+
+class InsoleAHRS:
+    """Madgwick AHRS that turns raw insole IMU samples into firmware channels.
+
+    Raw sensors report accelerations with gravity still in them and gyroscope
+    rates in dps. The new firmware (miraitech_sensors.h) instead ships linear
+    accelerations in the BLE basis (AcX = linY, AcY = -linX, AcZ = linZ) plus
+    an integrated Heading, Roll and Pitch, each quantised to its own step.
+    """
+
+    def __init__(
+        self,
+        sample_rate: float = 500.0,
+        beta: float = 0.1,
+        initial_yaw: float = 0.0,
+    ):
+        self.dt = 1.0 / sample_rate
+        self.beta = beta
+        self.q = np.array([1.0, 0.0, 0.0, 0.0])
+        self.integrated_yaw = float(initial_yaw)
+        self.initialized = False
+
+    def init_orientation(self, ax: float, ay: float, az: float) -> None:
+        norm_a = np.sqrt(ax * ax + ay * ay + az * az)
+        if norm_a > 1e-4:
+            ax_n, ay_n, az_n = ax / norm_a, ay / norm_a, az / norm_a
+            roll = np.arctan2(ay_n, az_n)
+            pitch = np.arctan2(-ax_n, np.sqrt(ay_n * ay_n + az_n * az_n))
+            cr, sr = np.cos(roll * 0.5), np.sin(roll * 0.5)
+            cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
+            self.q = np.array([cr * cp, sr * cp, cr * sp, -sr * sp])
+            self.q /= np.linalg.norm(self.q)
+        self.initialized = True
+
+    def update(
+        self,
+        ax: float,
+        ay: float,
+        az: float,
+        gx_dps: float,
+        gy_dps: float,
+        gz_dps: float,
+    ):
+        if not self.initialized:
+            self.init_orientation(ax, ay, az)
+
+        gx, gy, gz = np.deg2rad(gx_dps), np.deg2rad(gy_dps), np.deg2rad(gz_dps)
+        q0, q1, q2, q3 = self.q
+
+        # Quaternion rate from the gyroscope
+        qDot1 = 0.5 * (-q1 * gx - q2 * gy - q3 * gz)
+        qDot2 = 0.5 * (q0 * gx + q2 * gz - q3 * gy)
+        qDot3 = 0.5 * (q0 * gy - q1 * gz + q3 * gx)
+        qDot4 = 0.5 * (q0 * gz + q1 * gy - q2 * gx)
+
+        norm_a = np.sqrt(ax * ax + ay * ay + az * az)
+        if norm_a > 1e-4:
+            ax_n, ay_n, az_n = ax / norm_a, ay / norm_a, az / norm_a
+            _2q0, _2q1, _2q2, _2q3 = 2.0 * q0, 2.0 * q1, 2.0 * q2, 2.0 * q3
+            _4q0, _4q1, _4q2 = 4.0 * q0, 4.0 * q1, 4.0 * q2
+            _8q1, _8q2 = 8.0 * q1, 8.0 * q2
+            q0q0, q1q1, q2q2, q3q3 = q0 * q0, q1 * q1, q2 * q2, q3 * q3
+
+            s0 = _4q0 * q2q2 + _2q2 * ax_n + _4q0 * q1q1 - _2q1 * ay_n
+            s1 = (
+                _4q1 * q3q3
+                - _2q3 * ax_n
+                + 4.0 * q0q0 * q1
+                - _2q0 * ay_n
+                - _4q1
+                + _8q1 * q1q1
+                + _8q1 * q2q2
+                + _4q1 * az_n
+            )
+            s2 = (
+                4.0 * q0q0 * q2
+                + _2q0 * ax_n
+                + _4q2 * q3q3
+                - _2q3 * ay_n
+                - _4q2
+                + _8q2 * q1q1
+                + _8q2 * q2q2
+                + _4q2 * az_n
+            )
+            s3 = 4.0 * q1q1 * q3 - _2q1 * ax_n + 4.0 * q2q2 * q3 - _2q2 * ay_n
+
+            norm_s = np.sqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3)
+            if norm_s > 1e-4:
+                qDot1 -= self.beta * (s0 / norm_s)
+                qDot2 -= self.beta * (s1 / norm_s)
+                qDot3 -= self.beta * (s2 / norm_s)
+                qDot4 -= self.beta * (s3 / norm_s)
+
+        q0 += qDot1 * self.dt
+        q1 += qDot2 * self.dt
+        q2 += qDot3 * self.dt
+        q3 += qDot4 * self.dt
+        norm_q = np.sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3)
+        self.q = np.array([q0, q1, q2, q3]) / norm_q
+        q0, q1, q2, q3 = self.q
+
+        # Gravity vector in the body frame
+        gx_body = 2.0 * (q1 * q3 - q0 * q2)
+        gy_body = 2.0 * (q0 * q1 + q2 * q3)
+        gz_body = q0 * q0 - q1 * q1 - q2 * q2 + q3 * q3
+
+        # Linear body accelerations in m/s²
+        lin_ax = ax - gx_body * GRAVITY_MS2
+        lin_ay = ay - gy_body * GRAVITY_MS2
+        lin_az = az - gz_body * GRAVITY_MS2
+
+        # Euler angles
+        sinr_cosp = 2.0 * (q0 * q1 + q2 * q3)
+        cosr_cosp = 1.0 - 2.0 * (q1 * q1 + q2 * q2)
+        roll = np.rad2deg(np.arctan2(sinr_cosp, cosr_cosp))
+
+        sinp = 2.0 * (q0 * q2 - q3 * q1)
+        pitch = (
+            np.sign(sinp) * 90.0
+            if np.abs(sinp) >= 1.0
+            else np.rad2deg(np.arcsin(sinp))
+        )
+
+        # Heading integrated from the gyroscope projected on gravity
+        yawRateDps = gx_dps * gx_body + gy_dps * gy_body + gz_dps * gz_body
+        self.integrated_yaw = (self.integrated_yaw - yawRateDps * self.dt) % 360.0
+
+        # Pack into the miraitech_sensors.h layout and quantisation steps
+        AcX = np.round(lin_ay * 25.0) / 25.0
+        AcY = np.round(-lin_ax * 25.0) / 25.0
+        AcZ = np.round(lin_az * 25.0) / 25.0
+
+        hdg = (int(np.round(self.integrated_yaw)) % 360) - 180
+        XData = float(hdg + 180)
+        YData = float(int(np.round(roll * 0.5)) * 2)
+        ZData = float(int(np.round(-pitch)))
+
+        return AcX, AcY, AcZ, XData, YData, ZData
+
+
+def is_raw_sensor(sensor_df: pd.DataFrame) -> bool:
+    """Report whether a sensor still carries raw IMU signals.
+
+    Raw accelerations keep gravity (|AcZ| stays near 9.8) and raw gyroscope
+    rates go negative and well past the ±90° an angle channel can hold.
+    """
+    if len(sensor_df) == 0:
+        return False
+    if not {"AcZ", "XData", "ZData"}.issubset(sensor_df.columns):
+        return False
+    acz = pd.to_numeric(sensor_df["AcZ"], errors="coerce")
+    xdata = pd.to_numeric(sensor_df["XData"], errors="coerce")
+    zdata = pd.to_numeric(sensor_df["ZData"], errors="coerce")
+    has_gravity = bool(acz.abs().median() > 5.0)
+    has_raw_gyro = bool((xdata.min() < -5.0) or (zdata.abs().max() > 95.0))
+    return has_gravity or has_raw_gyro
+
+
+def _preprocess_imu_dataframe(
+    df: pd.DataFrame,
+    target_sensor: str = "auto",
+    sample_rate: float = 500.0,
+) -> tuple[pd.DataFrame, List[str]]:
+    df_out = df.copy()
+    processed_sensors: List[str] = []
+
+    # Seed the heading from a sensor that already runs the new firmware, so
+    # both feet share one course reference.
+    initial_yaw = 0.0
+    for _name, group in df_out.groupby("Name"):
+        if "XData" in group.columns and not is_raw_sensor(group):
+            seed = pd.to_numeric(group["XData"], errors="coerce").dropna()
+            if not seed.empty:
+                initial_yaw = float(seed.iloc[0])
+                break
+
+    for name, group in df_out.groupby("Name"):
+        name_str = str(name)
+        if target_sensor == "auto":
+            needs_processing = is_raw_sensor(group)
+        elif target_sensor == "all":
+            needs_processing = True
+        else:
+            needs_processing = name_str == target_sensor
+        if not needs_processing:
+            continue
+
+        ordered = group.sort_values("Time") if "Time" in group.columns else group
+        channels = {}
+        for column in IMU_COLUMNS:
+            if column in ordered.columns:
+                values = pd.to_numeric(ordered[column], errors="coerce")
+                channels[column] = values.fillna(0.0).to_numpy(dtype=float)
+            else:
+                channels[column] = np.zeros(len(ordered))
+
+        ahrs = InsoleAHRS(
+            sample_rate=sample_rate,
+            beta=0.1,
+            initial_yaw=initial_yaw,
+        )
+        processed_rows = [
+            ahrs.update(
+                ax=channels["AcX"][index],
+                ay=channels["AcY"][index],
+                az=channels["AcZ"][index],
+                gx_dps=channels["XData"][index],
+                gy_dps=channels["YData"][index],
+                gz_dps=channels["ZData"][index],
+            )
+            for index in range(len(ordered))
+        ]
+        if not processed_rows:
+            continue
+
+        # Assign by the sorted index: rows of a sensor are not necessarily
+        # stored in time order inside the session frame.
+        df_out.loc[ordered.index, IMU_COLUMNS] = np.array(processed_rows, dtype=float)
+        processed_sensors.append(name_str)
+
+    return df_out, processed_sensors
 
 
 @app.get("/health")
@@ -1023,6 +1351,70 @@ async def update_markup_additional_info(
     )
 
 
+def _extract_session_dataframe(payload: Dict[str, Any]) -> pd.DataFrame:
+    columns = payload.get("columns")
+    if isinstance(columns, dict) and columns:
+        return pd.DataFrame(columns)
+    rows = payload.get("rows")
+    if isinstance(rows, list) and rows:
+        return pd.DataFrame(rows)
+    raise HTTPException(status_code=422, detail="Session columns or rows are required")
+
+
+def _extract_session_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    columns = payload.get("columns")
+    if isinstance(columns, dict) and columns:
+        return pd.DataFrame(columns).to_dict(orient="records")
+    rows = payload.get("rows")
+    if isinstance(rows, list) and rows:
+        return rows
+    raise HTTPException(status_code=422, detail="Session columns or rows are required")
+
+
+@app.post("/markup/preprocess-imu")
+async def preprocess_imu(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Convert raw IMU channels of a session into the new firmware format."""
+    df = _extract_session_dataframe(payload)
+
+    target_sensor = str(payload.get("target_sensor") or "auto")
+    raw_sample_rate = payload.get("sample_rate")
+    try:
+        sample_rate = 500.0 if raw_sample_rate is None else float(raw_sample_rate)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="sample_rate must be a number")
+    if sample_rate <= 0:
+        raise HTTPException(status_code=422, detail="sample_rate must be positive")
+
+    if "Name" not in df.columns:
+        raise HTTPException(status_code=422, detail="Session data has no Name column")
+    if target_sensor not in {"auto", "all"}:
+        known = {str(name) for name in df["Name"].dropna().unique()}
+        if target_sensor not in known:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Датчик {target_sensor} отсутствует в данных сессии",
+            )
+
+    try:
+        df_processed, processed_sensors = await asyncio.to_thread(
+            _preprocess_imu_dataframe,
+            df,
+            target_sensor,
+            sample_rate,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    # NaN is not valid JSON — hand missing cells back as null.
+    df_processed = df_processed.astype(object).where(pd.notna(df_processed), None)
+    return {
+        "columns": {col: df_processed[col].tolist() for col in df_processed.columns},
+        "rows": df_processed.to_dict(orient="records"),
+        "processed_sensors": processed_sensors,
+        "success": True,
+    }
+
+
 @app.post("/calculate/{calculator_id}")
 async def calculate(
     calculator_id: str,
@@ -1031,9 +1423,10 @@ async def calculate(
     if calculator_id not in CALCULATOR_LABELS:
         raise HTTPException(status_code=404, detail="Unknown calculator")
 
-    rows = payload.get("rows")
-    if not isinstance(rows, list) or not rows:
-        raise HTTPException(status_code=422, detail="Session rows are required")
+    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
+        data = _extract_session_dataframe(payload)
+    else:
+        data = _extract_session_rows(payload)
 
     if calculator_id == "force-jump":
         try:
@@ -1043,7 +1436,7 @@ async def calculate(
         if weight_kg <= 0:
             raise HTTPException(status_code=422, detail="weight_kg must be positive")
         try:
-            return await asyncio.to_thread(_force_result, rows, weight_kg)
+            return await asyncio.to_thread(_force_result, data, weight_kg)
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -1063,7 +1456,7 @@ async def calculate(
         return await asyncio.to_thread(
             _calculate,
             calculator_id,
-            rows,
+            data,
             detection_foot=detection_foot,
             sensor_name=sensor_name,
         )
