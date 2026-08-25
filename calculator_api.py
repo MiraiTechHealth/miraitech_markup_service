@@ -146,10 +146,12 @@ def _list_markup_sessions(search: str | None, page_size: int) -> Dict[str, Any]:
             cursor.execute(
                 f"""
                 SELECT s.session_id, s.user_id, s.date, s.time, s.session_title,
-                       p.patient_name
+                       s.device_id, s.protocol_id, p.patient_name, pd.protocol_name
                 FROM {settings.DB_SCHEMA}.sessions s
                 LEFT JOIN {settings.DB_SCHEMA}.members p
                        ON p.member_id = s.member_id
+                LEFT JOIN {settings.DB_SCHEMA}.protocol_dict pd
+                       ON pd.protocol_id = s.protocol_id
                 {where}
                 ORDER BY s.session_id DESC
                 LIMIT %s
@@ -167,6 +169,9 @@ def _list_markup_sessions(search: str | None, page_size: int) -> Dict[str, Any]:
                 "session_title": row.get("session_title"),
                 "date": row.get("date"),
                 "time": row.get("time"),
+                "device_id": row.get("device_id"),
+                "protocol_id": row.get("protocol_id"),
+                "protocol_name": row.get("protocol_name"),
             }
             for row in rows
         ]
@@ -183,10 +188,13 @@ def _get_markup_session(session_id: int) -> Dict[str, Any]:
             cursor.execute(
                 f"""
                 SELECT s.session_id, s.user_id, s.date, s.time, s.session_title,
-                       s.additional_info, p.patient_name
+                       s.additional_info, s.device_id, s.protocol_id,
+                       p.patient_name, pd.protocol_name
                 FROM {settings.DB_SCHEMA}.sessions s
                 LEFT JOIN {settings.DB_SCHEMA}.members p
                        ON p.member_id = s.member_id
+                LEFT JOIN {settings.DB_SCHEMA}.protocol_dict pd
+                       ON pd.protocol_id = s.protocol_id
                 WHERE s.session_id = %s
                 """,
                 (session_id,),
@@ -202,6 +210,9 @@ def _get_markup_session(session_id: int) -> Dict[str, Any]:
         "session_title": row.get("session_title"),
         "date": row.get("date"),
         "time": row.get("time"),
+        "device_id": row.get("device_id"),
+        "protocol_id": row.get("protocol_id"),
+        "protocol_name": row.get("protocol_name"),
         "additional_info": _parse_additional_info(row.get("additional_info")),
     }
 

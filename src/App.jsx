@@ -1507,6 +1507,36 @@ function chartSubplotMetrics(index, total, chartHeight) {
   }
 }
 
+function plotAxisKey(index, axis) {
+  return index === 0 ? axis : `${axis}${index + 1}`
+}
+
+function readPlotRange(eventData, axisKey) {
+  if (!eventData) return null
+  const start = eventData[`${axisKey}.range[0]`]
+  const end = eventData[`${axisKey}.range[1]`]
+  if (start !== undefined && end !== undefined) return [Number(start), Number(end)]
+  const nested = eventData[`${axisKey}.range`] ?? eventData[axisKey]?.range
+  if (Array.isArray(nested) && nested.length >= 2) return [Number(nested[0]), Number(nested[1])]
+  return null
+}
+
+function currentAxisRange(gd, axisKey) {
+  const layoutRange = gd?.layout?.[axisKey]?.range
+  if (Array.isArray(layoutRange) && layoutRange.length >= 2) {
+    return [Number(layoutRange[0]), Number(layoutRange[1])]
+  }
+  const fullRange = gd?._fullLayout?.[axisKey]?.range
+  if (Array.isArray(fullRange) && fullRange.length >= 2) {
+    return [Number(fullRange[0]), Number(fullRange[1])]
+  }
+  return null
+}
+
+function hasSessionMetaValue(value) {
+  return value != null && value !== ''
+}
+
 function getPairStartIndex(index) {
   return index - (index % 2)
 }
@@ -1646,6 +1676,8 @@ export default function App() {
   // Session
   const [sessionId, setSessionId]       = useState('')
   const [sessionLabel, setSessionLabel] = useState('')
+  const [sessionProtocolName, setSessionProtocolName] = useState('')
+  const [sessionDeviceId, setSessionDeviceId] = useState(null)
   const [markupFiles, setMarkupFiles]   = useState([])
   const [activeMarkupFileId, setActiveMarkupFileId] = useState('')
   const [sessionRecordAvailable, setSessionRecordAvailable] = useState(false)
@@ -1720,6 +1752,11 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth]         = useState(292)
   const [videoPanelWidth, setVideoPanelWidth]   = useState(null)
   const [labMenuOpen, setLabMenuOpen]           = useState(false)
+  const [chartsLocked, setChartsLocked]         = useState(false)
+  const [mobileTab, setMobileTab]               = useState('data')
+  const [isMobile, setIsMobile]                 = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches,
+  )
   const labMenuRef = useRef(null)
 
   // Labeling
@@ -1782,6 +1819,7 @@ export default function App() {
   const selectedMarkupRef = useRef(null)
   const relabelStepRef   = useRef(null)
   const subplotRangesRef = useRef({})
+  const chartsLockedRef  = useRef(false)
   const chartReorderRef  = useRef(null)
   const importedCsvTextRef = useRef('')
   const skipClearImportCsvRef = useRef(false)
@@ -1815,6 +1853,15 @@ export default function App() {
   useEffect(() => { relabelStepRef.current = relabelStep }, [relabelStep])
   useEffect(() => { calculatorResultsRef.current = calculatorResults }, [calculatorResults])
   useEffect(() => { activeCalculatorsRef.current = activeCalculators }, [activeCalculators])
+  useEffect(() => { chartsLockedRef.current = chartsLocked }, [chartsLocked])
+
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 768px)')
+    const onChange = () => setIsMobile(mq.matches)
+    onChange()
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
 
   useEffect(() => {
     if (!selectedMarkup) return
@@ -1867,6 +1914,8 @@ export default function App() {
     setToken('')
     setSessionsList([])
     setSessionsListLoading(false)
+    setSessionProtocolName('')
+    setSessionDeviceId(null)
     sessionStorage.removeItem('auth_token')
   }, [])
 
@@ -1893,7 +1942,9 @@ export default function App() {
     return sessionsList.filter(s =>
       String(s.id).includes(q) ||
       (s.member_name && s.member_name.toLowerCase().includes(q)) ||
-      (s.session_title && s.session_title.toLowerCase().includes(q))
+      (s.session_title && s.session_title.toLowerCase().includes(q)) ||
+      (s.protocol_name && s.protocol_name.toLowerCase().includes(q)) ||
+      (s.device_id != null && String(s.device_id).includes(q))
     ).slice(0, 25)
   }, [sessionsList, sessionId])
 
@@ -1982,6 +2033,8 @@ export default function App() {
 
     setStatus({ text: `Загружаю сессию ${sid}…`, type: 'loading' })
     setSessionLabel(`Сессия #${sid}`)
+    setSessionProtocolName('')
+    setSessionDeviceId(null)
     setChartReady(false)
     plotInitRef.current = false
     if (chartDivRef.current) {
@@ -2050,7 +2103,14 @@ export default function App() {
       const result = metadataAvailable
         ? await metadataResp.json()
         : { additional_info: null }
+      const protocolName = result.protocol_name || result.protocolName || ''
+      const deviceId = result.device_id ?? result.deviceId ?? null
       setSessionRecordAvailable(metadataAvailable)
+      setSessionProtocolName(protocolName)
+      setSessionDeviceId(hasSessionMetaValue(deviceId) ? deviceId : null)
+      if (typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches) {
+        setMobileTab('chart')
+      }
 
       const initialMarkupFiles = result.additional_info?.markup_files || []
       setMarkupFiles(initialMarkupFiles)
@@ -3007,6 +3067,9 @@ export default function App() {
     setVideoName(file.name)
     setVideoPanelOpen(true)
     setCurrentTime(0)
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches) {
+      setMobileTab('video')
+    }
   }, [])
 
   // ── Parquet loader ────────────────────────────────────────────────────────
@@ -3016,6 +3079,8 @@ export default function App() {
       : null
     setStatus({ text: `Читаю ${file.name}…`, type: 'loading' })
     setSessionLabel(file.name)
+    setSessionProtocolName('')
+    setSessionDeviceId(null)
     setChartReady(false)
     setColumnsPanelOpen(false)
     plotInitRef.current = false
@@ -3109,12 +3174,17 @@ export default function App() {
         text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}${stHint}${gapHint}${yawHint}`,
         type: 'ok',
       })
+      if (typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches) {
+        setMobileTab('chart')
+      }
 
       const sid = sessionId.trim()
       if (sid) {
         try {
           const sess = await fetchSessionMarkupsFromDb(sid)
           setSessionRecordAvailable(true)
+          setSessionProtocolName(sess.protocol_name || sess.protocolName || '')
+          setSessionDeviceId(hasSessionMetaValue(sess.device_id ?? sess.deviceId) ? (sess.device_id ?? sess.deviceId) : null)
           // The parquet file carries no calibration; if the linked session does,
           // derive the normalized channels now and refresh the column list. The
           // weighted total was built from raw counts above, so it is rebuilt too.
@@ -3576,6 +3646,11 @@ export default function App() {
       legend: { orientation: 'h', y: -0.06, font: { family: UI_FONT_FAMILY, size: 11 } },
     }
 
+    const shareX = chartsLockedRef.current && n > 1
+    const sharedXRange = shareX
+      ? (subplotRangesRef.current[selectedCols[0]]?.x || [xMin, xMax])
+      : null
+
     selectedCols.forEach((col, i) => {
       const top    = 1 - i * (subH + gap)
       const bottom = top - subH
@@ -3598,8 +3673,9 @@ export default function App() {
         title:           i === n - 1 ? { text: 'Время', font: { size: 11 } } : undefined,
         tickfont:        { size: 10 },
         showticklabels:  i === n - 1,
-        range:           subplotRangesRef.current[col]?.x || [xMin, xMax],
+        range:           sharedXRange || subplotRangesRef.current[col]?.x || [xMin, xMax],
       }
+      if (shareX && i > 0) layout[xKey].matches = 'x'
     })
 
     Plotly.newPlot(chartDivRef.current, traces, layout, {
@@ -3733,8 +3809,8 @@ export default function App() {
 
       chartDivRef.current.on('plotly_relayout', (eventData) => {
         selectedCols.forEach((col, index) => {
-          const xAxisKey = index === 0 ? 'xaxis' : `xaxis${index + 1}`
-          const yAxisKey = index === 0 ? 'yaxis' : `yaxis${index + 1}`
+          const xAxisKey = plotAxisKey(index, 'xaxis')
+          const yAxisKey = plotAxisKey(index, 'yaxis')
           const current = subplotRangesRef.current[col] || {}
           const next = { ...current }
           let changed = false
@@ -3763,9 +3839,46 @@ export default function App() {
 
           if (changed) subplotRangesRef.current[col] = next
         })
+
+        if (chartsLockedRef.current) {
+          let sharedX = null
+          selectedCols.forEach((_, index) => {
+            const x = readPlotRange(eventData, plotAxisKey(index, 'xaxis'))
+            if (x) sharedX = x
+          })
+          if (sharedX) {
+            selectedCols.forEach(col => {
+              const current = subplotRangesRef.current[col] || {}
+              subplotRangesRef.current[col] = { ...current, x: sharedX }
+            })
+          }
+        }
       })
     })
   }, [chartData, selectedCols, timeCol, sensorGroups, hasSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict])
+
+  const toggleChartsLock = useCallback(() => {
+    const next = !chartsLockedRef.current
+    chartsLockedRef.current = next
+    setChartsLocked(next)
+    const gd = chartDivRef.current
+    const cols = selectedColsRef.current
+    if (!plotInitRef.current || !gd || cols.length < 2) return
+
+    const xRange = currentAxisRange(gd, 'xaxis')
+    const updates = {}
+    cols.forEach((col, i) => {
+      const xKey = plotAxisKey(i, 'xaxis')
+      if (i > 0) updates[`${xKey}.matches`] = next ? 'x' : false
+      if (next && xRange) {
+        updates[`${xKey}.range`] = xRange
+        const current = subplotRangesRef.current[col] || {}
+        subplotRangesRef.current[col] = { ...current, x: xRange }
+      }
+    })
+    if (next && xRange) updates['xaxis.range'] = xRange
+    Plotly.relayout(gd, updates)
+  }, [])
 
   const handleToggleYawDrift = useCallback(() => {
     if (!yawDrift?.applied) return
@@ -3814,9 +3927,12 @@ export default function App() {
 
   useEffect(() => {
     if (!chartReady || !chartDivRef.current) return undefined
-    const timeout = window.setTimeout(() => Plotly.Plots.resize(chartDivRef.current), 30)
+    const delay = isMobile && mobileTab === 'chart' ? 80 : 30
+    const timeout = window.setTimeout(() => {
+      if (chartDivRef.current) Plotly.Plots.resize(chartDivRef.current)
+    }, delay)
     return () => window.clearTimeout(timeout)
-  }, [chartReady, sidebarWidth, videoPanelOpen, videoPanelWidth])
+  }, [chartReady, sidebarWidth, videoPanelOpen, videoPanelWidth, mobileTab, isMobile])
 
   // ── Video timeupdate → move chart cursor ──────────────────────────────────
   const handleTimeUpdate = useCallback(() => {
@@ -4039,7 +4155,7 @@ export default function App() {
 
   return (
     <div
-      className={`app${dragOver ? ' drag-over' : ''}`}
+      className={`app${dragOver ? ' drag-over' : ''}${isMobile ? ` mobile-tab-${mobileTab}` : ''}`}
       onDrop={e => { e.preventDefault(); setDragOver(false); handleFiles(e.dataTransfer.files) }}
       onDragOver={e => { e.preventDefault(); setDragOver(true) }}
       onDragLeave={() => setDragOver(false)}
@@ -4057,11 +4173,36 @@ export default function App() {
           {sessionLabel && (
             <FileBadge type="parquet"><UiIcon name="database" /> {sessionLabel}</FileBadge>
           )}
+          {sessionProtocolName && (
+            <FileBadge type="protocol">{sessionProtocolName}</FileBadge>
+          )}
+          {hasSessionMetaValue(sessionDeviceId) && (
+            <FileBadge type="device">device {sessionDeviceId}</FileBadge>
+          )}
           <button className="logout-btn" onClick={handleLogout} title="Выйти">
             <UiIcon name="logout" /> <span className="logout-text">Выйти</span>
           </button>
         </div>
       </header>
+
+      <div className="mobile-session-strip" aria-label="Сведения о сессии">
+        <span className="mobile-session-chip">
+          <span className="mobile-session-key">Протокол</span>
+          <span className="mobile-session-val">{sessionProtocolName || '—'}</span>
+        </span>
+        <span className="mobile-session-chip mobile-session-device">
+          <span className="mobile-session-key">Device</span>
+          <span className="mobile-session-val">
+            {hasSessionMetaValue(sessionDeviceId) ? sessionDeviceId : '—'}
+          </span>
+        </span>
+        <span className={`mobile-session-chip${checkHzData && totalGaps > 0 ? ' mobile-session-gaps' : ''}`}>
+          <span className="mobile-session-key">Пропуски</span>
+          <span className="mobile-session-val">
+            {!checkHzData ? '—' : totalGaps > 0 ? totalGaps : 'нет'}
+          </span>
+        </span>
+      </div>
 
       <div className={`app-body${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
         <aside className="sidebar" style={sidebarCollapsed ? undefined : { width: sidebarWidth }}>
@@ -4076,7 +4217,7 @@ export default function App() {
             {sidebarCollapsed ? '▶' : '◀'}
           </button>
 
-          {!sidebarCollapsed && (
+          {(!sidebarCollapsed || isMobile) && (
             <div className="sidebar-scroll">
               <SidebarSection
                 title="1. Данные"
@@ -4095,6 +4236,13 @@ export default function App() {
                       <UiIcon name="file-table" /> CSV
                     </UploadBtn>
                   </div>
+
+                  <SessionInfoCard
+                    protocolName={sessionProtocolName}
+                    deviceId={sessionDeviceId}
+                    gapCount={totalGaps}
+                    gapsKnown={Boolean(checkHzData)}
+                  />
 
                   <div className="sidebar-field">
                     <span className="sidebar-field-lbl">Сессия</span>
@@ -4129,6 +4277,7 @@ export default function App() {
                               >
                                 <span className="sdi-id">#{s.id}</span>
                                 <span className="sdi-name">{s.member_name || '—'}</span>
+                                {s.protocol_name && <span className="sdi-protocol">{s.protocol_name}</span>}
                                 {s.date && <span className="sdi-date">{s.date.slice(0, 10)}</span>}
                               </li>
                             ))}
@@ -4910,6 +5059,23 @@ export default function App() {
               <div className="label-toolbar-group">
                 <button
                   type="button"
+                  className={`btn-toggle charts-lock-btn${chartsLocked ? ' active' : ''}`}
+                  onClick={toggleChartsLock}
+                  disabled={!chartReady || selectedCols.length < 2}
+                  aria-pressed={chartsLocked}
+                  title={
+                    selectedCols.length < 2
+                      ? 'Выберите несколько графиков, чтобы двигать их вместе'
+                      : chartsLocked
+                        ? 'Открепить: каждый график двигается отдельно'
+                        : 'Закрепить: масштабирование и сдвиг по времени на всех графиках сразу'
+                  }
+                >
+                  <UiIcon name="pin" /> Закрепить
+                </button>
+
+                <button
+                  type="button"
                   className={`btn-toggle video-panel-toggle${videoPanelOpen ? ' active' : ''}`}
                   onClick={toggleVideoPanel}
                   aria-pressed={videoPanelOpen}
@@ -5374,6 +5540,33 @@ export default function App() {
           <div className="drag-box">⬇<p>Видео, .parquet или размеченный .csv</p></div>
         </div>
       )}
+
+      <nav className="mobile-tabbar" aria-label="Разделы">
+        <button
+          type="button"
+          className={mobileTab === 'data' ? 'active' : ''}
+          onClick={() => setMobileTab('data')}
+        >
+          <UiIcon name="database" />
+          <span>Данные</span>
+        </button>
+        <button
+          type="button"
+          className={mobileTab === 'video' ? 'active' : ''}
+          onClick={() => setMobileTab('video')}
+        >
+          <UiIcon name="video" />
+          <span>Видео</span>
+        </button>
+        <button
+          type="button"
+          className={mobileTab === 'chart' ? 'active' : ''}
+          onClick={() => setMobileTab('chart')}
+        >
+          <UiIcon name="chart" />
+          <span>График</span>
+        </button>
+      </nav>
     </div>
   )
 }
@@ -5449,6 +5642,12 @@ function UiIcon({ name, className = '' }) {
     case 'grip':
       artwork = <><circle cx="9" cy="6" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="6" r="1" fill="currentColor" stroke="none" /><circle cx="9" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="9" cy="18" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="18" r="1" fill="currentColor" stroke="none" /></>
       break
+    case 'pin':
+      artwork = <><path d="M12 17v5" /><path d="M9 3h6l1 7 3 3H5l3-3z" /></>
+      break
+    case 'chart':
+      artwork = <><path d="M4 19h16" /><path d="M7 16v-6" /><path d="M12 16V8" /><path d="M17 16v-9" /></>
+      break
     case 'logout':
       artwork = <><path d="M10 5H5v14h5" /><path d="M13 8l4 4-4 4M8 12h9" /></>
       break
@@ -5490,6 +5689,28 @@ function UiIcon({ name, className = '' }) {
 
 function FileBadge({ type, children }) {
   return <span className={`file-badge badge-${type}`}>{children}</span>
+}
+
+function SessionInfoCard({ protocolName, deviceId, gapCount, gapsKnown }) {
+  const gapsLabel = !gapsKnown ? '—' : gapCount > 0 ? String(gapCount) : 'нет'
+  return (
+    <div className="session-info-card" aria-label="Данные сессии">
+      <div className="session-info-row">
+        <span className="session-info-key">Протокол</span>
+        <span className="session-info-val">{protocolName || '—'}</span>
+      </div>
+      <div className="session-info-row">
+        <span className="session-info-key">Device ID</span>
+        <span className="session-info-val">{hasSessionMetaValue(deviceId) ? String(deviceId) : '—'}</span>
+      </div>
+      <div className="session-info-row">
+        <span className="session-info-key">Пропуски</span>
+        <span className={`session-info-val${gapsKnown && gapCount > 0 ? ' session-info-warn' : ''}`}>
+          {gapsLabel}
+        </span>
+      </div>
+    </div>
+  )
 }
 
 function OffsetInput({ value, step, title, onChange }) {
