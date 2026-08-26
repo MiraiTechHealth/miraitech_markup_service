@@ -395,6 +395,32 @@ function buildDefaultCols(numCols, hasSpeedTracker, colMap, sensorNames) {
   return merged.length ? merged : plottable.slice(0, 3)
 }
 
+const TKEO_WIN = 15
+const TKEO_PLOT_COLS = ['TKEO_AcX', 'TKEO_AcY', 'TKEO_AcZ', 'TKEO_AccMag']
+const SENSOR_SUM_RAW_COL = 'Sensor_Sum_Raw'
+const SENSOR_SUM_NORM_COL = 'Sensor_Sum_Normalized'
+
+// pandas Series.rolling(win, center=True, min_periods=1).mean() over TKEO psi.
+function tkeoSeries(x, win = TKEO_WIN) {
+  const m = x.length
+  const psi = new Array(m).fill(0)
+  if (m >= 3) {
+    for (let k = 1; k < m - 1; k++) psi[k] = x[k] * x[k] - x[k - 1] * x[k + 1]
+  }
+  const back = Math.floor(win / 2)
+  const fwd = Math.floor((win - 1) / 2)
+  const cum = new Array(m + 1)
+  cum[0] = 0
+  for (let k = 0; k < m; k++) cum[k + 1] = cum[k] + psi[k]
+  const out = new Array(m)
+  for (let k = 0; k < m; k++) {
+    const lo = Math.max(0, k - back)
+    const hi = Math.min(m - 1, k + fwd)
+    out[k] = Math.max((cum[hi + 1] - cum[lo]) / (hi - lo + 1), 0)
+  }
+  return out
+}
+
 // Derived channel: TKEO of the accel magnitude, mirroring the backend
 // (ml_speed_calculator._foot_features / build_session_parquets._tkeo):
 // psi[i] = x[i]² − x[i−1]·x[i+1], centered rolling mean over
@@ -455,6 +481,119 @@ function addAccTkeoColumn(colMap, tCol) {
   })
 
   colMap['acc_tkeo'] = out
+}
+
+// Extra TKEO traces for the column picker: AcX / AcY / AcZ and
+// magg(Acc) = sqrt(AcX² + AcY² + AcZ²). Same operator as the backend
+// `_tkeo` (psi = x² − x[i−1]·x[i+1], centered rolling mean, clamp ≥ 0),
+// computed per sensor in time order.
+function addTkeoColumns(colMap, tCol) {
+  const times = colMap[tCol]
+  const names = colMap['Name']
+  if (!times) return []
+  const n = times.length
+  const sources = [
+    { col: 'TKEO_AcX', from: 'AcX' },
+    { col: 'TKEO_AcY', from: 'AcY' },
+    { col: 'TKEO_AcZ', from: 'AcZ' },
+    { col: 'TKEO_AccMag', from: 'mag' },
+  ]
+  const needed = sources.filter(s => !colMap[s.col])
+  if (!needed.length) return sources.map(s => s.col).filter(c => colMap[c])
+
+  const buffers = {}
+  needed.forEach(s => { buffers[s.col] = new Array(n).fill(null) })
+
+  const sensors = names
+    ? [...new Set(names.filter(v => v != null && v !== ''))]
+    : [null]
+
+  sensors.forEach(sensor => {
+    const idx = []
+    for (let i = 0; i < n; i++) {
+      if (sensor !== null && names[i] !== sensor) continue
+      if (safeNum(times[i]) === null) continue
+      idx.push(i)
+    }
+    if (idx.length < 3) return
+    idx.sort((a, b) => safeNum(times[a]) - safeNum(times[b]))
+
+    needed.forEach(({ col, from }) => {
+      const series = []
+      const seriesIdx = []
+      for (let k = 0; k < idx.length; k++) {
+        const i = idx[k]
+        let v = null
+        if (from === 'mag') {
+          const ax = safeNum(colMap.AcX?.[i])
+          const ay = safeNum(colMap.AcY?.[i])
+          const az = safeNum(colMap.AcZ?.[i])
+          if (ax !== null && ay !== null && az !== null) v = Math.hypot(ax, ay, az)
+        } else {
+          v = safeNum(colMap[from]?.[i])
+        }
+        if (v === null) continue
+        series.push(v)
+        seriesIdx.push(i)
+      }
+      if (series.length < 3) return
+      const tkeo = tkeoSeries(series, TKEO_WIN)
+      for (let k = 0; k < seriesIdx.length; k++) buffers[col][seriesIdx[k]] = tkeo[k]
+    })
+  })
+
+  const added = []
+  needed.forEach(({ col }) => {
+    if (buffers[col].some(v => v !== null)) {
+      colMap[col] = buffers[col]
+      added.push(col)
+    }
+  })
+  return added
+}
+
+function sumSensorColumns(colMap, sourceCols, outCol) {
+  if (colMap[outCol]) return outCol
+  if (sourceCols.some(col => !colMap[col])) return null
+  const n = colMap[sourceCols[0]].length
+  const out = new Array(n).fill(null)
+  let wrote = false
+  for (let i = 0; i < n; i++) {
+    let total = 0
+    let ok = true
+    for (let s = 0; s < sourceCols.length; s++) {
+      const v = safeNum(colMap[sourceCols[s]][i])
+      if (v === null) { ok = false; break }
+      total += v
+    }
+    if (!ok) continue
+    out[i] = total
+    wrote = true
+  }
+  if (!wrote) return null
+  colMap[outCol] = out
+  return outCol
+}
+
+function addSensorSumColumns(colMap) {
+  const added = []
+  const raw = sumSensorColumns(colMap, SENSOR_COLS, SENSOR_SUM_RAW_COL)
+  if (raw) added.push(raw)
+  const norm = sumSensorColumns(
+    colMap,
+    SENSOR_COLS.map(col => `${col}_Normalized`),
+    SENSOR_SUM_NORM_COL,
+  )
+  if (norm) added.push(norm)
+  return added
+}
+
+function addDerivedSessionColumns(colMap, tCol, additionalInfo) {
+  addAccTkeoColumn(colMap, tCol)
+  addTkeoColumns(colMap, tCol)
+  addNormalizedSensorColumns(colMap, additionalInfo)
+  addWeightedInsoleTotalColumn(colMap, tCol, additionalInfo)
+  addSensorSumColumns(colMap)
 }
 
 // A stored additional_info blob can arrive JSON-encoded one or more levels deep
@@ -920,7 +1059,7 @@ function unwrapAngleDegrees(arr, threshold = 180.0) {
 
 const UNWRAPPABLE_ANGLE_COLUMNS = new Set(['XData', 'YData', 'ZData'])
 // Channels the IMU postprocessing rewrites — snapshotted so it can be undone.
-const IMU_SNAPSHOT_COLUMNS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'acc_tkeo']
+const IMU_SNAPSHOT_COLUMNS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'acc_tkeo', ...TKEO_PLOT_COLS]
 
 // ── Gyro yaw drift ───────────────────────────────────────────────────────────
 // A port of the backend's app/services/calculators/yaw_drift_calculator.py,
@@ -2134,9 +2273,7 @@ export default function App() {
 
       const colMap = rowsToColMap(rows)
       const tCol = detectTimeCol(Object.keys(colMap))
-      addAccTkeoColumn(colMap, tCol)
-      addNormalizedSensorColumns(colMap, result.additional_info)
-      addWeightedInsoleTotalColumn(colMap, tCol, result.additional_info)
+      addDerivedSessionColumns(colMap, tCol, result.additional_info)
       setParquetData(colMap)
       setTimeCol(tCol)
       const drift = prepareYawDrift(colMap)
@@ -2655,8 +2792,7 @@ export default function App() {
         imuOriginalRef.current = null
         setImuApplied(false)
 
-        addAccTkeoColumn(colMap, tCol)
-        addWeightedInsoleTotalColumn(colMap, tCol, null)
+        addDerivedSessionColumns(colMap, tCol, null)
         setParquetData(colMap)
         setTimeCol(tCol)
         prepareYawDrift(colMap)
@@ -2868,7 +3004,9 @@ export default function App() {
       const colMap = { ...colMapFromResp }
       // Accelerations changed, so the derived TKEO channel is rebuilt.
       delete colMap['acc_tkeo']
+      TKEO_PLOT_COLS.forEach(col => { delete colMap[col] })
       addAccTkeoColumn(colMap, timeCol)
+      addTkeoColumns(colMap, timeCol)
       applyImuColMap(colMap)
       setImuApplied(true)
 
@@ -3131,8 +3269,7 @@ export default function App() {
 
       const colMap = rowsToColMap(rows)
       const tCol = detectTimeCol(Object.keys(colMap))
-      addAccTkeoColumn(colMap, tCol)
-      addWeightedInsoleTotalColumn(colMap, tCol, null)
+      addDerivedSessionColumns(colMap, tCol, null)
       setParquetData(colMap)
       setTimeCol(tCol)
       const drift = prepareYawDrift(colMap)
@@ -3190,7 +3327,9 @@ export default function App() {
           // weighted total was built from raw counts above, so it is rebuilt too.
           if (addNormalizedSensorColumns(colMap, sess?.additional_info).length) {
             delete colMap[INSOLE_TOTAL_COL]
+            delete colMap[SENSOR_SUM_NORM_COL]
             addWeightedInsoleTotalColumn(colMap, tCol, sess?.additional_info)
+            addSensorSumColumns(colMap)
             setParquetData({ ...colMap })
             setColumns(computeNumericColumns(colMap, tCol))
           }
