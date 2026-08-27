@@ -1058,6 +1058,10 @@ function unwrapAngleDegrees(arr, threshold = 180.0) {
 }
 
 const UNWRAPPABLE_ANGLE_COLUMNS = new Set(['XData', 'YData', 'ZData'])
+// The left insole is mounted mirrored relative to the right one, so its X and Y
+// accelerations point the opposite way and the two feet plot as reflections of
+// each other. Negating these channels on the left puts both feet in one frame.
+const MIRRORED_LEFT_COLUMNS = new Set(['AcX', 'AcY'])
 // Channels the IMU postprocessing rewrites — snapshotted so it can be undone.
 const IMU_SNAPSHOT_COLUMNS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'acc_tkeo', ...TKEO_PLOT_COLS]
 
@@ -1908,6 +1912,7 @@ export default function App() {
   const [showGaps, setShowGaps]                   = useState(false)
   const [selectedMarkup, setSelectedMarkup]       = useState(null)
   const [anglesUnwrapped, setAnglesUnwrapped]     = useState(false)
+  const [mirrorLeft, setMirrorLeft]               = useState(false)
   const [relabelStep, setRelabelStep]             = useState(null)
   // Gyro yaw drift: the estimate runs once per loaded session and both series
   // stay in memory, so the toggle swaps between them without recomputing.
@@ -1941,6 +1946,7 @@ export default function App() {
   const selectedColsRef  = useRef([])
   const columnSelectionInitializedRef = useRef(false)
   const anglesUnwrappedRef = useRef(false)
+  const mirrorLeftRef      = useRef(false)
   const isDragging       = useRef(false)
   const isVideoPan      = useRef(false)
   const vidLblRef       = useRef(null)
@@ -1988,6 +1994,7 @@ export default function App() {
   useEffect(() => { selectedColsRef.current = selectedCols }, [selectedCols])
   useEffect(() => { showGapsRef.current = showGaps }, [showGaps])
   useEffect(() => { anglesUnwrappedRef.current = anglesUnwrapped }, [anglesUnwrapped])
+  useEffect(() => { mirrorLeftRef.current = mirrorLeft }, [mirrorLeft])
   useEffect(() => { selectedMarkupRef.current = selectedMarkup }, [selectedMarkup])
   useEffect(() => { relabelStepRef.current = relabelStep }, [relabelStep])
   useEffect(() => { calculatorResultsRef.current = calculatorResults }, [calculatorResults])
@@ -2219,6 +2226,8 @@ export default function App() {
     setSelectedMarkup(null)
     anglesUnwrappedRef.current = false
     setAnglesUnwrapped(false)
+    mirrorLeftRef.current = false
+    setMirrorLeft(false)
     resetYawDrift()
 
     try {
@@ -2786,6 +2795,8 @@ export default function App() {
         setCheckHzData(null)
         anglesUnwrappedRef.current = false
         setAnglesUnwrapped(false)
+        mirrorLeftRef.current = false
+        setMirrorLeft(false)
         resetYawDrift()
         subplotRangesRef.current = {}
         importedCsvTextRef.current = ''
@@ -2950,6 +2961,8 @@ export default function App() {
     setSelectedCalculatorContact(null)
     anglesUnwrappedRef.current = false
     setAnglesUnwrapped(false)
+    mirrorLeftRef.current = false
+    setMirrorLeft(false)
     // XData was rewritten, so the cached drift estimate no longer matches it.
     prepareYawDrift(colMap)
   }, [timeCol, prepareYawDrift])
@@ -3252,6 +3265,8 @@ export default function App() {
     setSelectedMarkup(null)
     anglesUnwrappedRef.current = false
     setAnglesUnwrapped(false)
+    mirrorLeftRef.current = false
+    setMirrorLeft(false)
     resetYawDrift()
     subplotRangesRef.current = {}
     importedCsvTextRef.current = ''
@@ -3569,7 +3584,22 @@ export default function App() {
       })
       return out
     }
-    const data1 = applyUnwrap(filterBySensors(sensorGroups.left)) || {}
+    // Only the left foot is flipped: the point is to bring it into the right
+    // foot's frame, so the right one stays as recorded.
+    const applyMirror = (d) => {
+      if (!mirrorLeftRef.current || !d) return d
+      const out = { ...d }
+      selectedCols.forEach((col) => {
+        if (MIRRORED_LEFT_COLUMNS.has(col) && out[col]) {
+          out[col] = out[col].map((v) => {
+            const n = safeNum(v)
+            return n === null ? v : -n
+          })
+        }
+      })
+      return out
+    }
+    const data1 = applyMirror(applyUnwrap(filterBySensors(sensorGroups.left))) || {}
     const data2 = sensorGroups.right.length
       ? applyUnwrap(filterBySensors(sensorGroups.right))
       : null
@@ -4050,6 +4080,31 @@ export default function App() {
     setAnglesUnwrapped(anglesUnwrappedRef.current)
     renderChart()
   }, [parquetData, selectedCols, renderChart])
+
+  const mirrorableCols = useMemo(
+    () => selectedCols.filter(col => MIRRORED_LEFT_COLUMNS.has(col)),
+    [selectedCols],
+  )
+
+  /** Flip AcX/AcY of the left foot. Plot only — the stored data is untouched. */
+  const handleMirrorLeft = useCallback(() => {
+    if (!parquetData || !mirrorableCols.length) return
+    mirrorLeftRef.current = !mirrorLeftRef.current
+    setMirrorLeft(mirrorLeftRef.current)
+    renderChart()
+    setStatus(mirrorLeftRef.current
+      ? { text: `✓ Левая нога отражена · ${mirrorableCols.join(', ')} × (-1)`, type: 'ok' }
+      : { text: 'Показаны исходные AcX/AcY левой ноги', type: 'ok' })
+  }, [parquetData, mirrorableCols, renderChart])
+
+  const mirrorLeftTitle = useMemo(() => {
+    if (!mirrorableCols.length) {
+      return 'Выберите AcX или AcY — отражаются только эти каналы'
+    }
+    return mirrorLeft
+      ? `Вернуть исходные ${mirrorableCols.join(', ')} левой ноги`
+      : `Умножить ${mirrorableCols.join(', ')} левой ноги на −1 (только график)`
+  }, [mirrorLeft, mirrorableCols])
 
   useEffect(() => {
     if (!parquetData || !selectedCols.length) {
@@ -5315,6 +5370,17 @@ export default function App() {
                         <span className="yaw-drift-note">{yawDrift.reason}</span>
                       )}
                     </span>
+                    <button
+                      type="button"
+                      className={`btn-secondary btn-unwrap${mirrorLeft ? ' active' : ''}`}
+                      disabled={!mirrorableCols.length}
+                      onClick={handleMirrorLeft}
+                      aria-pressed={mirrorLeft}
+                      title={mirrorLeftTitle}
+                      aria-label={mirrorLeftTitle}
+                    >
+                      <UiIcon name="mirror" /> Отразить
+                    </button>
                   </div>
                 )}
 
@@ -5804,6 +5870,9 @@ function UiIcon({ name, className = '' }) {
       break
     case 'ruler':
       artwork = <><path d="m4 15 11-11 5 5-11 11H4z" /><path d="m12 7 2 2M9 10l2 2M6 13l2 2" /></>
+      break
+    case 'mirror':
+      artwork = <><path d="M12 3v18" strokeDasharray="3 3" /><path d="M9 8 4 12l5 4z" /><path d="m15 8 5 4-5 4z" /></>
       break
     case 'x':
       artwork = <path d="m6 6 12 12M18 6 6 18" />
