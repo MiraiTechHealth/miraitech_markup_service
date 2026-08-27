@@ -1680,6 +1680,17 @@ function hasSessionMetaValue(value) {
   return value != null && value !== ''
 }
 
+// The markup API fills an absent athlete with an em dash; the header badge is
+// hidden instead of showing a placeholder.
+function normalizeMemberName(value) {
+  const name = typeof value === 'string' ? value.trim() : ''
+  return name && name !== '—' ? name : ''
+}
+
+function normalizeSessionTitle(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
 function getPairStartIndex(index) {
   return index - (index % 2)
 }
@@ -1821,6 +1832,12 @@ export default function App() {
   const [sessionLabel, setSessionLabel] = useState('')
   const [sessionProtocolName, setSessionProtocolName] = useState('')
   const [sessionDeviceId, setSessionDeviceId] = useState(null)
+  const [sessionMemberName, setSessionMemberName] = useState('')
+  const [sessionTitle, setSessionTitle] = useState('')
+  // The session id the header meta was loaded for. The input box is a draft the
+  // user can retype, so edits must never target whatever it happens to hold.
+  const [loadedSessionId, setLoadedSessionId] = useState('')
+  const [sessionTitleExpanded, setSessionTitleExpanded] = useState(false)
   const [markupFiles, setMarkupFiles]   = useState([])
   const [activeMarkupFileId, setActiveMarkupFileId] = useState('')
   const [sessionRecordAvailable, setSessionRecordAvailable] = useState(false)
@@ -2062,6 +2079,11 @@ export default function App() {
     setSessionsListLoading(false)
     setSessionProtocolName('')
     setSessionDeviceId(null)
+    setSessionMemberName('')
+    setSessionTitle('')
+    setSessionTitleExpanded(false)
+    setLoadedSessionId('')
+    setSessionRecordAvailable(false)
     sessionStorage.removeItem('auth_token')
   }, [])
 
@@ -2169,6 +2191,32 @@ export default function App() {
     setYawFixed(false)
   }, [])
 
+  const saveSessionTitle = useCallback(async (nextTitle) => {
+    const sid = loadedSessionId
+    if (!sid) throw new Error('Сессия не загружена')
+    const resp = await fetch(`${MARKUP_API}/sessions/${sid}/title`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'accept': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({ session_title: nextTitle }),
+    })
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}))
+      throw new Error(parseApiError(errData, resp.status))
+    }
+    const result = await resp.json().catch(() => ({}))
+    const saved = normalizeSessionTitle(result.session_title ?? nextTitle)
+    setSessionTitle(saved)
+    // The dropdown list was fetched once at login; keep its row in step.
+    setSessionsList(list => list.map(item => (
+      String(item.id) === sid ? { ...item, session_title: saved || null } : item
+    )))
+    setStatus({ text: '✓ Название сессии сохранено', type: 'ok' })
+  }, [loadedSessionId, token])
+
   // ── Session loader ────────────────────────────────────────────────────────
   const loadSession = useCallback(async () => {
     const sid = sessionId.trim()
@@ -2181,6 +2229,10 @@ export default function App() {
     setSessionLabel(`Сессия #${sid}`)
     setSessionProtocolName('')
     setSessionDeviceId(null)
+    setSessionMemberName('')
+    setSessionTitle('')
+    setSessionTitleExpanded(false)
+    setLoadedSessionId('')
     setChartReady(false)
     plotInitRef.current = false
     if (chartDivRef.current) {
@@ -2256,6 +2308,9 @@ export default function App() {
       setSessionRecordAvailable(metadataAvailable)
       setSessionProtocolName(protocolName)
       setSessionDeviceId(hasSessionMetaValue(deviceId) ? deviceId : null)
+      setSessionMemberName(normalizeMemberName(result.member_name ?? result.memberName))
+      setSessionTitle(normalizeSessionTitle(result.session_title ?? result.sessionTitle))
+      setLoadedSessionId(metadataAvailable ? String(sid) : '')
       if (typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches) {
         setMobileTab('chart')
       }
@@ -2854,8 +2909,17 @@ export default function App() {
         // The session number stays optional — it only unlocks saving to the DB.
         if (sid && token) {
           try {
-            await fetchSessionMarkupsFromDb(sid)
+            const sess = await fetchSessionMarkupsFromDb(sid)
             setSessionRecordAvailable(true)
+            setSessionProtocolName(sess.protocol_name || sess.protocolName || '')
+            setSessionDeviceId(
+              hasSessionMetaValue(sess.device_id ?? sess.deviceId)
+                ? (sess.device_id ?? sess.deviceId)
+                : null
+            )
+            setSessionMemberName(normalizeMemberName(sess.member_name ?? sess.memberName))
+            setSessionTitle(normalizeSessionTitle(sess.session_title ?? sess.sessionTitle))
+            setLoadedSessionId(String(sid))
           } catch {
             setSessionRecordAvailable(false)
           }
@@ -3337,6 +3401,9 @@ export default function App() {
           setSessionRecordAvailable(true)
           setSessionProtocolName(sess.protocol_name || sess.protocolName || '')
           setSessionDeviceId(hasSessionMetaValue(sess.device_id ?? sess.deviceId) ? (sess.device_id ?? sess.deviceId) : null)
+          setSessionMemberName(normalizeMemberName(sess.member_name ?? sess.memberName))
+          setSessionTitle(normalizeSessionTitle(sess.session_title ?? sess.sessionTitle))
+          setLoadedSessionId(String(sid))
           // The parquet file carries no calibration; if the linked session does,
           // derive the normalized channels now and refresh the column list. The
           // weighted total was built from raw counts above, so it is rebuilt too.
@@ -4363,6 +4430,20 @@ export default function App() {
         <div className="header-right">
           {videoName && (
             <FileBadge type="video"><UiIcon name="video" /> {videoName}</FileBadge>
+          )}
+          {sessionRecordAvailable && loadedSessionId && (
+            <SessionTitleBadge
+              key={`${loadedSessionId}:${sessionTitle}`}
+              title={sessionTitle}
+              expanded={sessionTitleExpanded}
+              onToggle={() => setSessionTitleExpanded(v => !v)}
+              onSave={saveSessionTitle}
+            />
+          )}
+          {sessionMemberName && (
+            <FileBadge type="member" title={sessionMemberName}>
+              <UiIcon name="user" /> {sessionMemberName}
+            </FileBadge>
           )}
           {sessionLabel && (
             <FileBadge type="parquet"><UiIcon name="database" /> {sessionLabel}</FileBadge>
@@ -5853,6 +5934,15 @@ function UiIcon({ name, className = '' }) {
     case 'chart':
       artwork = <><path d="M4 19h16" /><path d="M7 16v-6" /><path d="M12 16V8" /><path d="M17 16v-9" /></>
       break
+    case 'check':
+      artwork = <path d="m5 13 4 4 10-11" />
+      break
+    case 'tag':
+      artwork = <><path d="M11 3H4v7l10 10 7-7z" /><circle cx="7.5" cy="6.5" r="1.2" /></>
+      break
+    case 'user':
+      artwork = <><circle cx="12" cy="8" r="4" /><path d="M5 21v-1.5A4.5 4.5 0 0 1 9.5 15h5a4.5 4.5 0 0 1 4.5 4.5V21" /></>
+      break
     case 'logout':
       artwork = <><path d="M10 5H5v14h5" /><path d="M13 8l4 4-4 4M8 12h9" /></>
       break
@@ -5895,8 +5985,120 @@ function UiIcon({ name, className = '' }) {
   )
 }
 
-function FileBadge({ type, children }) {
-  return <span className={`file-badge badge-${type}`}>{children}</span>
+// The title is free text an athlete typed on their phone, so it can be far
+// wider than the header allows: it stays clamped to one line until clicked,
+// and the expanded form doubles as the editor. The caller keys it on the
+// session and the title, so a save or a session switch remounts it and the
+// draft never survives into a different title.
+function SessionTitleBadge({ title, expanded, onToggle, onSave }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(title)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const inputRef = useRef(null)
+
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus()
+      inputRef.current.select()
+    }
+  }, [editing])
+
+  const startEditing = () => {
+    setDraft(title)
+    setError('')
+    setEditing(true)
+  }
+
+  const commit = async () => {
+    const next = draft.trim().slice(0, 255)
+    if (next === title) { setEditing(false); return }
+    setSaving(true)
+    setError('')
+    try {
+      await onSave(next)
+      setEditing(false)
+    } catch (err) {
+      setError(err.message || 'Не удалось сохранить')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const cancel = () => {
+    setDraft(title)
+    setError('')
+    setEditing(false)
+  }
+
+  if (editing) {
+    return (
+      <span className="file-badge badge-title badge-expanded badge-title-edit">
+        <UiIcon name="tag" />
+        <input
+          ref={inputRef}
+          className="badge-title-input"
+          value={draft}
+          maxLength={255}
+          placeholder="Название сессии"
+          disabled={saving}
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') { e.preventDefault(); commit() }
+            if (e.key === 'Escape') { e.preventDefault(); cancel() }
+          }}
+        />
+        <button
+          type="button"
+          className="badge-title-act"
+          onClick={commit}
+          disabled={saving}
+          title="Сохранить (Enter)"
+        >
+          <UiIcon name={saving ? 'loader' : 'check'} />
+        </button>
+        <button
+          type="button"
+          className="badge-title-act"
+          onClick={cancel}
+          disabled={saving}
+          title="Отмена (Esc)"
+        >
+          <UiIcon name="x" />
+        </button>
+        {error && <span className="badge-title-error">{error}</span>}
+      </span>
+    )
+  }
+
+  return (
+    <span
+      className={`file-badge badge-title${expanded ? ' badge-expanded' : ''}`}
+    >
+      <button
+        type="button"
+        className="badge-title-text"
+        onClick={onToggle}
+        title={expanded ? 'Свернуть' : (title || 'Название не задано')}
+        aria-expanded={expanded}
+      >
+        <UiIcon name="tag" />
+        <span className={title ? '' : 'badge-title-empty'}>{title || 'Пусто'}</span>
+      </button>
+      <button
+        type="button"
+        className="badge-title-act"
+        onClick={startEditing}
+        title="Изменить название"
+      >
+        <UiIcon name="pencil" />
+      </button>
+    </span>
+  )
+}
+
+function FileBadge({ type, title, children }) {
+  return <span className={`file-badge badge-${type}`} title={title}>{children}</span>
 }
 
 function SessionInfoCard({ protocolName, deviceId, gapCount, gapsKnown }) {
