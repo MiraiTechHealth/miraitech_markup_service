@@ -570,6 +570,80 @@ label.lab-btn:has(input:focus-visible) {
 .badge-parquet { background: rgba(22,163,74,.3); color: #86efac }
 .badge-protocol { background: rgba(124,58,237,.32); color: #ddd6fe }
 .badge-device { background: rgba(14,165,233,.28); color: #bae6fd }
+.badge-member { background: rgba(234,179,8,.28); color: #fde68a }
+.badge-title { background: rgba(244,114,182,.24); color: #fbcfe8 }
+.badge-title { gap: 3px; padding-right: 4px }
+/* The badge is the frame; the label and the actions inside it are the buttons. */
+.badge-title-text,
+.badge-title-act {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11.5px; font-weight: 500;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+.badge-title-text {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.badge-title-text > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.badge-title-act {
+  opacity: .65;
+  padding: 1px 2px;
+  border-radius: 5px;
+  flex: 0 0 auto;
+}
+.badge-title-act:hover { opacity: 1; background: rgba(255,255,255,.14) }
+.badge-title-act:disabled { cursor: default; opacity: .4 }
+.badge-title-empty { opacity: .7; font-style: italic }
+.badge-title-input {
+  min-width: 180px;
+  flex: 1 1 auto;
+  border: 0;
+  border-bottom: 1px solid rgba(251,207,232,.5);
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11.5px; font-weight: 500;
+  padding: 0 2px 1px;
+  outline: none;
+}
+.badge-title-input::placeholder { color: rgba(251,207,232,.55) }
+.badge-title-edit { flex-wrap: wrap }
+.badge-title-error {
+  flex: 1 1 100%;
+  color: #fecaca;
+  font-size: 10.5px;
+}
+/* Expanded: unclamp and wrap so a long title is fully readable. */
+.file-badge.badge-expanded {
+  max-width: min(520px, 60vw);
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  align-items: flex-start;
+  border-radius: 10px;
+  padding: 4px 5px 4px 9px;
+}
+.file-badge.badge-expanded .badge-title-text {
+  white-space: normal;
+  overflow: visible;
+  align-items: flex-start;
+}
+.file-badge.badge-expanded .badge-title-text > span { overflow: visible }
+.file-badge.badge-expanded .ui-icon { margin-top: 2px }
 
 /* ── Toolbar (legacy, kept for compatibility) ───────────────────────── */
 .toolbar {
@@ -1890,6 +1964,12 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
   .header-right .badge-video { display: none }
   .header-right .badge-protocol,
   .header-right .badge-device { display: none }
+  .header-right .badge-member,
+  .header-right .badge-title {
+    max-width: 30vw;
+    padding: 4px 8px;
+  }
+  .header-right .badge-title.badge-expanded { max-width: 82vw }
   .header-right .badge-parquet {
     max-width: 42vw;
     padding: 4px 8px;
