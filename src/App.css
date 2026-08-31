@@ -570,6 +570,7 @@ label.lab-btn:has(input:focus-visible) {
 .badge-parquet { background: rgba(22,163,74,.3); color: #86efac }
 .badge-protocol { background: rgba(124,58,237,.32); color: #ddd6fe }
 .badge-device { background: rgba(14,165,233,.28); color: #bae6fd }
+.badge-offset { background: rgba(234,179,8,.24); color: #fde68a }
 .badge-member { background: rgba(234,179,8,.28); color: #fde68a }
 .badge-title { background: rgba(244,114,182,.24); color: #fbcfe8 }
 .badge-title { gap: 3px; padding-right: 4px }
@@ -2119,7 +2120,8 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
   }
   .header-right .badge-video { display: none }
   .header-right .badge-protocol,
-  .header-right .badge-device { display: none }
+  .header-right .badge-device,
+  .header-right .badge-offset { display: none }
   .header-right .badge-member,
   .header-right .badge-title {
     max-width: 30vw;

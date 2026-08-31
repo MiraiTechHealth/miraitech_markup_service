@@ -1882,6 +1882,30 @@ function hasSessionMetaValue(value) {
   return value != null && value !== ''
 }
 
+// sessions.time_offset is an integer number of milliseconds (the column spans
+// -3469..11221 across the DB). The sign is always explicit so a measured zero
+// reads as a real value; a NULL is filtered out by the callers instead.
+function formatTimeOffset(value) {
+  if (!hasSessionMetaValue(value)) return ''
+  const ms = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(ms)) return String(value).trim()
+  return `${ms >= 0 ? '+' : ''}${ms} ms`
+}
+
+// The S1/S2 shift that sessions.time_offset implies, in the unit the shift boxes
+// are currently reading. The sign is flipped: the column records how far the
+// device clock ran ahead, so the traces move the other way to meet the video.
+// Confirmed by hand on session 7797 (-1753 in the DB, +1753 ms on screen lines
+// the video up); the column is otherwise undocumented — the backend schema calls
+// it seconds, which the values contradict.
+function timeOffsetAsShift(value, unit) {
+  if (!hasSessionMetaValue(value)) return null
+  const ms = typeof value === 'number' ? value : Number(value)
+  if (!Number.isFinite(ms)) return null
+  const shift = -ms
+  return unit === 'ms' ? shift : Math.round(shift) / 1000
+}
+
 // The markup API fills an absent athlete with an em dash; the header badge is
 // hidden instead of showing a placeholder.
 function normalizeMemberName(value) {
@@ -2034,6 +2058,7 @@ export default function App() {
   const [sessionLabel, setSessionLabel] = useState('')
   const [sessionProtocolName, setSessionProtocolName] = useState('')
   const [sessionDeviceId, setSessionDeviceId] = useState(null)
+  const [sessionTimeOffset, setSessionTimeOffset] = useState(null)
   const [sessionMemberName, setSessionMemberName] = useState('')
   const [sessionTitle, setSessionTitle] = useState('')
   // The session id the header meta was loaded for. The input box is a draft the
@@ -2307,6 +2332,7 @@ export default function App() {
     setSessionsListLoading(false)
     setSessionProtocolName('')
     setSessionDeviceId(null)
+    setSessionTimeOffset(null)
     setSessionMemberName('')
     setSessionTitle('')
     setSessionTitleExpanded(false)
@@ -2463,6 +2489,7 @@ export default function App() {
     savedActivityFilesRef.current = []
     setSessionProtocolName('')
     setSessionDeviceId(null)
+    setSessionTimeOffset(null)
     setSessionMemberName('')
     setSessionTitle('')
     setSessionTitleExpanded(false)
@@ -2539,9 +2566,11 @@ export default function App() {
         : { additional_info: null }
       const protocolName = result.protocol_name || result.protocolName || ''
       const deviceId = result.device_id ?? result.deviceId ?? null
+      const timeOffset = result.time_offset ?? result.timeOffset ?? null
       setSessionRecordAvailable(metadataAvailable)
       setSessionProtocolName(protocolName)
       setSessionDeviceId(hasSessionMetaValue(deviceId) ? deviceId : null)
+      setSessionTimeOffset(hasSessionMetaValue(timeOffset) ? timeOffset : null)
       setSessionMemberName(normalizeMemberName(result.member_name ?? result.memberName))
       setSessionTitle(normalizeSessionTitle(result.session_title ?? result.sessionTitle))
       setLoadedSessionId(metadataAvailable ? String(sid) : '')
@@ -2553,6 +2582,9 @@ export default function App() {
       const initialMarkupFiles = contactMarkupFiles(allMarkupFiles)
       setMarkupFiles(initialMarkupFiles)
       savedActivityFilesRef.current = allMarkupFiles
+      // A saved markup carries the shift its contacts were drawn against, so it
+      // outranks the value derived from sessions.time_offset below.
+      let markupSuppliedShift = false
       if (initialMarkupFiles.length > 0) {
         const lastFile = initialMarkupFiles[initialMarkupFiles.length - 1]
         setActiveMarkupFileId(lastFile.id)
@@ -2560,6 +2592,8 @@ export default function App() {
         setRightContacts(lastFile.rightContacts || [])
         importedCsvTextRef.current = lastFile.csv || ''
         if (lastFile.meta) {
+          markupSuppliedShift = lastFile.meta.offsetS1 !== undefined
+            || lastFile.meta.offsetS2 !== undefined
           if (lastFile.meta.offsetS1 !== undefined) setOffsetS1(lastFile.meta.offsetS1)
           if (lastFile.meta.offsetS2 !== undefined) setOffsetS2(lastFile.meta.offsetS2)
           if (lastFile.meta.offsetST !== undefined) setOffsetST(lastFile.meta.offsetST)
@@ -2600,9 +2634,20 @@ export default function App() {
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
 
-      // Restored here rather than beside the other markup files: the points are
-      // stored in raw sample time, so the shift they are drawn against has to be
-      // settled before they can be placed.
+      // Pre-fill the video sync from sessions.time_offset. Applied here rather
+      // than beside the other session metadata because the shift has to be
+      // expressed in autoUnit, which is only settled at this point.
+      const autoShift = timeOffsetAsShift(timeOffset, autoUnit)
+      if (autoShift !== null && !markupSuppliedShift) {
+        setOffsetS1(autoShift)
+        setOffsetS2(autoShift)
+        offsetS1Ref.current = autoShift
+      }
+
+      // Restored after the shift above, not beside the other markup files: the
+      // points are stored in raw sample time, so whatever shift they will be
+      // drawn against has to be settled before they can be placed. The ref is
+      // written by hand there because setState has not flushed yet.
       setActivitySpans(activitySpansFromFiles(savedActivityFilesRef.current, offsetS1Ref.current))
       setSelectedActivityIdx(null)
 
@@ -3498,6 +3543,14 @@ export default function App() {
                 ? (sess.device_id ?? sess.deviceId)
                 : null
             )
+            setSessionTimeOffset(
+              hasSessionMetaValue(sess.time_offset ?? sess.timeOffset)
+                ? (sess.time_offset ?? sess.timeOffset)
+                : null
+            )
+            // No saved markup is read on this path, so nothing outranks the DB.
+            const csvShift = timeOffsetAsShift(sess.time_offset ?? sess.timeOffset, autoUnit)
+            if (csvShift !== null) { setOffsetS1(csvShift); setOffsetS2(csvShift) }
             setSessionMemberName(normalizeMemberName(sess.member_name ?? sess.memberName))
             setSessionTitle(normalizeSessionTitle(sess.session_title ?? sess.sessionTitle))
             setLoadedSessionId(String(sid))
@@ -3982,6 +4035,10 @@ export default function App() {
           setSessionRecordAvailable(true)
           setSessionProtocolName(sess.protocol_name || sess.protocolName || '')
           setSessionDeviceId(hasSessionMetaValue(sess.device_id ?? sess.deviceId) ? (sess.device_id ?? sess.deviceId) : null)
+          setSessionTimeOffset(hasSessionMetaValue(sess.time_offset ?? sess.timeOffset) ? (sess.time_offset ?? sess.timeOffset) : null)
+          // No saved markup is read on this path, so nothing outranks the DB.
+          const parquetShift = timeOffsetAsShift(sess.time_offset ?? sess.timeOffset, autoUnit)
+          if (parquetShift !== null) { setOffsetS1(parquetShift); setOffsetS2(parquetShift) }
           setSessionMemberName(normalizeMemberName(sess.member_name ?? sess.memberName))
           setSessionTitle(normalizeSessionTitle(sess.session_title ?? sess.sessionTitle))
           setLoadedSessionId(String(sid))
@@ -5069,6 +5126,11 @@ export default function App() {
           {hasSessionMetaValue(sessionDeviceId) && (
             <FileBadge type="device">device {sessionDeviceId}</FileBadge>
           )}
+          {hasSessionMetaValue(sessionTimeOffset) && (
+            <FileBadge type="offset" title="sessions.time_offset">
+              offset {formatTimeOffset(sessionTimeOffset)}
+            </FileBadge>
+          )}
           <button className="logout-btn" onClick={handleLogout} title="Выйти">
             <UiIcon name="logout" /> <span className="logout-text">Выйти</span>
           </button>
@@ -5084,6 +5146,12 @@ export default function App() {
           <span className="mobile-session-key">Device</span>
           <span className="mobile-session-val">
             {hasSessionMetaValue(sessionDeviceId) ? sessionDeviceId : '—'}
+          </span>
+        </span>
+        <span className="mobile-session-chip">
+          <span className="mobile-session-key">Offset</span>
+          <span className="mobile-session-val">
+            {hasSessionMetaValue(sessionTimeOffset) ? formatTimeOffset(sessionTimeOffset) : '—'}
           </span>
         </span>
         <span className={`mobile-session-chip${checkHzData && totalGaps > 0 ? ' mobile-session-gaps' : ''}`}>
@@ -5130,6 +5198,7 @@ export default function App() {
                   <SessionInfoCard
                     protocolName={sessionProtocolName}
                     deviceId={sessionDeviceId}
+                    timeOffset={sessionTimeOffset}
                     gapCount={totalGaps}
                     gapsKnown={Boolean(checkHzData)}
                   />
@@ -6922,7 +6991,7 @@ function FileBadge({ type, title, children }) {
   return <span className={`file-badge badge-${type}`} title={title}>{children}</span>
 }
 
-function SessionInfoCard({ protocolName, deviceId, gapCount, gapsKnown }) {
+function SessionInfoCard({ protocolName, deviceId, timeOffset, gapCount, gapsKnown }) {
   const gapsLabel = !gapsKnown ? '—' : gapCount > 0 ? String(gapCount) : 'нет'
   return (
     <div className="session-info-card" aria-label="Данные сессии">
@@ -6933,6 +7002,10 @@ function SessionInfoCard({ protocolName, deviceId, gapCount, gapsKnown }) {
       <div className="session-info-row">
         <span className="session-info-key">Device ID</span>
         <span className="session-info-val">{hasSessionMetaValue(deviceId) ? String(deviceId) : '—'}</span>
+      </div>
+      <div className="session-info-row">
+        <span className="session-info-key">Time offset</span>
+        <span className="session-info-val">{formatTimeOffset(timeOffset) || '—'}</span>
       </div>
       <div className="session-info-row">
         <span className="session-info-key">Пропуски</span>

@@ -146,7 +146,8 @@ def _list_markup_sessions(search: str | None, page_size: int) -> Dict[str, Any]:
             cursor.execute(
                 f"""
                 SELECT s.session_id, s.user_id, s.date, s.time, s.session_title,
-                       s.device_id, s.protocol_id, p.patient_name, pd.protocol_name
+                       s.device_id, s.protocol_id, s.time_offset,
+                       p.patient_name, pd.protocol_name
                 FROM {settings.DB_SCHEMA}.sessions s
                 LEFT JOIN {settings.DB_SCHEMA}.members p
                        ON p.member_id = s.member_id
@@ -172,6 +173,7 @@ def _list_markup_sessions(search: str | None, page_size: int) -> Dict[str, Any]:
                 "device_id": row.get("device_id"),
                 "protocol_id": row.get("protocol_id"),
                 "protocol_name": row.get("protocol_name"),
+                "time_offset": row.get("time_offset"),
             }
             for row in rows
         ]
@@ -189,7 +191,7 @@ def _get_markup_session(session_id: int) -> Dict[str, Any]:
                 f"""
                 SELECT s.session_id, s.user_id, s.date, s.time, s.session_title,
                        s.additional_info, s.device_id, s.protocol_id,
-                       p.patient_name, pd.protocol_name
+                       s.time_offset, p.patient_name, pd.protocol_name
                 FROM {settings.DB_SCHEMA}.sessions s
                 LEFT JOIN {settings.DB_SCHEMA}.members p
                        ON p.member_id = s.member_id
@@ -213,6 +215,7 @@ def _get_markup_session(session_id: int) -> Dict[str, Any]:
         "device_id": row.get("device_id"),
         "protocol_id": row.get("protocol_id"),
         "protocol_name": row.get("protocol_name"),
+        "time_offset": row.get("time_offset"),
         "additional_info": _parse_additional_info(row.get("additional_info")),
     }
 
