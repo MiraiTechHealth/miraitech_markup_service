@@ -213,6 +213,13 @@ const EXTRA_CALCULATORS = [
     fill: 'rgba(219,39,119,0.10)',
   },
   {
+    id: 'jump-events',
+    label: 'Jump events · по платформам',
+    description: 'Отрыв и приземление по всему телу (не по ногам) · TCN, обучен по силовым платформам',
+    color: '#0d9488',
+    fill: 'rgba(13,148,136,0.10)',
+  },
+  {
     id: 'force-jump',
     label: 'Bilateral GRF · BiLSTM+CNN',
     description: 'Пиковая вертикальная сила по двум стопам',
@@ -363,7 +370,7 @@ function calculatorEventLegend(calculator, result) {
         : kind === 'sprint'
           ? contact?.is_complete === false ? 'Неполный спринт' : 'Отрезок 30 м'
           : kind === 'flight'
-            ? `Прыжок ${foot}`
+            ? `Прыжок${footSuffix}`
             : kind === 'step'
               ? `Шаг ${foot}`
               : ['contact', 'plateau'].includes(kind)
@@ -379,6 +386,20 @@ function calculatorEventLegend(calculator, result) {
 // the left insole, ESP32_Sensor_2 the right).
 const SENSOR_COLS = ['Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4']
 const SENSOR_NAME_TO_FOOT = { ESP32_Sensor_1: 'left', ESP32_Sensor_2: 'right' }
+// Движение — это входной канал модели (one-hot), поэтому одна и та же сессия
+// под разным протоколом даёт разные события. Оператор выбирает его сам;
+// «вертикальный» по умолчанию — самый частый случай разметки и протокол, на
+// котором модель сильнее всего (F1@20мс 0.963/0.973 против 0.896/0.852 в среднем).
+const JUMP_EVENT_PROTOCOL_OPTIONS = [
+  { value: 'vert', label: 'Вертикальный' },
+  { value: 'fwd_sl', label: 'SL вперёд' },
+  { value: 'side_sl', label: 'SL вбок' },
+  { value: 'sl_hop', label: 'SL hopping' },
+  { value: 'mv3', label: 'Движение 3' },
+  { value: 'mv5', label: 'Движение 5' },
+  { value: 'mv6', label: 'Движение 6' },
+]
+
 const TURN_DETECTION_FOOT_OPTIONS = [
   { value: 'both', label: 'L+R', title: 'Наложить независимые детекции левой и правой ног' },
   { value: 'left', label: 'L', title: 'Детектировать только по левой ноге' },
@@ -2105,6 +2126,7 @@ export default function App() {
     'protocol-ttest-detector': 'both',
   })
   const [weightKg, setWeightKg] = useState('70')
+  const [jumpEventProtocol, setJumpEventProtocol] = useState('vert')
   const [imuTargetSensor, setImuTargetSensor] = useState('auto')
   const [imuProcessing, setImuProcessing] = useState(false)
   const [imuApplied, setImuApplied] = useState(false)
@@ -4174,12 +4196,15 @@ export default function App() {
     const isJumpDetector = ['jump-metrics', 'protocol-jumping-detector'].includes(calculatorId)
     const cacheHasJumpHeights = !isJumpDetector
       || cachedResult?.contacts?.every(contact => contact.jump_height_cm != null)
+    const cacheMatchesJumpProtocol = calculatorId !== 'jump-events'
+      || (cachedResult?.summary?.protocol || 'vert') === jumpEventProtocol
     const cacheMatchesDetectionFoot = !PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)
       || (cachedResult?.summary?.detection_foot || 'both') === requestedDetectionFoot
     const cacheHasSeparateFootOverlay = !PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)
       || requestedDetectionFoot !== 'both'
       || (cachedResult?.summary?.left_turn_count != null && cachedResult?.summary?.right_turn_count != null)
-    if (!force && cachedResult && cacheHasSprintSteps && cacheHasJumpHeights && cacheMatchesDetectionFoot && cacheHasSeparateFootOverlay) {
+    if (!force && cachedResult && cacheHasSprintSteps && cacheHasJumpHeights && cacheMatchesJumpProtocol
+      && cacheMatchesDetectionFoot && cacheHasSeparateFootOverlay) {
       setActiveCalculators(prev => prev.includes(calculatorId) ? prev : [...prev, calculatorId])
       return
     }
@@ -4197,6 +4222,7 @@ export default function App() {
     try {
       const payload = { columns: parquetData }
       if (calculatorId === 'force-jump') payload.weight_kg = parsedWeight
+      if (calculatorId === 'jump-events') payload.protocol = jumpEventProtocol
       if (PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)) {
         const selectedSensorName = requestedDetectionFoot === 'both'
           ? ''
@@ -4229,7 +4255,7 @@ export default function App() {
       const cadence = data.summary?.cadence_spm
       const resultText = PROTOCOL_DETECTOR_BY_ID[calculatorId]
         ? protocolDetectorSummary(data)
-        : calculatorId === 'jump-metrics'
+        : ['jump-metrics', 'jump-events'].includes(calculatorId)
           ? `${data.summary?.total_jump_count || 0} прыж. · высота ${formatMetric(data.summary?.mean_jump_height_cm, 1, ' см')}`
           : calculatorId === 'force-jump'
             ? `пик ${formatMetric(data.summary?.peak_force_n, 1, ' Н')} · ${formatMetric(data.summary?.peak_force_bw, 2, ' BW')}`
@@ -4248,7 +4274,7 @@ export default function App() {
     } finally {
       if (dataVersion === calculatorDataVersionRef.current) setCalculatorLoading('')
     }
-  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg, turnDetectionFeet, insoleSensorNames])
+  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg, jumpEventProtocol, turnDetectionFeet, insoleSensorNames])
 
   /**
    * What the chart plots: the raw columns, or the same columns with XData
@@ -5799,8 +5825,23 @@ export default function App() {
                                 />
                                 <span>для Bilateral GRF</span>
                               </div>
+                              <div className="calculator-weight-row">
+                                <label htmlFor="calculator-jump-protocol">Движение</label>
+                                <select
+                                  id="calculator-jump-protocol"
+                                  value={jumpEventProtocol}
+                                  onChange={event => setJumpEventProtocol(event.target.value)}
+                                  title="Тип прыжка подаётся модели входным каналом — от него зависят найденные события"
+                                >
+                                  {JUMP_EVENT_PROTOCOL_OPTIONS.map(option => (
+                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                  ))}
+                                </select>
+                                <span>для Jump events</span>
+                              </div>
                               <div className="calculator-model-note">
-                                Модели: <b>step_gc_model.pt</b>, <b>jump_bilstm.pt</b>, <b>jump_force_total.pt</b>
+                                Модели: <b>step_gc_model.pt</b>, <b>jump_bilstm.pt</b>, <b>jump_force_total.pt</b>,{' '}
+                                <b>new_jump_model_byAdil.pt</b>
                               </div>
                             </div>
                             {COLLAPSIBLE_EXTRA_CALCULATORS.map(calculator => {
@@ -5836,6 +5877,19 @@ export default function App() {
                                     <span className="calculator-summary" style={{ '--calculator-color': calculator.color }}>
                                       {calculator.id === 'jump-metrics'
                                         ? `${summary?.total_jump_count || 0} прыж. · высота ${formatMetric(summary?.mean_jump_height_cm, 1, ' см')} · flight ${formatMetric(summary?.left_mean_flight_time_ms, 0, ' мс')}`
+                                        : calculator.id === 'jump-events'
+                                        ? <>
+                                            <span>
+                                              {summary?.total_jump_count || 0} прыж. · высота {formatMetric(summary?.mean_jump_height_cm, 1, ' см')}
+                                              {' · макс '}{formatMetric(summary?.max_jump_height_cm, 1, ' см')}
+                                            </span>
+                                            <br />
+                                            <span>
+                                              flight {formatMetric(summary?.mean_flight_time_ms, 0, ' мс')}
+                                              {' · контакт '}{formatMetric(summary?.mean_contact_time_ms, 0, ' мс')}
+                                              {summary?.mean_rsi != null && ` · RSI ${summary.mean_rsi.toFixed(2)}`}
+                                            </span>
+                                          </>
                                         : calculator.id === 'force-jump'
                                           ? `пик ${formatMetric(summary?.peak_force_n, 1, ' Н')} · ${formatMetric(summary?.peak_force_bw, 2, ' BW')}`
                                           : <>

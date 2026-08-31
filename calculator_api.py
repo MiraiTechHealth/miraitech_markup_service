@@ -38,6 +38,7 @@ CALCULATOR_LABELS = {
     "tkeo-cadence": "TKEO Cadence",
     "step-cadence": "Step Cadence",
     "jump-metrics": "Jump BiLSTM",
+    "jump-events": "Jump events · plates",
     "force-jump": "Bilateral GRF",
     "protocol-walking-detector": "Walking Test Detector",
     "protocol-running-detector": "Running Analysis Detector",
@@ -53,6 +54,7 @@ CALCULATOR_MODELS = {
     "tkeo-cadence": "TKEO + peak detection",
     "step-cadence": "StepResUNet",
     "jump-metrics": "JumpBiLSTM",
+    "jump-events": "NewJumpModelByAdil (plate-trained TCN)",
     "force-jump": "JumpForceBW regressor",
     "protocol-walking-detector": "WalkBiLSTM contacts",
     "protocol-running-detector": "WalkBiLSTM contacts",
@@ -65,12 +67,20 @@ CALCULATOR_MODELS = {
 CALCULATOR_MODEL_FILES = {
     "step-cadence": "step_gc_model.pt",
     "jump-metrics": "jump_bilstm.pt",
+    "jump-events": "new_jump_model_byAdil.pt",
     "force-jump": "jump_force_total.pt",
     "protocol-walking-detector": "walk_gc_bilstm.pt",
     "protocol-running-detector": "walk_gc_bilstm.pt",
     "protocol-jumping-detector": "jump_bilstm.pt",
     "protocol-sprint-detector": "speed_cont_v5.pt + step_gc_model.pt",
 }
+
+# Movement one-hot the plate-trained jump model is conditioned on. It is an
+# input channel, so the same session scored under a different protocol gives
+# different events — the operator picks it, and "vert" is the default because it
+# is both the most common markup case and the protocol the model is strongest on.
+JUMP_EVENT_PROTOCOLS = ("vert", "fwd_sl", "side_sl", "sl_hop", "mv3", "mv5", "mv6")
+DEFAULT_JUMP_EVENT_PROTOCOL = "vert"
 
 PER_FOOT_TURN_DETECTOR_IDS = {
     "protocol-shuttle-detector",
@@ -521,6 +531,68 @@ def _jump_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _jump_events_result(
+    rows: List[Dict[str, Any]],
+    protocol: str = DEFAULT_JUMP_EVENT_PROTOCOL,
+) -> Dict[str, Any]:
+    """Run the plate-trained jump detector and expose its bilateral events.
+
+    Imported lazily: this model lives on a backend branch, and a checkout without
+    it should cost this one calculator, not the whole companion API.
+
+    Events here are **bilateral** — the model was trained against force plates,
+    where flight starts when the last foot leaves the ground and ends when the
+    first foot touches down. So each jump is one interval, not a left and a right
+    one, and ``foot`` is left unset: the overlay is drawn once across the chart
+    without a per-foot time shift.
+    """
+    from app.services.calculators.new_jump_model_byAdil_calculator import (
+        get_new_jump_model_byAdil_calculator,
+    )
+
+    rows = _rows_with_time_in_ms(rows)
+    calculator = get_new_jump_model_byAdil_calculator()
+    result = calculator.calculate(rows, protocol=protocol)
+
+    contacts = [
+        {
+            "foot": None,
+            "start_time_s": jump.takeoff_time_ms / 1000.0,
+            "end_time_s": jump.landing_time_ms / 1000.0,
+            "peak_time_s": jump.takeoff_time_ms / 1000.0,
+            "duration_ms": jump.flight_time_ms,
+            "jump_height_cm": _round_or_none(jump.jump_height_cm),
+            "contact_time_ms": _round_or_none(jump.contact_time_ms, 1),
+            "rsi": _round_or_none(jump.rsi, 3),
+            "kind": "flight",
+            "confidence": None,
+        }
+        for jump in result.jumps
+    ]
+
+    summary = result.summary
+    return {
+        "calculator": "jump-events",
+        "label": CALCULATOR_LABELS["jump-events"],
+        "model": CALCULATOR_MODELS["jump-events"],
+        "model_file": CALCULATOR_MODEL_FILES["jump-events"],
+        "contacts": contacts,
+        "summary": {
+            "protocol": result.protocol,
+            "total_jump_count": summary.n_jumps,
+            "event_count": summary.n_jumps,
+            "flight_count": summary.n_jumps,
+            "mean_flight_time_ms": _round_or_none(summary.mean_flight_time_ms, 1),
+            "max_flight_time_ms": _round_or_none(summary.max_flight_time_ms, 1),
+            "mean_jump_height_cm": _round_or_none(summary.mean_jump_height_cm),
+            "max_jump_height_cm": _round_or_none(summary.max_jump_height_cm),
+            "mean_contact_time_ms": _round_or_none(summary.mean_contact_time_ms, 1),
+            "mean_rsi": _round_or_none(summary.mean_rsi, 3),
+            "is_valid": bool(summary.is_valid),
+        },
+    }
+
+
 def _force_units(units: Any) -> Dict[str, Any] | None:
     """Flatten a JumpForceUnits into the markup response's scalar fields."""
     if units is None:
@@ -742,6 +814,7 @@ def _protocol_turn_detector_result(
     data: Union[pd.DataFrame, List[Dict[str, Any]]],
     detection_foot: str = "both",
     sensor_name: str | None = None,
+    protocol: str = DEFAULT_JUMP_EVENT_PROTOCOL,
 ) -> Dict[str, Any]:
     """Run one detector per requested foot; ``both`` overlays L and R results."""
     from app.schemas.turn_cod import TurnEvent
@@ -1069,6 +1142,7 @@ def _calculate(
     *,
     detection_foot: str = "both",
     sensor_name: str | None = None,
+    protocol: str = DEFAULT_JUMP_EVENT_PROTOCOL,
 ) -> Dict[str, Any]:
     if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
         return _protocol_turn_detector_result(
@@ -1083,6 +1157,8 @@ def _calculate(
         return _ttest_result(rows)
     if calculator_id == "jump-metrics":
         return _jump_result(rows)
+    if calculator_id == "jump-events":
+        return _jump_events_result(rows, protocol)
     if calculator_id in {"protocol-walking-detector", "protocol-running-detector"}:
         return _protocol_contact_detector_result(calculator_id, rows)
     if calculator_id == "protocol-jumping-detector":
@@ -1499,6 +1575,16 @@ async def calculate(
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    protocol = DEFAULT_JUMP_EVENT_PROTOCOL
+    if calculator_id == "jump-events":
+        raw_protocol = payload.get("protocol")
+        protocol = str(raw_protocol) if raw_protocol not in (None, "") else DEFAULT_JUMP_EVENT_PROTOCOL
+        if protocol not in JUMP_EVENT_PROTOCOLS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"protocol must be one of: {', '.join(JUMP_EVENT_PROTOCOLS)}",
+            )
+
     detection_foot = "both"
     sensor_name = None
     if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
@@ -1518,6 +1604,7 @@ async def calculate(
             data,
             detection_foot=detection_foot,
             sensor_name=sensor_name,
+            protocol=protocol,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc

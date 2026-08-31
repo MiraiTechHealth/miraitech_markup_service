@@ -991,7 +991,8 @@ label.lab-btn:has(input:focus-visible) {
   font-weight: 700;
   color: var(--text);
 }
-.calculator-weight-row input {
+.calculator-weight-row input,
+.calculator-weight-row select {
   width: 58px;
   padding: 3px 5px;
   border: 1.5px solid var(--border);
@@ -1000,7 +1001,14 @@ label.lab-btn:has(input:focus-visible) {
   color: var(--text);
   font-size: 11px;
 }
-.calculator-weight-row input:focus {
+/* Protocol names are words, not a two-digit weight — let the select size itself. */
+.calculator-weight-row select {
+  width: auto;
+  max-width: 140px;
+  cursor: pointer;
+}
+.calculator-weight-row input:focus,
+.calculator-weight-row select:focus {
   outline: none;
   border-color: var(--primary);
   box-shadow: 0 0 0 2px rgba(37,99,235,.12);
