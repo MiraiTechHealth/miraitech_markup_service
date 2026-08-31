@@ -1847,6 +1847,162 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
 .lab-stat-r { color: #c2410c; font-weight: 600 }
 
 /* ── Zone durations ─────────────────────────────────────────────────── */
+/* ── Activity ribbon ──────────────────────────────────────────────────────
+   Each chip and segment carries its class colour through --act-color, so the
+   swatch, the active fill and the border all stay in step with the shapes drawn
+   on the chart. */
+/* Same shape as the contact-markup button, a different active tint so the two
+   modes are told apart at a glance. */
+.act-mode-btn.active {
+  background: #e0f2fe;
+  border-color: #0284c7;
+  color: #075985;
+}
+
+.act-toolbar { flex-wrap: wrap; gap: 8px }
+
+.act-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text2);
+  border: 1.5px dashed var(--border-strong);
+  border-radius: 5px;
+  white-space: nowrap;
+}
+
+.act-kind-group { display: flex; flex-wrap: wrap; gap: 4px }
+
+.act-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 9px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: #fff;
+  border: 1.5px solid var(--border);
+  border-radius: 999px;
+  cursor: pointer;
+}
+.act-chip:hover { background: #f3f4f6 }
+.act-chip.active {
+  color: var(--act-color);
+  border-color: var(--act-color);
+  background: color-mix(in srgb, var(--act-color) 12%, #fff);
+}
+.act-swatch {
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--act-color);
+  flex: none;
+}
+
+.act-actions { display: flex; flex-wrap: wrap; gap: 4px; margin-left: auto }
+
+/* Chips flow in rows rather than stacking: one span per full-width line pushed
+   the chart off screen once a session had more than a handful of them. Declared
+   against .zone-dur-block, which sets column direction LATER in this file and
+   would otherwise win on source order alone. */
+.zone-dur-block.act-seg-block {
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-content: flex-start;
+  gap: 4px;
+  /* Enough for roughly three rows of chips; past that the list scrolls instead
+     of squeezing the chart. */
+  max-height: 92px;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Fine-tuning row for the selected span: nudge, type an exact time, or butt it
+   against the neighbour. Placing a boundary by eye is never exact, so this is
+   where a span actually gets its final edges. */
+.act-edit-row { flex-wrap: wrap; gap: 10px; align-items: center }
+
+.act-edit-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--act-color);
+}
+
+.act-edit-group { display: inline-flex; align-items: center; gap: 3px }
+
+.act-edit-lbl {
+  font-size: 11px;
+  color: var(--text2);
+  margin-right: 2px;
+}
+
+.act-edit-nudge {
+  min-width: 26px;
+  min-height: 28px;
+  padding: 0 6px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text);
+  background: #fff;
+  border: 1.5px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.act-edit-nudge:hover { background: #f3f4f6; border-color: var(--primary) }
+.act-edit-snap { font-size: 12px }
+
+.act-edit-angle .offset-input-wrap { width: 76px }
+.act-angle-unit { font-size: 12px; color: var(--text2) }
+.act-angle-none { font-size: 12px; color: var(--text2); padding: 0 6px }
+
+.act-seg-angle {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--act-color);
+  padding-left: 2px;
+}
+
+.act-edit-dur {
+  margin-left: auto;
+  font-size: 12px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text2);
+}
+
+.act-seg {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 5px;
+  padding: 3px 8px;
+  font-size: 11px;
+  color: var(--text);
+  background: #fff;
+  border: 1.5px solid var(--border);
+  border-radius: 5px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.act-seg:hover { background: #f3f4f6 }
+.act-seg.active {
+  border-color: var(--act-color);
+  background: color-mix(in srgb, var(--act-color) 14%, #fff);
+}
+.act-seg-time { color: var(--text2); font-variant-numeric: tabular-nums }
+.act-seg-dur {
+  color: var(--act-color);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
 .zone-dur-block {
   display: flex;
   flex-direction: column;

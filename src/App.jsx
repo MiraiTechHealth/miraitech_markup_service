@@ -42,6 +42,131 @@ const NON_DATA_COLS = new Set([
 ])
 const PREFERRED_COLS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'GravityZ']
 const SPEED_TRACKER = 'ESP32_SpeedTracker'
+
+// ── Activity segmentation ──────────────────────────────────────────────────
+// Free-mode recordings are labelled with independent [from, to] spans, marked
+// the way contacts are: click the start, click the end. Unmarked stretches stay
+// unlabelled rather than being guessed at, and export them with an empty
+// Activity so the training set can drop or keep them deliberately.
+const ACTIVITY_KINDS = [
+  { id: 'stand', label: 'Стоит',    color: '#64748b', key: '1' },
+  { id: 'walk',  label: 'Идёт',     color: '#2ca02c', key: '2' },
+  { id: 'run',   label: 'Бежит',    color: '#ff7f0e', key: '3' },
+  { id: 'jump',  label: 'Прыгает',  color: '#9467bd', key: '4' },
+  { id: 'turn',  label: 'Разворот', color: '#17becf', key: '5' },
+  // Putting the insoles on, walking back to the phone: real signal, but not an
+  // exercise. Kept as a label rather than a gap so the ribbon stays unbroken
+  // and the export can drop these rows deliberately.
+  { id: 'junk',  label: 'Мусор',    color: '#d62728', key: '6' },
+]
+const ACTIVITY_BY_ID = Object.fromEntries(ACTIVITY_KINDS.map(a => [a.id, a]))
+const DEFAULT_ACTIVITY = 'stand'
+const ACTIVITY_FILE_TYPE = 'activity_segments'
+
+/** markup_files holds both markups; the contact UI must not see the ribbon. */
+function contactMarkupFiles(files) {
+  return (files || []).filter(f => f.type !== ACTIVITY_FILE_TYPE)
+}
+
+/** Load stored spans back into plot time by re-adding the saved offset. */
+function activitySpansFromFiles(files, offset) {
+  const file = (files || []).find(f => f.type === ACTIVITY_FILE_TYPE)
+  if (!file || !Array.isArray(file.activitySpans)) return []
+  return file.activitySpans
+    .map(sp => ({
+      from: Number(sp.from) + offset,
+      to: Number(sp.to) + offset,
+      activity: sp.activity,
+      ...(Number.isFinite(Number(sp.angleDeg)) ? { angleDeg: Number(sp.angleDeg) } : {}),
+    }))
+    .filter(sp => Number.isFinite(sp.from) && Number.isFinite(sp.to)
+      && sp.to > sp.from && ACTIVITY_BY_ID[sp.activity])
+    .sort((a, b) => a.from - b.from)
+}
+
+/** Close the pending span at t, ordering the ends so a backwards drag works. */
+function closeActivitySpan(pendingFrom, t, activity) {
+  return {
+    from: Math.min(pendingFrom, t),
+    to: Math.max(pendingFrom, t),
+    activity,
+  }
+}
+
+/** Index of the span containing t, or -1. Later spans win where they overlap. */
+function activitySpanAt(spans, t) {
+  for (let i = spans.length - 1; i >= 0; i--) {
+    if (t >= spans[i].from && t <= spans[i].to) return i
+  }
+  return -1
+}
+
+// Hitting an exact boundary by eye is not realistic, so a new edge lands on a
+// neighbour's edge when it is within this fraction of the visible span. It is
+// relative to the zoom, not absolute, so it stays usable at every scale.
+const ACTIVITY_SNAP_FRACTION = 0.012
+
+/** Pull t onto the nearest existing edge within tolerance, else leave it be. */
+function snapActivityEdge(spans, t, tolerance, skipIndex = -1) {
+  if (!(tolerance > 0)) return t
+  let best = t
+  let bestGap = tolerance
+  spans.forEach((span, i) => {
+    if (i === skipIndex) return
+    for (const edge of [span.from, span.to]) {
+      const gap = Math.abs(edge - t)
+      if (gap < bestGap) { bestGap = gap; best = edge }
+    }
+  })
+  return best
+}
+
+/**
+ * Insert a span, carving it out of whatever it overlaps: an activity happens at
+ * one time or another, never both at once. Older spans are trimmed, split when
+ * the newcomer lands inside them, and dropped when fully covered.
+ */
+function insertActivitySpan(spans, incoming) {
+  const out = []
+  spans.forEach(span => {
+    if (span.to <= incoming.from || span.from >= incoming.to) { out.push(span); return }
+    // Covered entirely — the old span disappears.
+    if (span.from >= incoming.from && span.to <= incoming.to) return
+    // Split in two: the newcomer sits strictly inside.
+    if (span.from < incoming.from && span.to > incoming.to) {
+      out.push({ ...span, to: incoming.from })
+      out.push({ ...span, from: incoming.to })
+      return
+    }
+    out.push(span.from < incoming.from
+      ? { ...span, to: incoming.from }
+      : { ...span, from: incoming.to })
+  })
+  out.push(incoming)
+  return out.sort((a, b) => a.from - b.from)
+}
+
+/** Move one edge of a span, refusing to invert it or cross a neighbour. */
+function resizeActivitySpan(spans, index, edge, t) {
+  const span = spans[index]
+  if (!span) return spans
+  const others = spans.filter((_, i) => i !== index)
+  const MIN = 1e-6
+  let next
+  if (edge === 'from') {
+    const limit = others.reduce(
+      (acc, o) => (o.to <= span.to && o.to > acc ? o.to : acc), -Infinity)
+    next = { ...span, from: Math.min(Math.max(t, limit), span.to - MIN) }
+  } else {
+    const limit = others.reduce(
+      (acc, o) => (o.from >= span.from && o.from < acc ? o.from : acc), Infinity)
+    next = { ...span, to: Math.max(Math.min(t, limit), span.from + MIN) }
+  }
+  const copy = [...spans]
+  copy[index] = next
+  return copy
+}
+
 const ST_COLOR = '#2ca02c'
 const ST_COL_NAMES = ['Distance', 'Speed', 'DistanceM', 'VelocityMs']
 const ST_ONLY_COLS = new Set(ST_COL_NAMES)
@@ -1502,6 +1627,83 @@ function correctedXData(colMap, drift) {
   return out
 }
 
+// How far the two feet may disagree before an angle is refused. Kept very wide
+// on purpose: measured over 158 turns in five sessions, the turns a tighter
+// limit would have dropped had a median error of 2.3 degrees against the body's
+// own rotation — BETTER than the ones it kept (3.8). Feet disagreeing is normal
+// asynchrony, not a fault, and averaging already handles it, so a strict limit
+// only discards good measurements. What remains here is a guard against a board
+// that has genuinely failed, where one foot reports rotation the other never saw.
+const TURN_DISAGREEMENT_BASE_DEG = 200.0
+const TURN_DISAGREEMENT_PER_S_DEG = 40.0
+const TURN_DISAGREEMENT_MAX_DEG = 720.0
+
+/** Tolerance for the feet disagreeing over a span of the given length. */
+function turnDisagreementLimitDeg(spanMs) {
+  const seconds = Math.max(0, spanMs) / 1000
+  return Math.min(
+    TURN_DISAGREEMENT_BASE_DEG + seconds * TURN_DISAGREEMENT_PER_S_DEG,
+    TURN_DISAGREEMENT_MAX_DEG,
+  )
+}
+
+/**
+ * Net rotation over [fromMs, toMs], in degrees. Signed: positive and negative
+ * are turns in opposite directions, which a classifier wants kept apart rather
+ * than collapsed to a magnitude.
+ *
+ * Averages the two feet. They swing out of phase, so either one alone overshoots
+ * or undershoots the body by tens of degrees; the average cancels most of that,
+ * and it cancels a per-foot gyro bias too, since the drift correction splits
+ * equally with opposite signs.
+ *
+ * Measured against the body's own rotation over 139 turns in three sessions,
+ * grouped by how large the turn actually was — free-mode turns are any angle,
+ * not just 180. Median absolute error:
+ *
+ *   true angle    average   furthest foot
+ *     40-90         1-3         16-47
+ *     90-150        2-6          9-12
+ *     150+          3-5          5-10
+ *
+ * Taking the foot that rotated furthest was tried and is clearly worse: on small
+ * turns it reads one foot's overswing as the turn itself, biasing 40-90 degree
+ * turns upward by a median of +47 degrees.
+ *
+ * Null when the heading is missing, a foot has no samples inside the span, or
+ * the feet disagree so badly that the number would be meaningless.
+ */
+function turnAngleDeg(colMap, fromMs, toMs, correctedCol = null) {
+  // The corrected heading is passed in when the session has one: reading the raw
+  // XData instead would fold a few deg/s of gyro bias into every long span.
+  const source = correctedCol ? { ...colMap, XData: correctedCol } : colMap
+  const read = readYawColumns(source)
+  if (read === null) return null
+
+  const perFoot = []
+  for (const device of [YAW_LEFT_DEVICE, YAW_RIGHT_DEVICE]) {
+    const got = footYaw(read.names, read.times, read.yaw, device)
+    if (got === null) return null
+    // First and last sample inside the span; the heading is already unwrapped,
+    // so the net rotation is simply the difference between the two ends.
+    let first = -1
+    let last = -1
+    for (let i = 0; i < got.tMs.length; i++) {
+      if (got.tMs[i] < fromMs) continue
+      if (got.tMs[i] > toMs) break
+      if (first < 0) first = i
+      last = i
+    }
+    if (first < 0 || last <= first) return null
+    perFoot.push(got.yaw[last] - got.yaw[first])
+  }
+
+  // Some disagreement is normal — the feet swing out of phase — but past the
+  // span's limit one board is broken and any number would be invented.
+  if (Math.abs(perFoot[0] - perFoot[1]) > turnDisagreementLimitDeg(toMs - fromMs)) return null
+  return (perFoot[0] + perFoot[1]) / 2
+}
+
 function formatTime(s) {
   if (!isFinite(s) || s < 0) return '0:00.0'
   const m = Math.floor(s / 60)
@@ -1946,6 +2148,12 @@ export default function App() {
 
   // Labeling
   const [labelingMode, setLabelingMode]           = useState(false)
+  const [activityMode, setActivityMode]           = useState(false)
+  const [activitySpans, setActivitySpans]         = useState([])
+  // The first click of a pair, waiting for its closing click. null when idle.
+  const [pendingActivityFrom, setPendingActivityFrom] = useState(null)
+  const [currentActivity, setCurrentActivity]     = useState(DEFAULT_ACTIVITY)
+  const [selectedActivityIdx, setSelectedActivityIdx] = useState(null)
   const [currentFoot, setCurrentFoot]             = useState('left')
   const [leftContacts, setLeftContacts]           = useState([])
   const [rightContacts, setRightContacts]         = useState([])
@@ -2004,6 +2212,21 @@ export default function App() {
   const s2TraceIdxRef    = useRef([])
   const stTraceIdxRef    = useRef([])
   const selectedMarkupRef = useRef(null)
+  const activityModeRef   = useRef(false)
+  // The end of the plotted data, so the ribbon's last segment knows where to
+  // stop. Written by renderChart, which is the only place the extent is known.
+  const xMaxRef           = useRef(null)
+  // markup_files as loaded, held until the shift settles: the stored ribbon is
+  // in raw sample time and needs the offset added to land on the plot.
+  const savedActivityFilesRef = useRef([])
+  const activitySpansRef  = useRef([])
+  const pendingActivityFromRef = useRef(null)
+  // Snap tolerance in data units, refreshed from the visible x-range so it
+  // tracks the zoom: a pixel of slack is a different number of ms at each scale.
+  const activitySnapToleranceRef = useRef(0)
+  const correctedXDataColRef = useRef(null)
+  const currentActivityRef = useRef(DEFAULT_ACTIVITY)
+  const selectedActivityIdxRef = useRef(null)
   const relabelStepRef   = useRef(null)
   const subplotRangesRef = useRef({})
   const chartsLockedRef  = useRef(false)
@@ -2038,6 +2261,11 @@ export default function App() {
   useEffect(() => { anglesUnwrappedRef.current = anglesUnwrapped }, [anglesUnwrapped])
   useEffect(() => { mirrorLeftRef.current = mirrorLeft }, [mirrorLeft])
   useEffect(() => { selectedMarkupRef.current = selectedMarkup }, [selectedMarkup])
+  useEffect(() => { activityModeRef.current = activityMode }, [activityMode])
+  useEffect(() => { currentActivityRef.current = currentActivity }, [currentActivity])
+  useEffect(() => { selectedActivityIdxRef.current = selectedActivityIdx }, [selectedActivityIdx])
+  useEffect(() => { pendingActivityFromRef.current = pendingActivityFrom }, [pendingActivityFrom])
+  useEffect(() => { correctedXDataColRef.current = correctedXDataCol }, [correctedXDataCol])
   useEffect(() => { relabelStepRef.current = relabelStep }, [relabelStep])
   useEffect(() => { calculatorResultsRef.current = calculatorResults }, [calculatorResults])
   useEffect(() => { activeCalculatorsRef.current = activeCalculators }, [activeCalculators])
@@ -2175,8 +2403,10 @@ export default function App() {
     }
 
     const result = await resp.json()
-    const files = result.additional_info?.markup_files || []
+    const allFiles = result.additional_info?.markup_files || []
+    const files = contactMarkupFiles(allFiles)
     setMarkupFiles(files)
+    setActivitySpans(activitySpansFromFiles(allFiles, offsetS1Ref.current))
 
     if (restoreLatest && files.length > 0) {
       const lastFile = files[files.length - 1]
@@ -2253,6 +2483,10 @@ export default function App() {
 
     setStatus({ text: `Загружаю сессию ${sid}…`, type: 'loading' })
     setSessionLabel(`Сессия #${sid}`)
+    setActivitySpans([])
+    setPendingActivityFrom(null)
+    setSelectedActivityIdx(null)
+    savedActivityFilesRef.current = []
     setSessionProtocolName('')
     setSessionDeviceId(null)
     setSessionTimeOffset(null)
@@ -2344,8 +2578,10 @@ export default function App() {
         setMobileTab('chart')
       }
 
-      const initialMarkupFiles = result.additional_info?.markup_files || []
+      const allMarkupFiles = result.additional_info?.markup_files || []
+      const initialMarkupFiles = contactMarkupFiles(allMarkupFiles)
       setMarkupFiles(initialMarkupFiles)
+      savedActivityFilesRef.current = allMarkupFiles
       // A saved markup carries the shift its contacts were drawn against, so it
       // outranks the value derived from sessions.time_offset below.
       let markupSuppliedShift = false
@@ -2405,7 +2641,15 @@ export default function App() {
       if (autoShift !== null && !markupSuppliedShift) {
         setOffsetS1(autoShift)
         setOffsetS2(autoShift)
+        offsetS1Ref.current = autoShift
       }
+
+      // Restored after the shift above, not beside the other markup files: the
+      // points are stored in raw sample time, so whatever shift they will be
+      // drawn against has to be settled before they can be placed. The ref is
+      // written by hand there because setState has not flushed yet.
+      setActivitySpans(activitySpansFromFiles(savedActivityFilesRef.current, offsetS1Ref.current))
+      setSelectedActivityIdx(null)
 
       const gapStats = computeGapStats(colMap, tCol)
       const gapCount = Object.values(gapStats)
@@ -2476,6 +2720,36 @@ export default function App() {
             width: isSel ? 3.5 : 2,
             dash: isSel ? 'solid' : 'dot',
           },
+        })
+      }
+    }
+
+    // The activity ribbon is drawn first so the contact zones stay readable on
+    // top of it. Only its own mode shows it — the two markups are edited apart.
+    if (activityModeRef.current) {
+      const selIdx = selectedActivityIdxRef.current
+      activitySpansRef.current.forEach((span, i) => {
+        const kind = ACTIVITY_BY_ID[span.activity]
+        if (!kind) return
+        const isSel = selIdx === i
+        pushAcrossSubplots(contactShapes, {
+          type: 'rect',
+          x0: span.from, x1: span.to,
+          y0: 0, y1: 1,
+          fillcolor: kind.color + (isSel ? '55' : '2e'),
+          line: { color: kind.color, width: isSel ? 3 : 1 },
+          layer: 'below',
+        })
+      })
+      // The opening click of a pair, drawn dashed until its end is placed.
+      const pending = pendingActivityFromRef.current
+      if (pending !== null) {
+        const kind = ACTIVITY_BY_ID[currentActivityRef.current]
+        pushAcrossSubplots(contactShapes, {
+          type: 'line',
+          x0: pending, x1: pending,
+          y0: 0, y1: 1,
+          line: { color: kind ? kind.color : '#334155', width: 2.5, dash: 'dot' },
         })
       }
     }
@@ -2574,6 +2848,17 @@ export default function App() {
   }, [leftContacts, rightContacts, updateOverlayShapes])
 
   useEffect(() => {
+    activitySpansRef.current = activitySpans
+    if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
+  }, [activitySpans, updateOverlayShapes])
+
+  // Entering or leaving the mode, and moving the selection, both change what the
+  // ribbon looks like, so the overlay is rebuilt for those too.
+  useEffect(() => {
+    if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
+  }, [activityMode, selectedActivityIdx, pendingActivityFrom, currentActivity, updateOverlayShapes])
+
+  useEffect(() => {
     showLeftRef.current  = showLeftPatterns
     showRightRef.current = showRightPatterns
     if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
@@ -2625,6 +2910,160 @@ export default function App() {
     setSelectedMarkup(null)
   }, [selectedMarkup])
 
+  // ── Activity ribbon actions ───────────────────────────────────────────────
+  /** Take back the half-placed span first, then the last completed one. */
+  const undoActivitySpan = useCallback(() => {
+    if (pendingActivityFromRef.current !== null) {
+      setPendingActivityFrom(null)
+      return
+    }
+    setActivitySpans(prev => prev.slice(0, -1))
+    setSelectedActivityIdx(null)
+  }, [])
+
+  const clearActivitySpans = useCallback(() => {
+    setActivitySpans([])
+    setPendingActivityFrom(null)
+    setSelectedActivityIdx(null)
+  }, [])
+
+  const deleteSelectedActivity = useCallback(() => {
+    setActivitySpans(prev => {
+      const idx = selectedActivityIdxRef.current
+      if (idx == null || idx >= prev.length) return prev
+      return prev.filter((_, i) => i !== idx)
+    })
+    setSelectedActivityIdx(null)
+  }, [])
+
+  /**
+   * The measured turn for each span, in the same order. Only 'turn' spans get
+   * one — a heading change during a run is not a turn anyone marked — and a
+   * hand-entered angleDeg on the span wins over the measurement.
+   */
+  const spanAngles = useMemo(() => activitySpans.map(span => {
+    if (span.activity !== 'turn') return null
+    if (span.angleDeg !== undefined) return span.angleDeg
+    if (!parquetData) return null
+    const offset = offsetS1
+    return turnAngleDeg(parquetData, span.from - offset, span.to - offset, correctedXDataCol)
+  }), [activitySpans, parquetData, offsetS1, correctedXDataCol])
+
+  /** Pin an angle onto the selected span, overriding what was measured. */
+  const setActivityAngle = useCallback((deg) => {
+    setActivitySpans(prev => {
+      const idx = selectedActivityIdxRef.current
+      if (idx == null || !prev[idx]) return prev
+      const next = [...prev]
+      next[idx] = { ...next[idx], angleDeg: deg }
+      return next
+    })
+  }, [])
+
+  /** Drop a hand-entered angle so the measurement takes over again. */
+  const clearActivityAngle = useCallback(() => {
+    setActivitySpans(prev => {
+      const idx = selectedActivityIdxRef.current
+      if (idx == null || !prev[idx]) return prev
+      const next = [...prev]
+      const cleared = { ...next[idx] }
+      delete cleared.angleDeg
+      next[idx] = cleared
+      return next
+    })
+  }, [])
+
+  /** Nudge one edge of the selected span by a step in the current time unit. */
+  const nudgeActivityEdge = useCallback((edge, deltaMs) => {
+    setActivitySpans(prev => {
+      const idx = selectedActivityIdxRef.current
+      if (idx == null || !prev[idx]) return prev
+      const step = timeUnitRef.current === 'ms' ? deltaMs : deltaMs / 1000
+      return resizeActivitySpan(prev, idx, edge, prev[idx][edge] + step)
+    })
+  }, [])
+
+  /** Set one edge of the selected span to an absolute time. */
+  const setActivityEdge = useCallback((edge, value) => {
+    setActivitySpans(prev => {
+      const idx = selectedActivityIdxRef.current
+      if (idx == null || !prev[idx]) return prev
+      return resizeActivitySpan(prev, idx, edge, value)
+    })
+  }, [])
+
+  /**
+   * Close the gap between the selected span and the neighbour on that side, so
+   * two activities meet exactly instead of leaving a sliver of unlabelled data.
+   */
+  const snapActivityToNeighbour = useCallback((edge) => {
+    setActivitySpans(prev => {
+      const idx = selectedActivityIdxRef.current
+      const span = idx == null ? null : prev[idx]
+      if (!span) return prev
+      const neighbour = edge === 'from'
+        ? prev.reduce((acc, o, i) => (
+          i !== idx && o.to <= span.from && (!acc || o.to > acc.to) ? o : acc), null)
+        : prev.reduce((acc, o, i) => (
+          i !== idx && o.from >= span.to && (!acc || o.from < acc.from) ? o : acc), null)
+      if (!neighbour) return prev
+      return resizeActivitySpan(
+        prev, idx, edge, edge === 'from' ? neighbour.to : neighbour.from)
+    })
+  }, [])
+
+  /** Relabel the selected span in place, leaving its boundaries alone. */
+  const relabelSelectedActivity = useCallback((activity) => {
+    setActivitySpans(prev => {
+      const idx = selectedActivityIdxRef.current
+      if (idx == null || idx >= prev.length) return prev
+      const next = [...prev]
+      next[idx] = { ...next[idx], activity }
+      return next
+    })
+  }, [])
+
+  // Number keys pick the activity to paint with, and relabel the selected
+  // segment if there is one. Ignored while typing so the session-id box and the
+  // offset inputs keep working.
+  useEffect(() => {
+    if (!activityMode) return undefined
+    const onKey = (event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      const tag = event.target?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || event.target?.isContentEditable) return
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setPendingActivityFrom(null)
+        setSelectedActivityIdx(null)
+        return
+      }
+      // Arrows nudge the selected span's edges: plain moves the end, Shift the
+      // start, so both can be trimmed without leaving the keyboard.
+      if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+        if (selectedActivityIdxRef.current === null) return
+        event.preventDefault()
+        const delta = event.key === 'ArrowLeft' ? -100 : 100
+        nudgeActivityEdge(event.shiftKey ? 'from' : 'to', delta)
+        return
+      }
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        if (selectedActivityIdxRef.current === null) return
+        event.preventDefault()
+        deleteSelectedActivity()
+        return
+      }
+      const kind = ACTIVITY_KINDS.find(k => k.key === event.key)
+      if (!kind) return
+      event.preventDefault()
+      setCurrentActivity(kind.id)
+      if (selectedActivityIdxRef.current !== null) relabelSelectedActivity(kind.id)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [activityMode, relabelSelectedActivity, deleteSelectedActivity, nudgeActivityEdge])
+
+
   const generateCsvString = useCallback(() => {
     if (!parquetData) return ''
     const allCols = Object.keys(parquetData)
@@ -2673,6 +3112,68 @@ export default function App() {
     return hdr + '\n' + rows.join('\n')
   }, [parquetData, timeCol, sensorGroups])
 
+  /**
+   * Every sensor row plus the activity it falls in — the training set for an
+   * activity classifier. The ribbon is drawn against the shifted plot, so the
+   * same offset the traces carry is removed to get back to raw sample times;
+   * S1's offset stands in for the athlete, whose activity is not per-foot.
+   */
+  const generateActivityCsvString = useCallback(() => {
+    if (!parquetData) return ''
+    const spans = activitySpansRef.current
+    if (!spans.length) return ''
+
+    const allCols = Object.keys(parquetData)
+    const timeArr = parquetData[timeCol] || []
+    const offset = offsetS1Ref.current
+    const shifted = spans.map(span => {
+      const from = span.from - offset
+      const to = span.to - offset
+      const angle = span.activity !== 'turn'
+        ? null
+        : span.angleDeg !== undefined
+          ? span.angleDeg
+          : turnAngleDeg(parquetData, from, to, correctedXDataColRef.current)
+      return { from, to, activity: span.activity, angle }
+    })
+    // Spans are inclusive at both ends — they are placed by eye, so a sample
+    // landing exactly on a boundary belongs to that span. Unmarked stretches
+    // export a blank Activity rather than being guessed at.
+
+    // TurnAngleDeg repeats on every row of a turn span and is blank elsewhere,
+    // so a windowed model can read it off any sample it trains on.
+    const hdr = [...allCols, 'Activity', 'TurnAngleDeg'].join(',')
+    const rows = []
+    for (let i = 0; i < timeArr.length; i++) {
+      const vals = allCols.map(c => {
+        const v = parquetData[c][i]
+        return v == null ? '' : String(v)
+      })
+      const idx = activitySpanAt(shifted, safeNum(timeArr[i]) ?? NaN)
+      vals.push(idx >= 0 ? shifted[idx].activity : '')
+      vals.push(idx >= 0 && shifted[idx].angle !== null && shifted[idx].angle !== undefined
+        ? shifted[idx].angle.toFixed(1)
+        : '')
+      rows.push(vals.join(','))
+    }
+    return hdr + '\n' + rows.join('\n')
+  }, [parquetData, timeCol])
+
+  const exportActivities = useCallback(() => {
+    const csv = generateActivityCsvString()
+    if (!csv) {
+      setStatus({ text: 'Нет размеченных активностей', type: 'error' })
+      return
+    }
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href = url
+    a.download = (sessionLabel || 'session').replace(/\s+/g, '_') + '_activity.csv'
+    document.body.appendChild(a); a.click()
+    document.body.removeChild(a); URL.revokeObjectURL(url)
+  }, [generateActivityCsvString, sessionLabel])
+
   const exportLabels = useCallback(() => {
     const csv = generateCsvString()
     if (!csv) return
@@ -2709,6 +3210,88 @@ export default function App() {
       }
     }
   }, [markupFiles])
+
+  /**
+   * The ribbon is stored as its own entry in markup_files, beside the contact
+   * markups, so the two can be edited and saved without disturbing each other.
+   * Points are written in raw sample time — the plot offset is removed here and
+   * added back on load, so a later change to the shift does not move them.
+   */
+  const saveActivitiesToDb = useCallback(async () => {
+    const sid = sessionId.trim()
+    if (!sid) {
+      setStatus({ text: 'Укажите ID сессии в поле слева', type: 'error' })
+      return
+    }
+    if (!sessionRecordAvailable) {
+      setStatus({ text: 'Записи сессии в БД нет — сохранить активности нельзя', type: 'error' })
+      return
+    }
+    if (activitySpansRef.current.length === 0) {
+      setStatus({ text: 'Нет размеченных активностей', type: 'error' })
+      return
+    }
+
+    setIsSaveLoading(true)
+    try {
+      const currentSession = await fetchSessionMarkupsFromDb(sid)
+      const currentAdditionalInfo = currentSession.additional_info || {}
+      const existingFiles = Array.isArray(currentAdditionalInfo.markup_files)
+        ? [...currentAdditionalInfo.markup_files]
+        : []
+
+      const offset = offsetS1Ref.current
+      const existingIndex = existingFiles.findIndex(f => f.type === ACTIVITY_FILE_TYPE)
+      const fileId = existingIndex >= 0 ? existingFiles[existingIndex].id : `af_${Date.now()}`
+      const newFile = {
+        id: fileId,
+        filename: existingIndex >= 0
+          ? existingFiles[existingIndex].filename
+          : `activities_${sid}.json`,
+        type: ACTIVITY_FILE_TYPE,
+        updated_at: new Date().toISOString(),
+        activitySpans: activitySpansRef.current.map(sp => ({
+          from: sp.from - offset,
+          to: sp.to - offset,
+          activity: sp.activity,
+          // Only a hand-entered angle is stored; a measured one is recomputed on
+          // load, so it follows any later change to the drift correction.
+          ...(sp.angleDeg === undefined ? {} : { angleDeg: sp.angleDeg }),
+        })),
+        meta: { offsetS1: offset, timeUnit: timeUnitRef.current },
+      }
+
+      const updatedFiles = [...existingFiles]
+      if (existingIndex >= 0) updatedFiles[existingIndex] = newFile
+      else updatedFiles.push(newFile)
+
+      const resp = await fetch(`${MARKUP_API}/sessions/${sid}/additional-info`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'accept': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          additional_info: { ...currentAdditionalInfo, markup_files: updatedFiles },
+        }),
+      })
+      if (!resp.ok) {
+        const errData = await resp.json().catch(() => ({}))
+        throw new Error(parseApiError(errData, resp.status))
+      }
+      const updatedSession = await resp.json()
+      setMarkupFiles(updatedSession.additional_info?.markup_files || updatedFiles)
+      setStatus({
+        text: `✓ Активности сохранены · ${activitySpansRef.current.length} отрезк(ов)`,
+        type: 'ok',
+      })
+    } catch (err) {
+      setStatus({ text: `Ошибка сохранения активностей: ${err.message}`, type: 'error' })
+    } finally {
+      setIsSaveLoading(false)
+    }
+  }, [sessionId, sessionRecordAvailable, fetchSessionMarkupsFromDb, token])
 
   const saveMarkupToDb = useCallback(async () => {
     const sid = sessionId.trim()
@@ -3763,6 +4346,8 @@ export default function App() {
     }
     const xMin = arrayMin(allTVals)
     const xMax = arrayMax(allTVals)
+    xMaxRef.current = xMax
+    activitySnapToleranceRef.current = (xMax - xMin) * ACTIVITY_SNAP_FRACTION
 
     const n    = selectedCols.length
     const gap  = 0.03
@@ -4019,6 +4604,17 @@ export default function App() {
         return true
       }
 
+      // Zooming in should tighten the snap, so the tolerance is taken from the
+      // range on screen at click time rather than the whole recording.
+      const currentSnapTolerance = () => {
+        const range = chartDivRef.current?._fullLayout?.xaxis?.range
+        if (Array.isArray(range) && range.length >= 2) {
+          const width = Math.abs(Number(range[1]) - Number(range[0]))
+          if (Number.isFinite(width) && width > 0) return width * ACTIVITY_SNAP_FRACTION
+        }
+        return activitySnapToleranceRef.current
+      }
+
       chartDivRef.current.on('plotly_click', (d) => {
         if (!d?.points?.length) return
         const t = d.points[0].x
@@ -4044,6 +4640,27 @@ export default function App() {
             })
             setRelabelStep(null)
           }
+        } else if (activityModeRef.current) {
+          const pending = pendingActivityFromRef.current
+          const snapped = snapActivityEdge(
+            activitySpansRef.current, t, currentSnapTolerance())
+          if (pending === null) {
+            // A click inside an existing span selects it instead of starting a
+            // new one, so a mis-click can be corrected rather than stacking.
+            const hit = activitySpanAt(activitySpansRef.current, t)
+            if (hit >= 0) {
+              setSelectedActivityIdx(prev => (prev === hit ? null : hit))
+            } else {
+              setSelectedActivityIdx(null)
+              setPendingActivityFrom(snapped)
+            }
+          } else {
+            const span = closeActivitySpan(pending, snapped, currentActivityRef.current)
+            if (span.to > span.from) {
+              setActivitySpans(prev => insertActivitySpan(prev, span))
+            }
+            setPendingActivityFrom(null)
+          }
         } else if (labelingRef.current) {
           if (currentFootRef.current === 'left') setLeftContacts(p => [...p, t])
           else setRightContacts(p => [...p, t])
@@ -4060,7 +4677,7 @@ export default function App() {
       }
       const nativeChartClick = (event) => {
         if (event.target?.closest?.('.modebar')) return
-        if (relabelStepRef.current || labelingRef.current) return
+        if (relabelStepRef.current || labelingRef.current || activityModeRef.current) return
 
         const fullLayout = chartDivRef.current?._fullLayout
         const rect = chartDivRef.current?.getBoundingClientRect()
@@ -5430,11 +6047,24 @@ export default function App() {
                 <button
                   type="button"
                   className={`btn-toggle lab-mode-btn${labelingMode ? ' active' : ''}`}
-                  onClick={() => setLabelingMode(m => !m)}
+                  onClick={() => { setLabelingMode(m => !m); setActivityMode(false) }}
                   aria-pressed={labelingMode}
                   title={labelingMode ? 'Выключить режим разметки' : 'Включить режим разметки'}
                 >
                   <UiIcon name="pencil" /> {labelingMode ? 'Разметка вкл' : 'Разметка'}
+                </button>
+
+                <button
+                  type="button"
+                  className={`btn-toggle lab-mode-btn act-mode-btn${activityMode ? ' active' : ''}`}
+                  onClick={() => { setActivityMode(m => !m); setLabelingMode(false) }}
+                  aria-pressed={activityMode}
+                  disabled={!chartReady}
+                  title={activityMode
+                    ? 'Выключить разметку активностей'
+                    : 'Разметить отрезки: стоит / идёт / бежит / прыгает / разворот'}
+                >
+                  <UiIcon name="tag" /> {activityMode ? 'Активности вкл' : 'Активности'}
                 </button>
 
                 <button
@@ -5748,6 +6378,199 @@ export default function App() {
                     </div>
                   )
                 })()}
+              </div>
+            )}
+
+            {activityMode && (
+              <div className="label-toolbar-row label-toolbar-row-secondary act-toolbar">
+                <div className="act-kind-group" role="group" aria-label="Вид активности">
+                  {ACTIVITY_KINDS.map(kind => (
+                    <button
+                      key={kind.id}
+                      type="button"
+                      className={`act-chip${currentActivity === kind.id ? ' active' : ''}`}
+                      style={{ '--act-color': kind.color }}
+                      onClick={() => {
+                        setCurrentActivity(kind.id)
+                        if (selectedActivityIdx !== null) relabelSelectedActivity(kind.id)
+                      }}
+                      aria-pressed={currentActivity === kind.id}
+                      title={selectedActivityIdx !== null
+                        ? `Сменить метку выбранного отрезка на «${kind.label}»`
+                        : `Ставить отрезки «${kind.label}» (клавиша ${kind.key})`}
+                    >
+                      <span className="act-swatch" /> {kind.label}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="act-actions">
+                  <button
+                    type="button"
+                    className="btn-secondary lab-btn"
+                    onClick={undoActivitySpan}
+                    disabled={!activitySpans.length && pendingActivityFrom === null}
+                    title="Отменить незакрытый клик или убрать последний отрезок"
+                  >
+                    <UiIcon name="undo" /> Отмена
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary lab-btn"
+                    onClick={deleteSelectedActivity}
+                    disabled={selectedActivityIdx === null}
+                    title="Удалить выбранный отрезок — он сольётся с предыдущим"
+                  >
+                    Удалить отрезок
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary lab-btn"
+                    onClick={clearActivitySpans}
+                    disabled={!activitySpans.length && pendingActivityFrom === null}
+                    title="Убрать всю разметку активностей"
+                  >
+                    Очистить
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary lab-btn"
+                    onClick={saveActivitiesToDb}
+                    disabled={!activitySpans.length || isSaving}
+                    title="Сохранить активности в сессию"
+                  >
+                    <UiIcon name="database" /> В БД
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-secondary lab-btn"
+                    onClick={exportActivities}
+                    disabled={!activitySpans.length}
+                    title="Скачать CSV: все каналы плюс колонка Activity"
+                  >
+                    <UiIcon name="download" /> CSV
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {activityMode && selectedActivityIdx !== null && activitySpans[selectedActivityIdx] && (() => {
+              const span = activitySpans[selectedActivityIdx]
+              const kind = ACTIVITY_BY_ID[span.activity]
+              const STEP_MS = 100
+              const step = timeUnit === 'ms' ? STEP_MS : STEP_MS / 1000
+              return (
+                <div className="label-toolbar-row label-toolbar-row-secondary act-edit-row">
+                  <span className="act-edit-title" style={{ '--act-color': kind?.color }}>
+                    <span className="act-swatch" /> {kind?.label}
+                  </span>
+
+                  {['from', 'to'].map(edge => (
+                    <span className="act-edit-group" key={edge}>
+                      <span className="act-edit-lbl">{edge === 'from' ? 'Начало' : 'Конец'}</span>
+                      <button
+                        type="button"
+                        className="act-edit-nudge"
+                        onClick={() => nudgeActivityEdge(edge, -STEP_MS)}
+                        title={`Сдвинуть влево на ${step} ${timeUnit}`}
+                      >←</button>
+                      <OffsetInput
+                        value={Number(span[edge].toFixed(timeUnit === 'ms' ? 0 : 3))}
+                        step={step}
+                        title={edge === 'from' ? 'Время начала' : 'Время конца'}
+                        onChange={(v) => setActivityEdge(edge, v)}
+                      />
+                      <button
+                        type="button"
+                        className="act-edit-nudge"
+                        onClick={() => nudgeActivityEdge(edge, STEP_MS)}
+                        title={`Сдвинуть вправо на ${step} ${timeUnit}`}
+                      >→</button>
+                      <button
+                        type="button"
+                        className="act-edit-nudge act-edit-snap"
+                        onClick={() => snapActivityToNeighbour(edge)}
+                        title="Встык к соседнему отрезку — без щели"
+                      >⇥</button>
+                    </span>
+                  ))}
+
+                  {span.activity === 'turn' && (() => {
+                    const measured = spanAngles[selectedActivityIdx]
+                    const manual = span.angleDeg !== undefined
+                    return (
+                      <span className="act-edit-group act-edit-angle">
+                        <span className="act-edit-lbl">Угол</span>
+                        {measured === null && !manual ? (
+                          <span className="act-angle-none" title="Нет курса XData на этом отрезке, либо ноги расходятся слишком сильно">
+                            —
+                          </span>
+                        ) : (
+                          <OffsetInput
+                            value={Number((manual ? span.angleDeg : measured).toFixed(1))}
+                            step={5}
+                            title={manual
+                              ? 'Угол задан вручную'
+                              : 'Измерено по курсу обеих ног — можно перебить'}
+                            onChange={setActivityAngle}
+                          />
+                        )}
+                        <span className="act-angle-unit">°</span>
+                        {manual && (
+                          <button
+                            type="button"
+                            className="act-edit-nudge"
+                            onClick={clearActivityAngle}
+                            title="Вернуть измеренное значение"
+                          >
+                            <UiIcon name="undo" />
+                          </button>
+                        )}
+                      </span>
+                    )
+                  })()}
+
+                  <span className="act-edit-dur">
+                    {((span.to - span.from) / (timeUnit === 'ms' ? 1000 : 1)).toFixed(2)}с
+                  </span>
+                </div>
+              )
+            })()}
+
+            {activityMode && (activitySpans.length > 0 || pendingActivityFrom !== null) && (
+              <div className="zone-dur-block act-seg-block">
+                {pendingActivityFrom !== null && (
+                  <span className="act-pending">
+                    <span className="act-swatch" style={{ '--act-color': ACTIVITY_BY_ID[currentActivity]?.color }} />
+                    Кликните конец отрезка «{ACTIVITY_BY_ID[currentActivity]?.label}»
+                  </span>
+                )}
+                {activitySpans.map((span, i) => {
+                  const kind = ACTIVITY_BY_ID[span.activity]
+                  if (!kind) return null
+                  const fmt = (t) => timeUnit === 'ms' ? `${(t / 1000).toFixed(2)}с` : `${t.toFixed(2)}с`
+                  const dur = timeUnit === 'ms' ? (span.to - span.from) / 1000 : span.to - span.from
+                  return (
+                    <button
+                      key={`${span.from}-${span.to}-${i}`}
+                      type="button"
+                      className={`act-seg${selectedActivityIdx === i ? ' active' : ''}`}
+                      style={{ '--act-color': kind.color }}
+                      onClick={() => setSelectedActivityIdx(prev => (prev === i ? null : i))}
+                      title={`${kind.label}: ${fmt(span.from)} → ${fmt(span.to)}`}
+                    >
+                      <span className="act-swatch" />
+                      <b>{kind.label}</b>
+                      <span className="act-seg-time">{fmt(span.from)}</span>
+                      <span className="act-seg-dur">{dur.toFixed(1)}с</span>
+                      {spanAngles[i] !== null && spanAngles[i] !== undefined && (
+                        <span className="act-seg-angle">
+                          {spanAngles[i] > 0 ? '+' : ''}{spanAngles[i].toFixed(0)}°
+                        </span>
+                      )}
+                    </button>
+                  )
+                })}
               </div>
             )}
 
