@@ -435,6 +435,32 @@ function buildDefaultCols(numCols, hasSpeedTracker, colMap, sensorNames) {
   return merged.length ? merged : plottable.slice(0, 3)
 }
 
+const TKEO_WIN = 15
+const TKEO_PLOT_COLS = ['TKEO_AcX', 'TKEO_AcY', 'TKEO_AcZ', 'TKEO_AccMag']
+const SENSOR_SUM_RAW_COL = 'Sensor_Sum_Raw'
+const SENSOR_SUM_NORM_COL = 'Sensor_Sum_Normalized'
+
+// pandas Series.rolling(win, center=True, min_periods=1).mean() over TKEO psi.
+function tkeoSeries(x, win = TKEO_WIN) {
+  const m = x.length
+  const psi = new Array(m).fill(0)
+  if (m >= 3) {
+    for (let k = 1; k < m - 1; k++) psi[k] = x[k] * x[k] - x[k - 1] * x[k + 1]
+  }
+  const back = Math.floor(win / 2)
+  const fwd = Math.floor((win - 1) / 2)
+  const cum = new Array(m + 1)
+  cum[0] = 0
+  for (let k = 0; k < m; k++) cum[k + 1] = cum[k] + psi[k]
+  const out = new Array(m)
+  for (let k = 0; k < m; k++) {
+    const lo = Math.max(0, k - back)
+    const hi = Math.min(m - 1, k + fwd)
+    out[k] = Math.max((cum[hi + 1] - cum[lo]) / (hi - lo + 1), 0)
+  }
+  return out
+}
+
 // Derived channel: TKEO of the accel magnitude, mirroring the backend
 // (ml_speed_calculator._foot_features / build_session_parquets._tkeo):
 // psi[i] = x[i]² − x[i−1]·x[i+1], centered rolling mean over
@@ -497,6 +523,119 @@ function addAccTkeoColumn(colMap, tCol) {
   colMap['acc_tkeo'] = out
 }
 
+// Extra TKEO traces for the column picker: AcX / AcY / AcZ and
+// magg(Acc) = sqrt(AcX² + AcY² + AcZ²). Same operator as the backend
+// `_tkeo` (psi = x² − x[i−1]·x[i+1], centered rolling mean, clamp ≥ 0),
+// computed per sensor in time order.
+function addTkeoColumns(colMap, tCol) {
+  const times = colMap[tCol]
+  const names = colMap['Name']
+  if (!times) return []
+  const n = times.length
+  const sources = [
+    { col: 'TKEO_AcX', from: 'AcX' },
+    { col: 'TKEO_AcY', from: 'AcY' },
+    { col: 'TKEO_AcZ', from: 'AcZ' },
+    { col: 'TKEO_AccMag', from: 'mag' },
+  ]
+  const needed = sources.filter(s => !colMap[s.col])
+  if (!needed.length) return sources.map(s => s.col).filter(c => colMap[c])
+
+  const buffers = {}
+  needed.forEach(s => { buffers[s.col] = new Array(n).fill(null) })
+
+  const sensors = names
+    ? [...new Set(names.filter(v => v != null && v !== ''))]
+    : [null]
+
+  sensors.forEach(sensor => {
+    const idx = []
+    for (let i = 0; i < n; i++) {
+      if (sensor !== null && names[i] !== sensor) continue
+      if (safeNum(times[i]) === null) continue
+      idx.push(i)
+    }
+    if (idx.length < 3) return
+    idx.sort((a, b) => safeNum(times[a]) - safeNum(times[b]))
+
+    needed.forEach(({ col, from }) => {
+      const series = []
+      const seriesIdx = []
+      for (let k = 0; k < idx.length; k++) {
+        const i = idx[k]
+        let v = null
+        if (from === 'mag') {
+          const ax = safeNum(colMap.AcX?.[i])
+          const ay = safeNum(colMap.AcY?.[i])
+          const az = safeNum(colMap.AcZ?.[i])
+          if (ax !== null && ay !== null && az !== null) v = Math.hypot(ax, ay, az)
+        } else {
+          v = safeNum(colMap[from]?.[i])
+        }
+        if (v === null) continue
+        series.push(v)
+        seriesIdx.push(i)
+      }
+      if (series.length < 3) return
+      const tkeo = tkeoSeries(series, TKEO_WIN)
+      for (let k = 0; k < seriesIdx.length; k++) buffers[col][seriesIdx[k]] = tkeo[k]
+    })
+  })
+
+  const added = []
+  needed.forEach(({ col }) => {
+    if (buffers[col].some(v => v !== null)) {
+      colMap[col] = buffers[col]
+      added.push(col)
+    }
+  })
+  return added
+}
+
+function sumSensorColumns(colMap, sourceCols, outCol) {
+  if (colMap[outCol]) return outCol
+  if (sourceCols.some(col => !colMap[col])) return null
+  const n = colMap[sourceCols[0]].length
+  const out = new Array(n).fill(null)
+  let wrote = false
+  for (let i = 0; i < n; i++) {
+    let total = 0
+    let ok = true
+    for (let s = 0; s < sourceCols.length; s++) {
+      const v = safeNum(colMap[sourceCols[s]][i])
+      if (v === null) { ok = false; break }
+      total += v
+    }
+    if (!ok) continue
+    out[i] = total
+    wrote = true
+  }
+  if (!wrote) return null
+  colMap[outCol] = out
+  return outCol
+}
+
+function addSensorSumColumns(colMap) {
+  const added = []
+  const raw = sumSensorColumns(colMap, SENSOR_COLS, SENSOR_SUM_RAW_COL)
+  if (raw) added.push(raw)
+  const norm = sumSensorColumns(
+    colMap,
+    SENSOR_COLS.map(col => `${col}_Normalized`),
+    SENSOR_SUM_NORM_COL,
+  )
+  if (norm) added.push(norm)
+  return added
+}
+
+function addDerivedSessionColumns(colMap, tCol, additionalInfo) {
+  addAccTkeoColumn(colMap, tCol)
+  addTkeoColumns(colMap, tCol)
+  addNormalizedSensorColumns(colMap, additionalInfo)
+  addWeightedInsoleTotalColumn(colMap, tCol, additionalInfo)
+  addSensorSumColumns(colMap)
+}
+
 // A stored additional_info blob can arrive JSON-encoded one or more levels deep
 // (the backend double/triple-encodes it). Peel string layers until we reach a
 // real value or give up.
@@ -542,12 +681,13 @@ function extractInsoleCalibration(additionalInfo) {
   return { left, right }
 }
 
-// Per-timestep min-max normalization of one sensor reading into [0, 1].
+// Per-timestep min-max normalization of one sensor reading. Values outside the
+// calibration's [min, max] are left unclamped (can go <0 or >1).
 // Degenerate calibration (max <= min) contributes nothing (0).
 function normalizeSensorValue(value, mn, mx) {
   const range = mx - mn
   if (range <= 0) return 0.0
-  return Math.min(1.0, Math.max(0.0, (value - mn) / range))
+  return (value - mn) / range
 }
 
 // Derived channels: Sensor_1..4_Normalized in [0, 1]. Each row is normalized
@@ -583,6 +723,282 @@ function addNormalizedSensorColumns(colMap, additionalInfo) {
   })
 
   return added
+}
+
+// ── Weighted insole total ──────────────────────────────────────────────────
+// Derived channel `Sensor_Total_Weighted`: one summary trace per foot, because
+// reading four pressure pads at once is not how you check whether an insole saw
+// a step. Ported from the force-plate analysis notebook so a contact marked
+// against this curve here is the same curve the model is trained on.
+//
+// Per foot, over that foot's rows in time order:
+//   raw ADC → 25 Hz zero-phase Butterworth low-pass → per-pad normalization
+//   → weighted sum.
+//
+// The low-pass runs on the raw ADC *before* normalizing. Normalization is affine
+// per pad so the two commute, except for the clamp at 0 — and clamping an
+// already-smooth signal is cleaner than smoothing a truncated one.
+//
+// The sum is WEIGHTED, not the flat S1+S2+S3+S4 that `Sensor_Total` means
+// elsewhere, and the weights come from what each pad is worth against a force
+// plate. Over 58 clean single-foot stances the mean within-stance correlation of
+// one normalized pad against that plate's Fz is S4 heel +0.756, S3 arch +0.735,
+// S2 forefoot +0.541, S1 big toe +0.115 — S3 and S4 carry load across the whole
+// stance, S2 only sees push-off and S1 sees essentially nothing, which is why
+// the flat sum (+0.681) scores worse than S3 alone. Against the flat sum this
+// weighting lifts mean within-stance r to +0.763, loading-onset error 32 → 24 ms
+// median and peak-time error 72 → 59 ms. The weights are FIXED, not fitted:
+// fitted per session they disagree wildly and generalize worse held out. They
+// sum to 1, so the curve sits in the same 0..1 band as the normalized pads.
+//
+// What it does not do is reproduce Fz's double hump — it tracks the loading
+// envelope, when the foot took weight and let it go, not the M-shape inside it.
+const INSOLE_TOTAL_COL = 'Sensor_Total_Weighted'
+const INSOLE_TOTAL_WEIGHTS = { Sensor_1: 0.05, Sensor_2: 0.15, Sensor_3: 0.50, Sensor_4: 0.30 }
+
+// The pads are read by a 10-bit ADC at 500 Hz and what looks like noise on the
+// raw trace is mostly the quantization staircase, so they go through a 4th-order
+// Butterworth low-pass applied forwards and backwards — zero-phase, no group
+// delay at any frequency, which is what keeps the curve on the same clock as the
+// video and the markup. 25 Hz because noise removal saturates well below it
+// (15/25/30 Hz all land at ~0.46% jitter) while a higher cutoff keeps the peaks
+// as sharp as the data supports; measured across walking and running sessions a
+// 25 Hz cut moves gait-peak FWHM by −0.8% and apex height by +0.05%.
+const INSOLE_LP_HZ = 25.0
+const INSOLE_LP_ORDER = 4
+const INSOLE_CLOCK_MS = 2.0   // the 500 Hz insole clock these cutoffs were chosen for
+
+function medianOf(values) {
+  const sorted = [...values].sort((a, b) => a - b)
+  const mid = sorted.length >> 1
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+}
+
+// scipy.signal.butter(order, cutoffHz, 'lowpass', fs=fs, output='sos') for an
+// even order: analog Butterworth prototype poles, scaled to the pre-warped
+// cutoff, bilinear-transformed, then paired into biquads ordered by increasing
+// pole radius with the whole gain in the first section — the layout scipy emits.
+function butterLowpassSos(order, cutoffHz, fs) {
+  const wn = (2 * cutoffHz) / fs          // cutoff normalized so Nyquist = 1
+  const warped = 4 * Math.tan((Math.PI * wn) / 2)
+  const angleOf = k => (Math.PI * (-order + 1 + 2 * k)) / (2 * order)
+
+  // Prototype pole -exp(i·θ) scaled by `warped`, mapped through (4 + s)/(4 − s).
+  const poles = []
+  for (let k = 0; k < order; k++) {
+    const theta = angleOf(k)
+    const re = -Math.cos(theta) * warped
+    const im = -Math.sin(theta) * warped
+    const dRe = 4 - re, dIm = -im
+    const den = dRe * dRe + dIm * dIm
+    poles.push([((4 + re) * dRe + im * dIm) / den, (im * dRe - (4 + re) * dIm) / den])
+  }
+
+  // Gain warped**order · Re(1 / Π(4 − s_k)); the transform leaves no analog zeros.
+  let pRe = 1, pIm = 0
+  for (let k = 0; k < order; k++) {
+    const theta = angleOf(k)
+    const dRe = 4 + Math.cos(theta) * warped
+    const dIm = Math.sin(theta) * warped
+    const nRe = pRe * dRe - pIm * dIm
+    pIm = pRe * dIm + pIm * dRe
+    pRe = nRe
+  }
+  const gain = Math.pow(warped, order) * (pRe / (pRe * pRe + pIm * pIm))
+
+  const sos = poles
+    .filter(([, im]) => im > 0)
+    .sort((a, b) => (a[0] * a[0] + a[1] * a[1]) - (b[0] * b[0] + b[1] * b[1]))
+    .map(([re, im]) => [1, 2, 1, 1, -2 * re, re * re + im * im])
+  sos[0][0] *= gain
+  sos[0][1] *= gain
+  sos[0][2] *= gain
+  return sos
+}
+
+// scipy.signal.sosfilt_zi: the steady-state delays each section holds for a unit
+// step, scaled by the DC gain of the sections ahead of it.
+function sosfiltZi(sos) {
+  const zi = []
+  let scale = 1
+  sos.forEach(([b0, b1, b2, , a1, a2]) => {
+    const c0 = b1 - a1 * b0
+    const c1 = b2 - a2 * b0
+    const det = 1 + a1 + a2
+    zi.push([scale * ((c0 + c1) / det), scale * (((1 + a1) * c1 - a2 * c0) / det)])
+    scale *= (b0 + b1 + b2) / det
+  })
+  return zi
+}
+
+// scipy.signal.sosfilt with initial conditions: transposed direct form II, each
+// sample carried through every section before the next sample is read.
+function sosfilt(sos, x, zi) {
+  const out = new Float64Array(x.length)
+  const z = zi.map(([z0, z1]) => [z0, z1])
+  for (let i = 0; i < x.length; i++) {
+    let v = x[i]
+    for (let s = 0; s < sos.length; s++) {
+      const [b0, b1, b2, , a1, a2] = sos[s]
+      const y = b0 * v + z[s][0]
+      z[s][0] = b1 * v - a1 * y + z[s][1]
+      z[s][1] = b2 * v - a2 * y
+      v = y
+    }
+    out[i] = v
+  }
+  return out
+}
+
+// scipy.signal.sosfiltfilt(sos, x) at its defaults (padtype='odd', padlen=None):
+// odd-extend both ends by 3·(2·sections+1), filter forwards then backwards from
+// step-matched initial conditions, then trim the extension back off.
+function sosfiltfilt(sos, x) {
+  const n = x.length
+  const edge = 3 * (2 * sos.length + 1)
+  if (n <= edge) return Float64Array.from(x)
+
+  const ext = new Float64Array(n + 2 * edge)
+  for (let i = 0; i < edge; i++) ext[i] = 2 * x[0] - x[edge - i]
+  ext.set(x, edge)
+  for (let i = 0; i < edge; i++) ext[edge + n + i] = 2 * x[n - 1] - x[n - 2 - i]
+
+  const zi = sosfiltZi(sos)
+  const scaled = k => zi.map(([z0, z1]) => [z0 * k, z1 * k])
+
+  let y = sosfilt(sos, ext, scaled(ext[0]))
+  y.reverse()
+  y = sosfilt(sos, y, scaled(y[0]))
+  y.reverse()
+  return y.slice(edge, y.length - edge)
+}
+
+// Zero-phase low-pass one foot's four pressure channels, already in time order.
+// `fs` is read off the median sample interval rather than assumed, so a foot that
+// did not record at 500 Hz is still filtered against its own clock. A block too
+// short for the filter to settle, or one carrying a non-finite reading, comes back
+// untouched rather than mangled — filtfilt would otherwise raise, or smear a
+// single missing sample across the whole trace.
+function smoothInsole(channels, times, label) {
+  const n = times.length
+  const bail = (reason) => {
+    console.warn(`${INSOLE_TOTAL_COL} (${label}): ${reason} — leaving ${n} samples unfiltered`)
+    return channels
+  }
+  if (n < 2) return channels
+  if (times.some(v => !isFinite(v))) return bail('the time column has non-finite values')
+  if (channels.some(ch => ch.some(v => !isFinite(v)))) return bail('a pad reading is missing')
+
+  const steps = []
+  for (let i = 1; i < n; i++) steps.push(times[i] - times[i - 1])
+  const dt = medianOf(steps)
+  if (!(dt > 0)) return bail(`the median sample interval is ${dt}, not a usable clock`)
+  // Session parquet carries Time in ms; some imported files use seconds. The same
+  // test addAccTkeoColumn uses tells them apart at any plausible insole rate.
+  const dtMs = dt > 0.5 ? dt : dt * 1000
+  const fs = 1000 / dtMs
+
+  // An unexpected clock is reported rather than quietly filtered against. The
+  // tolerance is relative, unlike the notebook's exact comparison: seconds-based
+  // timestamps carry float dust that an exact test reports as half the samples
+  // being off clock, which buries the real dropped-sample case.
+  const offClock = steps.filter(s => Math.abs(s - dt) > 1e-6 * dt).length / steps.length
+  if (Math.abs(dtMs - INSOLE_CLOCK_MS) > 0.1 || offClock > 0.01) {
+    console.warn(`${INSOLE_TOTAL_COL} (${label}): clock is ${dtMs.toFixed(3)} ms `
+      + `(${fs.toFixed(0)} Hz) with ${Math.round(offClock * 100)}% of samples off it, `
+      + `not the expected ${INSOLE_CLOCK_MS} ms — filtering against ${fs.toFixed(0)} Hz`)
+  }
+  // Too low an fs is the one thing here that really would distort a trace, because
+  // the cutoff then bites far harder than the 25 Hz it claims to.
+  if (!(INSOLE_LP_HZ > 0 && INSOLE_LP_HZ < 0.5 * fs)) {
+    return bail(`${INSOLE_LP_HZ} Hz is not below this block's ${(0.5 * fs).toFixed(0)} Hz Nyquist`)
+  }
+
+  const sos = butterLowpassSos(INSOLE_LP_ORDER, INSOLE_LP_HZ, fs)
+  if (n <= 3 * (2 * sos.length + 1)) return channels   // too short for filtfilt to settle
+  return channels.map(ch => sosfiltfilt(sos, ch))
+}
+
+// The production normalizer (insole_normalization.normalize_matrix):
+// (value − min) / (max − min) per pad against the session's intake calibration,
+// clamped at 0 with no upper bound, so a reading above the calibrated max
+// legitimately exceeds 1. Unlike the Sensor_*_Normalized display channels above,
+// which deliberately leave negatives in so a drifting pad stays visible, this one
+// clamps — the weighted total has to match what the calculators see.
+function normalizeInsoleValue(value, mn, mx) {
+  const range = mx - mn
+  if (range <= 0) return 0.0
+  return Math.max((value - mn) / range, 0)
+}
+
+// Build INSOLE_TOTAL_COL into `colMap`. Returns the columns added, empty when the
+// session carries no pressure pads at all. Without calibration the curve falls
+// back to weighted raw ADC counts exactly as production does — it still shows
+// where the foot loaded, just not on a 0..1 scale.
+function addWeightedInsoleTotalColumn(colMap, tCol, additionalInfo) {
+  if (colMap[INSOLE_TOTAL_COL]) return [INSOLE_TOTAL_COL]   // parquet already carries it
+  const times = colMap[tCol]
+  if (!times || SENSOR_COLS.some(col => !colMap[col])) return []
+
+  const calib = extractInsoleCalibration(additionalInfo)
+  const names = colMap['Name']
+  const weights = SENSOR_COLS.map(col => INSOLE_TOTAL_WEIGHTS[col])
+  const n = times.length
+  const out = new Array(n).fill(null)
+  let wrote = false
+
+  // Rows of the two insoles are interleaved in a session frame, so each foot is
+  // filtered over its own rows in its own time order, as the notebook does.
+  const sensors = names
+    ? [...new Set(names.filter(v => v != null && v !== ''))]
+    : [null]
+
+  sensors.forEach(sensor => {
+    const foot = inferSensorFoot(sensor)
+    // The SpeedTracker and any unrecognised device carry no pads; they stay empty.
+    if (names && !foot) return
+    // A calibrated session missing this one foot leaves it as no-data rather than
+    // mixing a normalized foot and a raw one into the same column.
+    const footCalib = foot && calib ? calib[foot] : null
+    if (calib && !footCalib) return
+
+    const at = i => { const v = safeNum(times[i]); return v === null ? NaN : v }
+    const idx = []
+    for (let i = 0; i < n; i++) {
+      if (sensor !== null && names[i] !== sensor) continue
+      idx.push(i)
+    }
+    if (!idx.length) return
+    idx.sort((a, b) => at(a) - at(b))
+
+    const smoothed = smoothInsole(
+      SENSOR_COLS.map(col => Float64Array.from(idx, i => {
+        const v = safeNum(colMap[col][i])
+        return v === null ? NaN : v
+      })),
+      idx.map(at),
+      sensor || 'insole',
+    )
+
+    for (let k = 0; k < idx.length; k++) {
+      let total = 0
+      let ok = true
+      for (let s = 0; s < SENSOR_COLS.length; s++) {
+        const v = smoothed[s][k]
+        if (!isFinite(v)) { ok = false; break }
+        total += weights[s] * (footCalib
+          ? normalizeInsoleValue(v, footCalib.min[s], footCalib.max[s])
+          : v)
+      }
+      if (!ok) continue
+      out[idx[k]] = total
+      wrote = true
+    }
+  })
+
+  if (!wrote) return []
+  colMap[INSOLE_TOTAL_COL] = out
+  return [INSOLE_TOTAL_COL]
 }
 
 const L_FILL = 'rgba(31,119,180,0.35)'
@@ -682,8 +1098,12 @@ function unwrapAngleDegrees(arr, threshold = 180.0) {
 }
 
 const UNWRAPPABLE_ANGLE_COLUMNS = new Set(['XData', 'YData', 'ZData'])
+// The left insole is mounted mirrored relative to the right one, so its X and Y
+// accelerations point the opposite way and the two feet plot as reflections of
+// each other. Negating these channels on the left puts both feet in one frame.
+const MIRRORED_LEFT_COLUMNS = new Set(['AcX', 'AcY'])
 // Channels the IMU postprocessing rewrites — snapshotted so it can be undone.
-const IMU_SNAPSHOT_COLUMNS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'acc_tkeo']
+const IMU_SNAPSHOT_COLUMNS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'acc_tkeo', ...TKEO_PLOT_COLS]
 
 // ── Gyro yaw drift ───────────────────────────────────────────────────────────
 // A port of the backend's app/services/calculators/yaw_drift_calculator.py,
@@ -1270,6 +1690,47 @@ function chartSubplotMetrics(index, total, chartHeight) {
   }
 }
 
+function plotAxisKey(index, axis) {
+  return index === 0 ? axis : `${axis}${index + 1}`
+}
+
+function readPlotRange(eventData, axisKey) {
+  if (!eventData) return null
+  const start = eventData[`${axisKey}.range[0]`]
+  const end = eventData[`${axisKey}.range[1]`]
+  if (start !== undefined && end !== undefined) return [Number(start), Number(end)]
+  const nested = eventData[`${axisKey}.range`] ?? eventData[axisKey]?.range
+  if (Array.isArray(nested) && nested.length >= 2) return [Number(nested[0]), Number(nested[1])]
+  return null
+}
+
+function currentAxisRange(gd, axisKey) {
+  const layoutRange = gd?.layout?.[axisKey]?.range
+  if (Array.isArray(layoutRange) && layoutRange.length >= 2) {
+    return [Number(layoutRange[0]), Number(layoutRange[1])]
+  }
+  const fullRange = gd?._fullLayout?.[axisKey]?.range
+  if (Array.isArray(fullRange) && fullRange.length >= 2) {
+    return [Number(fullRange[0]), Number(fullRange[1])]
+  }
+  return null
+}
+
+function hasSessionMetaValue(value) {
+  return value != null && value !== ''
+}
+
+// The markup API fills an absent athlete with an em dash; the header badge is
+// hidden instead of showing a placeholder.
+function normalizeMemberName(value) {
+  const name = typeof value === 'string' ? value.trim() : ''
+  return name && name !== '—' ? name : ''
+}
+
+function normalizeSessionTitle(value) {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
 function getPairStartIndex(index) {
   return index - (index % 2)
 }
@@ -1410,6 +1871,14 @@ export default function App() {
   const [sessionId, setSessionId]       = useState('')
   const [loadedSessionId, setLoadedSessionId] = useState(null)
   const [sessionLabel, setSessionLabel] = useState('')
+  const [sessionProtocolName, setSessionProtocolName] = useState('')
+  const [sessionDeviceId, setSessionDeviceId] = useState(null)
+  const [sessionMemberName, setSessionMemberName] = useState('')
+  const [sessionTitle, setSessionTitle] = useState('')
+  // The session id the header meta was loaded for. The input box is a draft the
+  // user can retype, so edits must never target whatever it happens to hold.
+  const [loadedSessionId, setLoadedSessionId] = useState('')
+  const [sessionTitleExpanded, setSessionTitleExpanded] = useState(false)
   const [markupFiles, setMarkupFiles]   = useState([])
   const [activeMarkupFileId, setActiveMarkupFileId] = useState('')
   const [sessionRecordAvailable, setSessionRecordAvailable] = useState(false)
@@ -1484,6 +1953,11 @@ export default function App() {
   const [sidebarWidth, setSidebarWidth]         = useState(292)
   const [videoPanelWidth, setVideoPanelWidth]   = useState(null)
   const [labMenuOpen, setLabMenuOpen]           = useState(false)
+  const [chartsLocked, setChartsLocked]         = useState(false)
+  const [mobileTab, setMobileTab]               = useState('data')
+  const [isMobile, setIsMobile]                 = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches,
+  )
   const labMenuRef = useRef(null)
 
   // Labeling
@@ -1496,6 +1970,7 @@ export default function App() {
   const [showGaps, setShowGaps]                   = useState(false)
   const [selectedMarkup, setSelectedMarkup]       = useState(null)
   const [anglesUnwrapped, setAnglesUnwrapped]     = useState(false)
+  const [mirrorLeft, setMirrorLeft]               = useState(false)
   const [relabelStep, setRelabelStep]             = useState(null)
   // Gyro yaw drift: the estimate runs once per loaded session and both series
   // stay in memory, so the toggle swaps between them without recomputing.
@@ -1529,6 +2004,7 @@ export default function App() {
   const selectedColsRef  = useRef([])
   const columnSelectionInitializedRef = useRef(false)
   const anglesUnwrappedRef = useRef(false)
+  const mirrorLeftRef      = useRef(false)
   const isDragging       = useRef(false)
   const isVideoPan      = useRef(false)
   const vidLblRef       = useRef(null)
@@ -1546,6 +2022,7 @@ export default function App() {
   const selectedMarkupRef = useRef(null)
   const relabelStepRef   = useRef(null)
   const subplotRangesRef = useRef({})
+  const chartsLockedRef  = useRef(false)
   const chartReorderRef  = useRef(null)
   const importedCsvTextRef = useRef('')
   const skipClearImportCsvRef = useRef(false)
@@ -1575,10 +2052,20 @@ export default function App() {
   useEffect(() => { selectedColsRef.current = selectedCols }, [selectedCols])
   useEffect(() => { showGapsRef.current = showGaps }, [showGaps])
   useEffect(() => { anglesUnwrappedRef.current = anglesUnwrapped }, [anglesUnwrapped])
+  useEffect(() => { mirrorLeftRef.current = mirrorLeft }, [mirrorLeft])
   useEffect(() => { selectedMarkupRef.current = selectedMarkup }, [selectedMarkup])
   useEffect(() => { relabelStepRef.current = relabelStep }, [relabelStep])
   useEffect(() => { calculatorResultsRef.current = calculatorResults }, [calculatorResults])
   useEffect(() => { activeCalculatorsRef.current = activeCalculators }, [activeCalculators])
+  useEffect(() => { chartsLockedRef.current = chartsLocked }, [chartsLocked])
+
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 768px)')
+    const onChange = () => setIsMobile(mq.matches)
+    onChange()
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
 
   useEffect(() => {
     if (!selectedMarkup) return
@@ -1631,6 +2118,13 @@ export default function App() {
     setToken('')
     setSessionsList([])
     setSessionsListLoading(false)
+    setSessionProtocolName('')
+    setSessionDeviceId(null)
+    setSessionMemberName('')
+    setSessionTitle('')
+    setSessionTitleExpanded(false)
+    setLoadedSessionId('')
+    setSessionRecordAvailable(false)
     sessionStorage.removeItem('auth_token')
   }, [])
 
@@ -1657,7 +2151,9 @@ export default function App() {
     return sessionsList.filter(s =>
       String(s.id).includes(q) ||
       (s.member_name && s.member_name.toLowerCase().includes(q)) ||
-      (s.session_title && s.session_title.toLowerCase().includes(q))
+      (s.session_title && s.session_title.toLowerCase().includes(q)) ||
+      (s.protocol_name && s.protocol_name.toLowerCase().includes(q)) ||
+      (s.device_id != null && String(s.device_id).includes(q))
     ).slice(0, 25)
   }, [sessionsList, sessionId])
 
@@ -1736,6 +2232,32 @@ export default function App() {
     setYawFixed(false)
   }, [])
 
+  const saveSessionTitle = useCallback(async (nextTitle) => {
+    const sid = loadedSessionId
+    if (!sid) throw new Error('Сессия не загружена')
+    const resp = await fetch(`${MARKUP_API}/sessions/${sid}/title`, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': 'application/json',
+        'accept': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify({ session_title: nextTitle }),
+    })
+    if (!resp.ok) {
+      const errData = await resp.json().catch(() => ({}))
+      throw new Error(parseApiError(errData, resp.status))
+    }
+    const result = await resp.json().catch(() => ({}))
+    const saved = normalizeSessionTitle(result.session_title ?? nextTitle)
+    setSessionTitle(saved)
+    // The dropdown list was fetched once at login; keep its row in step.
+    setSessionsList(list => list.map(item => (
+      String(item.id) === sid ? { ...item, session_title: saved || null } : item
+    )))
+    setStatus({ text: '✓ Название сессии сохранено', type: 'ok' })
+  }, [loadedSessionId, token])
+
   // ── Session loader ────────────────────────────────────────────────────────
   const loadSession = useCallback(async () => {
     const sid = sessionId.trim()
@@ -1746,6 +2268,12 @@ export default function App() {
 
     setStatus({ text: `Загружаю сессию ${sid}…`, type: 'loading' })
     setSessionLabel(`Сессия #${sid}`)
+    setSessionProtocolName('')
+    setSessionDeviceId(null)
+    setSessionMemberName('')
+    setSessionTitle('')
+    setSessionTitleExpanded(false)
+    setLoadedSessionId('')
     setChartReady(false)
     plotInitRef.current = false
     if (chartDivRef.current) {
@@ -1791,6 +2319,8 @@ export default function App() {
     setSelectedMarkup(null)
     anglesUnwrappedRef.current = false
     setAnglesUnwrapped(false)
+    mirrorLeftRef.current = false
+    setMirrorLeft(false)
     resetYawDrift()
 
     try {
@@ -1814,8 +2344,17 @@ export default function App() {
       const result = metadataAvailable
         ? await metadataResp.json()
         : { additional_info: null }
+      const protocolName = result.protocol_name || result.protocolName || ''
+      const deviceId = result.device_id ?? result.deviceId ?? null
       setSessionRecordAvailable(metadataAvailable)
-      setLoadedSessionId(sid)
+      setSessionProtocolName(protocolName)
+      setSessionDeviceId(hasSessionMetaValue(deviceId) ? deviceId : null)
+      setSessionMemberName(normalizeMemberName(result.member_name ?? result.memberName))
+      setSessionTitle(normalizeSessionTitle(result.session_title ?? result.sessionTitle))
+      setLoadedSessionId(metadataAvailable ? String(sid) : '')
+      if (typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches) {
+        setMobileTab('chart')
+      }
 
       const initialMarkupFiles = result.additional_info?.markup_files || []
       setMarkupFiles(initialMarkupFiles)
@@ -1839,8 +2378,7 @@ export default function App() {
 
       const colMap = rowsToColMap(rows)
       const tCol = detectTimeCol(Object.keys(colMap))
-      addAccTkeoColumn(colMap, tCol)
-      addNormalizedSensorColumns(colMap, result.additional_info)
+      addDerivedSessionColumns(colMap, tCol, result.additional_info)
       setParquetData(colMap)
       setTimeCol(tCol)
       const drift = prepareYawDrift(colMap)
@@ -2354,13 +2892,15 @@ export default function App() {
         setCheckHzData(null)
         anglesUnwrappedRef.current = false
         setAnglesUnwrapped(false)
+        mirrorLeftRef.current = false
+        setMirrorLeft(false)
         resetYawDrift()
         subplotRangesRef.current = {}
         importedCsvTextRef.current = ''
         imuOriginalRef.current = null
         setImuApplied(false)
 
-        addAccTkeoColumn(colMap, tCol)
+        addDerivedSessionColumns(colMap, tCol, null)
         setParquetData(colMap)
         setTimeCol(tCol)
         prepareYawDrift(colMap)
@@ -2411,8 +2951,17 @@ export default function App() {
         // The session number stays optional — it only unlocks saving to the DB.
         if (sid && token) {
           try {
-            await fetchSessionMarkupsFromDb(sid)
+            const sess = await fetchSessionMarkupsFromDb(sid)
             setSessionRecordAvailable(true)
+            setSessionProtocolName(sess.protocol_name || sess.protocolName || '')
+            setSessionDeviceId(
+              hasSessionMetaValue(sess.device_id ?? sess.deviceId)
+                ? (sess.device_id ?? sess.deviceId)
+                : null
+            )
+            setSessionMemberName(normalizeMemberName(sess.member_name ?? sess.memberName))
+            setSessionTitle(normalizeSessionTitle(sess.session_title ?? sess.sessionTitle))
+            setLoadedSessionId(String(sid))
           } catch {
             setSessionRecordAvailable(false)
           }
@@ -2518,6 +3067,8 @@ export default function App() {
     setSelectedCalculatorContact(null)
     anglesUnwrappedRef.current = false
     setAnglesUnwrapped(false)
+    mirrorLeftRef.current = false
+    setMirrorLeft(false)
     // XData was rewritten, so the cached drift estimate no longer matches it.
     prepareYawDrift(colMap)
   }, [timeCol, prepareYawDrift])
@@ -2572,7 +3123,9 @@ export default function App() {
       const colMap = { ...colMapFromResp }
       // Accelerations changed, so the derived TKEO channel is rebuilt.
       delete colMap['acc_tkeo']
+      TKEO_PLOT_COLS.forEach(col => { delete colMap[col] })
       addAccTkeoColumn(colMap, timeCol)
+      addTkeoColumns(colMap, timeCol)
       applyImuColMap(colMap)
       setImuApplied(true)
 
@@ -2771,6 +3324,9 @@ export default function App() {
     setVideoName(file.name)
     setVideoPanelOpen(true)
     setCurrentTime(0)
+    if (typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches) {
+      setMobileTab('video')
+    }
   }, [])
 
   // ── Parquet loader ────────────────────────────────────────────────────────
@@ -2780,6 +3336,8 @@ export default function App() {
       : null
     setStatus({ text: `Читаю ${file.name}…`, type: 'loading' })
     setSessionLabel(file.name)
+    setSessionProtocolName('')
+    setSessionDeviceId(null)
     setChartReady(false)
     setColumnsPanelOpen(false)
     plotInitRef.current = false
@@ -2813,6 +3371,8 @@ export default function App() {
     setSelectedMarkup(null)
     anglesUnwrappedRef.current = false
     setAnglesUnwrapped(false)
+    mirrorLeftRef.current = false
+    setMirrorLeft(false)
     resetYawDrift()
     subplotRangesRef.current = {}
     importedCsvTextRef.current = ''
@@ -2831,7 +3391,7 @@ export default function App() {
 
       const colMap = rowsToColMap(rows)
       const tCol = detectTimeCol(Object.keys(colMap))
-      addAccTkeoColumn(colMap, tCol)
+      addDerivedSessionColumns(colMap, tCol, null)
       setParquetData(colMap)
       setTimeCol(tCol)
       const drift = prepareYawDrift(colMap)
@@ -2873,15 +3433,28 @@ export default function App() {
         text: `✓ ${rows.length} строк · ${numCols.length} колонок · ${autoUnit}${stHint}${gapHint}${yawHint}`,
         type: 'ok',
       })
+      if (typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches) {
+        setMobileTab('chart')
+      }
 
       const sid = sessionId.trim()
       if (sid) {
         try {
           const sess = await fetchSessionMarkupsFromDb(sid)
           setSessionRecordAvailable(true)
+          setSessionProtocolName(sess.protocol_name || sess.protocolName || '')
+          setSessionDeviceId(hasSessionMetaValue(sess.device_id ?? sess.deviceId) ? (sess.device_id ?? sess.deviceId) : null)
+          setSessionMemberName(normalizeMemberName(sess.member_name ?? sess.memberName))
+          setSessionTitle(normalizeSessionTitle(sess.session_title ?? sess.sessionTitle))
+          setLoadedSessionId(String(sid))
           // The parquet file carries no calibration; if the linked session does,
-          // derive the normalized channels now and refresh the column list.
+          // derive the normalized channels now and refresh the column list. The
+          // weighted total was built from raw counts above, so it is rebuilt too.
           if (addNormalizedSensorColumns(colMap, sess?.additional_info).length) {
+            delete colMap[INSOLE_TOTAL_COL]
+            delete colMap[SENSOR_SUM_NORM_COL]
+            addWeightedInsoleTotalColumn(colMap, tCol, sess?.additional_info)
+            addSensorSumColumns(colMap)
             setParquetData({ ...colMap })
             setColumns(computeNumericColumns(colMap, tCol))
           }
@@ -3130,7 +3703,22 @@ export default function App() {
       })
       return out
     }
-    const data1 = applyUnwrap(filterBySensors(sensorGroups.left)) || {}
+    // Only the left foot is flipped: the point is to bring it into the right
+    // foot's frame, so the right one stays as recorded.
+    const applyMirror = (d) => {
+      if (!mirrorLeftRef.current || !d) return d
+      const out = { ...d }
+      selectedCols.forEach((col) => {
+        if (MIRRORED_LEFT_COLUMNS.has(col) && out[col]) {
+          out[col] = out[col].map((v) => {
+            const n = safeNum(v)
+            return n === null ? v : -n
+          })
+        }
+      })
+      return out
+    }
+    const data1 = applyMirror(applyUnwrap(filterBySensors(sensorGroups.left))) || {}
     const data2 = sensorGroups.right.length
       ? applyUnwrap(filterBySensors(sensorGroups.right))
       : null
@@ -3346,6 +3934,11 @@ export default function App() {
       legend: { orientation: 'h', y: -0.06, font: { family: UI_FONT_FAMILY, size: 11 } },
     }
 
+    const shareX = chartsLockedRef.current && n > 1
+    const sharedXRange = shareX
+      ? (subplotRangesRef.current[selectedCols[0]]?.x || [xMin, xMax])
+      : null
+
     selectedCols.forEach((col, i) => {
       const top    = 1 - i * (subH + gap)
       const bottom = top - subH
@@ -3368,8 +3961,9 @@ export default function App() {
         title:           i === n - 1 ? { text: 'Время', font: { size: 11 } } : undefined,
         tickfont:        { size: 10 },
         showticklabels:  i === n - 1,
-        range:           subplotRangesRef.current[col]?.x || [xMin, xMax],
+        range:           sharedXRange || subplotRangesRef.current[col]?.x || [xMin, xMax],
       }
+      if (shareX && i > 0) layout[xKey].matches = 'x'
     })
 
     Plotly.newPlot(chartDivRef.current, traces, layout, {
@@ -3503,8 +4097,8 @@ export default function App() {
 
       chartDivRef.current.on('plotly_relayout', (eventData) => {
         selectedCols.forEach((col, index) => {
-          const xAxisKey = index === 0 ? 'xaxis' : `xaxis${index + 1}`
-          const yAxisKey = index === 0 ? 'yaxis' : `yaxis${index + 1}`
+          const xAxisKey = plotAxisKey(index, 'xaxis')
+          const yAxisKey = plotAxisKey(index, 'yaxis')
           const current = subplotRangesRef.current[col] || {}
           const next = { ...current }
           let changed = false
@@ -3533,9 +4127,46 @@ export default function App() {
 
           if (changed) subplotRangesRef.current[col] = next
         })
+
+        if (chartsLockedRef.current) {
+          let sharedX = null
+          selectedCols.forEach((_, index) => {
+            const x = readPlotRange(eventData, plotAxisKey(index, 'xaxis'))
+            if (x) sharedX = x
+          })
+          if (sharedX) {
+            selectedCols.forEach(col => {
+              const current = subplotRangesRef.current[col] || {}
+              subplotRangesRef.current[col] = { ...current, x: sharedX }
+            })
+          }
+        }
       })
     })
   }, [chartData, selectedCols, timeCol, sensorGroups, hasSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict])
+
+  const toggleChartsLock = useCallback(() => {
+    const next = !chartsLockedRef.current
+    chartsLockedRef.current = next
+    setChartsLocked(next)
+    const gd = chartDivRef.current
+    const cols = selectedColsRef.current
+    if (!plotInitRef.current || !gd || cols.length < 2) return
+
+    const xRange = currentAxisRange(gd, 'xaxis')
+    const updates = {}
+    cols.forEach((col, i) => {
+      const xKey = plotAxisKey(i, 'xaxis')
+      if (i > 0) updates[`${xKey}.matches`] = next ? 'x' : false
+      if (next && xRange) {
+        updates[`${xKey}.range`] = xRange
+        const current = subplotRangesRef.current[col] || {}
+        subplotRangesRef.current[col] = { ...current, x: xRange }
+      }
+    })
+    if (next && xRange) updates['xaxis.range'] = xRange
+    Plotly.relayout(gd, updates)
+  }, [])
 
   const handleToggleYawDrift = useCallback(() => {
     if (!yawDrift?.applied) return
@@ -3569,6 +4200,31 @@ export default function App() {
     renderChart()
   }, [parquetData, selectedCols, renderChart])
 
+  const mirrorableCols = useMemo(
+    () => selectedCols.filter(col => MIRRORED_LEFT_COLUMNS.has(col)),
+    [selectedCols],
+  )
+
+  /** Flip AcX/AcY of the left foot. Plot only — the stored data is untouched. */
+  const handleMirrorLeft = useCallback(() => {
+    if (!parquetData || !mirrorableCols.length) return
+    mirrorLeftRef.current = !mirrorLeftRef.current
+    setMirrorLeft(mirrorLeftRef.current)
+    renderChart()
+    setStatus(mirrorLeftRef.current
+      ? { text: `✓ Левая нога отражена · ${mirrorableCols.join(', ')} × (-1)`, type: 'ok' }
+      : { text: 'Показаны исходные AcX/AcY левой ноги', type: 'ok' })
+  }, [parquetData, mirrorableCols, renderChart])
+
+  const mirrorLeftTitle = useMemo(() => {
+    if (!mirrorableCols.length) {
+      return 'Выберите AcX или AcY — отражаются только эти каналы'
+    }
+    return mirrorLeft
+      ? `Вернуть исходные ${mirrorableCols.join(', ')} левой ноги`
+      : `Умножить ${mirrorableCols.join(', ')} левой ноги на −1 (только график)`
+  }, [mirrorLeft, mirrorableCols])
+
   useEffect(() => {
     if (!parquetData || !selectedCols.length) {
       const timeout = window.setTimeout(() => {
@@ -3584,9 +4240,12 @@ export default function App() {
 
   useEffect(() => {
     if (!chartReady || !chartDivRef.current) return undefined
-    const timeout = window.setTimeout(() => Plotly.Plots.resize(chartDivRef.current), 30)
+    const delay = isMobile && mobileTab === 'chart' ? 80 : 30
+    const timeout = window.setTimeout(() => {
+      if (chartDivRef.current) Plotly.Plots.resize(chartDivRef.current)
+    }, delay)
     return () => window.clearTimeout(timeout)
-  }, [chartReady, sidebarWidth, videoPanelOpen, videoPanelWidth])
+  }, [chartReady, sidebarWidth, videoPanelOpen, videoPanelWidth, mobileTab, isMobile])
 
   // ── Video timeupdate → move chart cursor ──────────────────────────────────
   const handleTimeUpdate = useCallback(() => {
@@ -3809,7 +4468,7 @@ export default function App() {
 
   return (
     <div
-      className={`app${dragOver ? ' drag-over' : ''}`}
+      className={`app${dragOver ? ' drag-over' : ''}${isMobile ? ` mobile-tab-${mobileTab}` : ''}`}
       onDrop={e => { e.preventDefault(); setDragOver(false); handleFiles(e.dataTransfer.files) }}
       onDragOver={e => { e.preventDefault(); setDragOver(true) }}
       onDragLeave={() => setDragOver(false)}
@@ -3824,14 +4483,53 @@ export default function App() {
           {videoName && (
             <FileBadge type="video"><UiIcon name="video" /> {videoName}</FileBadge>
           )}
+          {sessionRecordAvailable && loadedSessionId && (
+            <SessionTitleBadge
+              key={`${loadedSessionId}:${sessionTitle}`}
+              title={sessionTitle}
+              expanded={sessionTitleExpanded}
+              onToggle={() => setSessionTitleExpanded(v => !v)}
+              onSave={saveSessionTitle}
+            />
+          )}
+          {sessionMemberName && (
+            <FileBadge type="member" title={sessionMemberName}>
+              <UiIcon name="user" /> {sessionMemberName}
+            </FileBadge>
+          )}
           {sessionLabel && (
             <FileBadge type="parquet"><UiIcon name="database" /> {sessionLabel}</FileBadge>
+          )}
+          {sessionProtocolName && (
+            <FileBadge type="protocol">{sessionProtocolName}</FileBadge>
+          )}
+          {hasSessionMetaValue(sessionDeviceId) && (
+            <FileBadge type="device">device {sessionDeviceId}</FileBadge>
           )}
           <button className="logout-btn" onClick={handleLogout} title="Выйти">
             <UiIcon name="logout" /> <span className="logout-text">Выйти</span>
           </button>
         </div>
       </header>
+
+      <div className="mobile-session-strip" aria-label="Сведения о сессии">
+        <span className="mobile-session-chip">
+          <span className="mobile-session-key">Протокол</span>
+          <span className="mobile-session-val">{sessionProtocolName || '—'}</span>
+        </span>
+        <span className="mobile-session-chip mobile-session-device">
+          <span className="mobile-session-key">Device</span>
+          <span className="mobile-session-val">
+            {hasSessionMetaValue(sessionDeviceId) ? sessionDeviceId : '—'}
+          </span>
+        </span>
+        <span className={`mobile-session-chip${checkHzData && totalGaps > 0 ? ' mobile-session-gaps' : ''}`}>
+          <span className="mobile-session-key">Пропуски</span>
+          <span className="mobile-session-val">
+            {!checkHzData ? '—' : totalGaps > 0 ? totalGaps : 'нет'}
+          </span>
+        </span>
+      </div>
 
       <div className={`app-body${sidebarCollapsed ? ' sidebar-collapsed' : ''}`}>
         <aside className="sidebar" style={sidebarCollapsed ? undefined : { width: sidebarWidth }}>
@@ -3846,7 +4544,7 @@ export default function App() {
             {sidebarCollapsed ? '▶' : '◀'}
           </button>
 
-          {!sidebarCollapsed && (
+          {(!sidebarCollapsed || isMobile) && (
             <div className="sidebar-scroll">
               <SidebarSection
                 title="1. Данные"
@@ -3865,6 +4563,13 @@ export default function App() {
                       <UiIcon name="file-table" /> CSV
                     </UploadBtn>
                   </div>
+
+                  <SessionInfoCard
+                    protocolName={sessionProtocolName}
+                    deviceId={sessionDeviceId}
+                    gapCount={totalGaps}
+                    gapsKnown={Boolean(checkHzData)}
+                  />
 
                   <div className="sidebar-field">
                     <span className="sidebar-field-lbl">Сессия</span>
@@ -3899,6 +4604,7 @@ export default function App() {
                               >
                                 <span className="sdi-id">#{s.id}</span>
                                 <span className="sdi-name">{s.member_name || '—'}</span>
+                                {s.protocol_name && <span className="sdi-protocol">{s.protocol_name}</span>}
                                 {s.date && <span className="sdi-date">{s.date.slice(0, 10)}</span>}
                               </li>
                             ))}
@@ -4680,6 +5386,23 @@ export default function App() {
               <div className="label-toolbar-group">
                 <button
                   type="button"
+                  className={`btn-toggle charts-lock-btn${chartsLocked ? ' active' : ''}`}
+                  onClick={toggleChartsLock}
+                  disabled={!chartReady || selectedCols.length < 2}
+                  aria-pressed={chartsLocked}
+                  title={
+                    selectedCols.length < 2
+                      ? 'Выберите несколько графиков, чтобы двигать их вместе'
+                      : chartsLocked
+                        ? 'Открепить: каждый график двигается отдельно'
+                        : 'Закрепить: масштабирование и сдвиг по времени на всех графиках сразу'
+                  }
+                >
+                  <UiIcon name="pin" /> Закрепить
+                </button>
+
+                <button
+                  type="button"
                   className={`btn-toggle video-panel-toggle${videoPanelOpen ? ' active' : ''}`}
                   onClick={toggleVideoPanel}
                   aria-pressed={videoPanelOpen}
@@ -4780,6 +5503,17 @@ export default function App() {
                         <span className="yaw-drift-note">{yawDrift.reason}</span>
                       )}
                     </span>
+                    <button
+                      type="button"
+                      className={`btn-secondary btn-unwrap${mirrorLeft ? ' active' : ''}`}
+                      disabled={!mirrorableCols.length}
+                      onClick={handleMirrorLeft}
+                      aria-pressed={mirrorLeft}
+                      title={mirrorLeftTitle}
+                      aria-label={mirrorLeftTitle}
+                    >
+                      <UiIcon name="mirror" /> Отразить
+                    </button>
                   </div>
                 )}
 
@@ -5144,6 +5878,33 @@ export default function App() {
           <div className="drag-box">⬇<p>Видео, .parquet или размеченный .csv</p></div>
         </div>
       )}
+
+      <nav className="mobile-tabbar" aria-label="Разделы">
+        <button
+          type="button"
+          className={mobileTab === 'data' ? 'active' : ''}
+          onClick={() => setMobileTab('data')}
+        >
+          <UiIcon name="database" />
+          <span>Данные</span>
+        </button>
+        <button
+          type="button"
+          className={mobileTab === 'video' ? 'active' : ''}
+          onClick={() => setMobileTab('video')}
+        >
+          <UiIcon name="video" />
+          <span>Видео</span>
+        </button>
+        <button
+          type="button"
+          className={mobileTab === 'chart' ? 'active' : ''}
+          onClick={() => setMobileTab('chart')}
+        >
+          <UiIcon name="chart" />
+          <span>График</span>
+        </button>
+      </nav>
     </div>
   )
 }
@@ -5219,6 +5980,21 @@ function UiIcon({ name, className = '' }) {
     case 'grip':
       artwork = <><circle cx="9" cy="6" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="6" r="1" fill="currentColor" stroke="none" /><circle cx="9" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="9" cy="18" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="18" r="1" fill="currentColor" stroke="none" /></>
       break
+    case 'pin':
+      artwork = <><path d="M12 17v5" /><path d="M9 3h6l1 7 3 3H5l3-3z" /></>
+      break
+    case 'chart':
+      artwork = <><path d="M4 19h16" /><path d="M7 16v-6" /><path d="M12 16V8" /><path d="M17 16v-9" /></>
+      break
+    case 'check':
+      artwork = <path d="m5 13 4 4 10-11" />
+      break
+    case 'tag':
+      artwork = <><path d="M11 3H4v7l10 10 7-7z" /><circle cx="7.5" cy="6.5" r="1.2" /></>
+      break
+    case 'user':
+      artwork = <><circle cx="12" cy="8" r="4" /><path d="M5 21v-1.5A4.5 4.5 0 0 1 9.5 15h5a4.5 4.5 0 0 1 4.5 4.5V21" /></>
+      break
     case 'logout':
       artwork = <><path d="M10 5H5v14h5" /><path d="M13 8l4 4-4 4M8 12h9" /></>
       break
@@ -5236,6 +6012,9 @@ function UiIcon({ name, className = '' }) {
       break
     case 'ruler':
       artwork = <><path d="m4 15 11-11 5 5-11 11H4z" /><path d="m12 7 2 2M9 10l2 2M6 13l2 2" /></>
+      break
+    case 'mirror':
+      artwork = <><path d="M12 3v18" strokeDasharray="3 3" /><path d="M9 8 4 12l5 4z" /><path d="m15 8 5 4-5 4z" /></>
       break
     case 'x':
       artwork = <path d="m6 6 12 12M18 6 6 18" />
@@ -5258,8 +6037,142 @@ function UiIcon({ name, className = '' }) {
   )
 }
 
-function FileBadge({ type, children }) {
-  return <span className={`file-badge badge-${type}`}>{children}</span>
+// The title is free text an athlete typed on their phone, so it can be far
+// wider than the header allows: it stays clamped to one line until clicked,
+// and the expanded form doubles as the editor. The caller keys it on the
+// session and the title, so a save or a session switch remounts it and the
+// draft never survives into a different title.
+function SessionTitleBadge({ title, expanded, onToggle, onSave }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(title)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+  const inputRef = useRef(null)
+
+  useEffect(() => {
+    if (editing && inputRef.current) {
+      inputRef.current.focus()
+      inputRef.current.select()
+    }
+  }, [editing])
+
+  const startEditing = () => {
+    setDraft(title)
+    setError('')
+    setEditing(true)
+  }
+
+  const commit = async () => {
+    const next = draft.trim().slice(0, 255)
+    if (next === title) { setEditing(false); return }
+    setSaving(true)
+    setError('')
+    try {
+      await onSave(next)
+      setEditing(false)
+    } catch (err) {
+      setError(err.message || 'Не удалось сохранить')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const cancel = () => {
+    setDraft(title)
+    setError('')
+    setEditing(false)
+  }
+
+  if (editing) {
+    return (
+      <span className="file-badge badge-title badge-expanded badge-title-edit">
+        <UiIcon name="tag" />
+        <input
+          ref={inputRef}
+          className="badge-title-input"
+          value={draft}
+          maxLength={255}
+          placeholder="Название сессии"
+          disabled={saving}
+          onChange={e => setDraft(e.target.value)}
+          onKeyDown={e => {
+            if (e.key === 'Enter') { e.preventDefault(); commit() }
+            if (e.key === 'Escape') { e.preventDefault(); cancel() }
+          }}
+        />
+        <button
+          type="button"
+          className="badge-title-act"
+          onClick={commit}
+          disabled={saving}
+          title="Сохранить (Enter)"
+        >
+          <UiIcon name={saving ? 'loader' : 'check'} />
+        </button>
+        <button
+          type="button"
+          className="badge-title-act"
+          onClick={cancel}
+          disabled={saving}
+          title="Отмена (Esc)"
+        >
+          <UiIcon name="x" />
+        </button>
+        {error && <span className="badge-title-error">{error}</span>}
+      </span>
+    )
+  }
+
+  return (
+    <span
+      className={`file-badge badge-title${expanded ? ' badge-expanded' : ''}`}
+    >
+      <button
+        type="button"
+        className="badge-title-text"
+        onClick={onToggle}
+        title={expanded ? 'Свернуть' : (title || 'Название не задано')}
+        aria-expanded={expanded}
+      >
+        <UiIcon name="tag" />
+        <span className={title ? '' : 'badge-title-empty'}>{title || 'Пусто'}</span>
+      </button>
+      <button
+        type="button"
+        className="badge-title-act"
+        onClick={startEditing}
+        title="Изменить название"
+      >
+        <UiIcon name="pencil" />
+      </button>
+    </span>
+  )
+}
+
+function FileBadge({ type, title, children }) {
+  return <span className={`file-badge badge-${type}`} title={title}>{children}</span>
+}
+
+function SessionInfoCard({ protocolName, deviceId, gapCount, gapsKnown }) {
+  const gapsLabel = !gapsKnown ? '—' : gapCount > 0 ? String(gapCount) : 'нет'
+  return (
+    <div className="session-info-card" aria-label="Данные сессии">
+      <div className="session-info-row">
+        <span className="session-info-key">Протокол</span>
+        <span className="session-info-val">{protocolName || '—'}</span>
+      </div>
+      <div className="session-info-row">
+        <span className="session-info-key">Device ID</span>
+        <span className="session-info-val">{hasSessionMetaValue(deviceId) ? String(deviceId) : '—'}</span>
+      </div>
+      <div className="session-info-row">
+        <span className="session-info-key">Пропуски</span>
+        <span className={`session-info-val${gapsKnown && gapCount > 0 ? ' session-info-warn' : ''}`}>
+          {gapsLabel}
+        </span>
+      </div>
+    </div>
+  )
 }
 
 function OffsetInput({ value, step, title, onChange }) {

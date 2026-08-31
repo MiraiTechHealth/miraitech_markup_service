@@ -568,6 +568,82 @@ label.lab-btn:has(input:focus-visible) {
 }
 .badge-video   { background: rgba(37,99,235,.3); color: #93c5fd }
 .badge-parquet { background: rgba(22,163,74,.3); color: #86efac }
+.badge-protocol { background: rgba(124,58,237,.32); color: #ddd6fe }
+.badge-device { background: rgba(14,165,233,.28); color: #bae6fd }
+.badge-member { background: rgba(234,179,8,.28); color: #fde68a }
+.badge-title { background: rgba(244,114,182,.24); color: #fbcfe8 }
+.badge-title { gap: 3px; padding-right: 4px }
+/* The badge is the frame; the label and the actions inside it are the buttons. */
+.badge-title-text,
+.badge-title-act {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11.5px; font-weight: 500;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+}
+.badge-title-text {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.badge-title-text > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.badge-title-act {
+  opacity: .65;
+  padding: 1px 2px;
+  border-radius: 5px;
+  flex: 0 0 auto;
+}
+.badge-title-act:hover { opacity: 1; background: rgba(255,255,255,.14) }
+.badge-title-act:disabled { cursor: default; opacity: .4 }
+.badge-title-empty { opacity: .7; font-style: italic }
+.badge-title-input {
+  min-width: 180px;
+  flex: 1 1 auto;
+  border: 0;
+  border-bottom: 1px solid rgba(251,207,232,.5);
+  background: none;
+  color: inherit;
+  font-family: inherit;
+  font-size: 11.5px; font-weight: 500;
+  padding: 0 2px 1px;
+  outline: none;
+}
+.badge-title-input::placeholder { color: rgba(251,207,232,.55) }
+.badge-title-edit { flex-wrap: wrap }
+.badge-title-error {
+  flex: 1 1 100%;
+  color: #fecaca;
+  font-size: 10.5px;
+}
+/* Expanded: unclamp and wrap so a long title is fully readable. */
+.file-badge.badge-expanded {
+  max-width: min(520px, 60vw);
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  align-items: flex-start;
+  border-radius: 10px;
+  padding: 4px 5px 4px 9px;
+}
+.file-badge.badge-expanded .badge-title-text {
+  white-space: normal;
+  overflow: visible;
+  align-items: flex-start;
+}
+.file-badge.badge-expanded .badge-title-text > span { overflow: visible }
+.file-badge.badge-expanded .ui-icon { margin-top: 2px }
 
 /* ── Toolbar (legacy, kept for compatibility) ───────────────────────── */
 .toolbar {
@@ -1480,6 +1556,40 @@ label.lab-btn:has(input:focus-visible) {
   font-weight: 600;
 }
 
+.charts-lock-btn {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border: 1.5px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text2);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color .12s, background .12s, color .12s, box-shadow .12s;
+}
+.charts-lock-btn:hover:not(:disabled) {
+  border-color: var(--primary);
+  color: var(--text);
+  box-shadow: 0 1px 2px rgba(15,23,42,.08);
+}
+.charts-lock-btn.active {
+  border-color: #93c5fd;
+  background: #dbeafe;
+  color: #1d4ed8;
+  font-weight: 700;
+}
+.charts-lock-btn:disabled {
+  opacity: .4;
+  cursor: not-allowed;
+}
+
 .lab-stat-inline {
   margin-left: 0;
 }
@@ -1817,24 +1927,22 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
 
 @media (max-width: 768px) {
   html, body, #root {
-    min-height: 100%;
-    height: auto;
-    overflow: visible;
+    height: 100%;
+    overflow: hidden;
   }
-  body { overflow-y: auto }
+  body { overflow: hidden; overscroll-behavior: none }
   .app {
-    height: auto;
+    height: 100dvh;
     min-height: 100dvh;
-    overflow: visible;
+    overflow: hidden;
   }
   .header {
-    position: sticky;
-    top: 0;
     z-index: 500;
     min-height: 52px;
     height: auto;
-    padding: 7px 10px;
+    padding: 8px 10px;
     gap: 8px;
+    flex-wrap: wrap;
   }
   .header-left {
     min-width: 0;
@@ -1848,14 +1956,72 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
   }
   .header-right {
     display: flex;
-    flex-wrap: nowrap;
-    flex-shrink: 0;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    max-width: 100%;
+    gap: 5px;
   }
   .header-right .badge-video { display: none }
-  .header-right .badge-parquet {
-    max-width: 126px;
-    padding: 4px 7px;
+  .header-right .badge-protocol,
+  .header-right .badge-device { display: none }
+  .header-right .badge-member,
+  .header-right .badge-title {
+    max-width: 30vw;
+    padding: 4px 8px;
   }
+  .header-right .badge-title.badge-expanded { max-width: 82vw }
+  .header-right .badge-parquet {
+    max-width: 42vw;
+    padding: 4px 8px;
+  }
+  .mobile-session-strip {
+    display: flex;
+    flex-shrink: 0;
+    align-items: stretch;
+    gap: 6px;
+    padding: 7px 10px;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    border-bottom: 1px solid var(--border);
+    background: #f8fafc;
+  }
+  .mobile-session-chip {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 1px;
+    min-width: 0;
+    flex: 1;
+    padding: 5px 8px;
+    border: 1px solid #ddd6fe;
+    border-radius: 8px;
+    background: #f5f3ff;
+  }
+  .mobile-session-device {
+    border-color: #bae6fd;
+    background: #f0f9ff;
+  }
+  .mobile-session-gaps {
+    border-color: #fcd34d;
+    background: #fffbeb;
+  }
+  .mobile-session-key {
+    color: var(--text2);
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+  }
+  .mobile-session-val {
+    overflow: hidden;
+    color: var(--text);
+    font-size: 12.5px;
+    font-weight: 700;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .mobile-session-device .mobile-session-val { color: #0369a1 }
+  .mobile-session-gaps .mobile-session-val { color: #b45309 }
   .logout-btn {
     width: 38px;
     min-height: 38px;
@@ -1866,27 +2032,64 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
     width: 17px;
     height: 17px;
   }
+  .mobile-tabbar {
+    display: flex;
+    flex-shrink: 0;
+    align-items: stretch;
+    justify-content: space-around;
+    gap: 4px;
+    padding: 6px 8px calc(8px + env(safe-area-inset-bottom, 0));
+    border-top: 1px solid var(--border);
+    background: #fff;
+    z-index: 400;
+  }
+  .mobile-tabbar button {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    min-height: 48px;
+    border: none;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--text2);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .mobile-tabbar button .ui-icon {
+    width: 18px;
+    height: 18px;
+    flex-basis: 18px;
+  }
+  .mobile-tabbar button.active {
+    background: #eff6ff;
+    color: #1d4ed8;
+  }
   .app-body {
-    flex: none;
+    flex: 1;
     flex-direction: column;
     min-height: 0;
-    overflow: visible;
+    overflow: hidden;
   }
-  .sidebar {
-    width: 100% !important;
-    max-height: 46dvh;
-    border-right: none;
-    border-bottom: 1px solid var(--border);
+  .sidebar-collapse-btn,
+  .panel-resizer,
+  .video-panel-toggle {
+    display: none;
   }
-  .sidebar-scroll {
-    max-height: calc(46dvh - 40px);
-    padding-bottom: 14px;
-  }
+  .sidebar,
   .app-body.sidebar-collapsed .sidebar {
     width: 100% !important;
-    max-height: 40px;
+    max-height: none;
+    border-right: none;
+    border-bottom: none;
   }
-  .sidebar-collapse-btn { height: 40px }
+  .sidebar-scroll {
+    max-height: none;
+    padding-bottom: 18px;
+  }
   .sidebar-section-head,
   .columns-picker-toggle,
   .btn-primary,
@@ -1896,7 +2099,7 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
   .lab-btn,
   .lab-mode-btn,
   .gap-vis-btn,
-  .video-panel-toggle,
+  .charts-lock-btn,
   .foot-btn,
   .pattern-vis-btn,
   .unit-btn {
@@ -1927,53 +2130,56 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
     border-top: 0;
     border-left: 1px solid var(--border);
   }
-  .main-area {
-    flex: none;
-    min-height: 0;
-    overflow: visible;
-  }
-  .content {
-    flex: none;
-    flex-direction: column;
-    min-height: 0;
-    overflow: visible;
-  }
-  .video-side {
-    width: 100% !important;
-    height: 260px;
-    max-height: none;
-    flex: none;
-    border-right: none;
-    border-bottom: 1px solid var(--border);
-  }
-  .panel-resizer  { display: none }
+  .main-area,
+  .content,
   .chart-side {
-    flex: none;
+    flex: 1;
     min-height: 0;
-    overflow: visible;
+    min-width: 0;
+    overflow: hidden;
+  }
+  .content { flex-direction: column }
+  .video-side,
+  .app.mobile-tab-video .video-side-hidden {
+    display: none;
+    width: 100% !important;
+    height: auto;
+    max-height: none;
+    flex: 1;
+    border-right: none;
   }
   .label-panel {
-    padding: 9px 10px;
+    padding: 8px 10px;
     overflow: visible;
   }
-  .label-toolbar-row,
+  .label-toolbar-row {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: 2px;
+  }
   .label-toolbar-group {
+    flex-wrap: nowrap;
     align-items: stretch;
   }
-  .label-toolbar-actions {
-    width: 100%;
-    margin-left: 0;
-    justify-content: stretch;
-  }
-  .label-toolbar-actions > * { flex: 1 1 130px }
-  .chart-sync-controls {
-    width: 100%;
+  .label-toolbar-row-secondary,
+  .label-toolbar-row-secondary .label-toolbar-group {
     flex-wrap: wrap;
   }
+  .label-toolbar-actions {
+    width: auto;
+    margin-left: 0;
+    flex-shrink: 0;
+  }
+  .label-toolbar-actions > * { flex: 0 0 auto }
+  .chart-sync-controls {
+    width: auto;
+    flex-wrap: nowrap;
+  }
   .chart-area {
-    flex: none;
-    min-height: 480px;
-    height: max(480px, 62dvh);
+    flex: 1;
+    min-height: 0;
+    height: auto;
   }
   .session-dropdown {
     min-width: 0;
@@ -1982,6 +2188,33 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
   .modebar-btn {
     width: 34px !important;
     height: 34px !important;
+  }
+
+  .app.mobile-tab-data .sidebar {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+  }
+  .app.mobile-tab-data .sidebar-scroll {
+    flex: 1;
+  }
+  .app.mobile-tab-data .main-area { display: none }
+
+  .app.mobile-tab-video .sidebar { display: none }
+  .app.mobile-tab-video .main-area,
+  .app.mobile-tab-video .content,
+  .app.mobile-tab-video .video-side,
+  .app.mobile-tab-video .video-side-hidden {
+    display: flex;
+  }
+  .app.mobile-tab-video .chart-side { display: none }
+
+  .app.mobile-tab-chart .sidebar,
+  .app.mobile-tab-chart .video-side { display: none }
+  .app.mobile-tab-chart .main-area,
+  .app.mobile-tab-chart .content,
+  .app.mobile-tab-chart .chart-side {
+    display: flex;
   }
 }
 
@@ -2335,6 +2568,64 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
   color: var(--text2);
   margin-left: auto;
   padding-left: 8px;
+}
+.sdi-protocol {
+  font-size: 11px;
+  color: #6d28d9;
+  background: #f5f3ff;
+  border-radius: 999px;
+  padding: 1px 7px;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.session-info-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  border: 1.25px solid var(--border);
+  border-radius: 8px;
+  background: #f8fafc;
+  overflow: hidden;
+}
+.session-info-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+}
+.session-info-row + .session-info-row {
+  border-top: 1px solid #e2e8f0;
+}
+.session-info-key {
+  color: var(--text2);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  flex-shrink: 0;
+}
+.session-info-val {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-info-warn {
+  color: #b45309;
+}
+
+.mobile-session-strip {
+  display: none;
+}
+
+.mobile-tabbar {
+  display: none;
 }
 
 /* ── Logout button ───────────────────────────────────────────────────── */

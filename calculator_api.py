@@ -146,10 +146,12 @@ def _list_markup_sessions(search: str | None, page_size: int) -> Dict[str, Any]:
             cursor.execute(
                 f"""
                 SELECT s.session_id, s.user_id, s.date, s.time, s.session_title,
-                       p.patient_name
+                       s.device_id, s.protocol_id, p.patient_name, pd.protocol_name
                 FROM {settings.DB_SCHEMA}.sessions s
                 LEFT JOIN {settings.DB_SCHEMA}.members p
                        ON p.member_id = s.member_id
+                LEFT JOIN {settings.DB_SCHEMA}.protocol_dict pd
+                       ON pd.protocol_id = s.protocol_id
                 {where}
                 ORDER BY s.session_id DESC
                 LIMIT %s
@@ -167,6 +169,9 @@ def _list_markup_sessions(search: str | None, page_size: int) -> Dict[str, Any]:
                 "session_title": row.get("session_title"),
                 "date": row.get("date"),
                 "time": row.get("time"),
+                "device_id": row.get("device_id"),
+                "protocol_id": row.get("protocol_id"),
+                "protocol_name": row.get("protocol_name"),
             }
             for row in rows
         ]
@@ -183,10 +188,13 @@ def _get_markup_session(session_id: int) -> Dict[str, Any]:
             cursor.execute(
                 f"""
                 SELECT s.session_id, s.user_id, s.date, s.time, s.session_title,
-                       s.additional_info, p.patient_name
+                       s.additional_info, s.device_id, s.protocol_id,
+                       p.patient_name, pd.protocol_name
                 FROM {settings.DB_SCHEMA}.sessions s
                 LEFT JOIN {settings.DB_SCHEMA}.members p
                        ON p.member_id = s.member_id
+                LEFT JOIN {settings.DB_SCHEMA}.protocol_dict pd
+                       ON pd.protocol_id = s.protocol_id
                 WHERE s.session_id = %s
                 """,
                 (session_id,),
@@ -202,6 +210,9 @@ def _get_markup_session(session_id: int) -> Dict[str, Any]:
         "session_title": row.get("session_title"),
         "date": row.get("date"),
         "time": row.get("time"),
+        "device_id": row.get("device_id"),
+        "protocol_id": row.get("protocol_id"),
+        "protocol_name": row.get("protocol_name"),
         "additional_info": _parse_additional_info(row.get("additional_info")),
     }
 
@@ -244,6 +255,31 @@ def _update_markup_additional_info(
         "id": session_id,
         "additional_info": _parse_additional_info(row.get("additional_info")),
     }
+
+
+def _update_markup_session_title(session_id: int, session_title: str) -> Dict[str, Any]:
+    """Rename a session from the markup workspace, regardless of its owner."""
+    from app.core.config import settings
+    from app.db.database import get_db
+    from app.db.redis_sync import invalidate_session_caches
+
+    with get_db() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                f"""
+                UPDATE {settings.DB_SCHEMA}.sessions
+                SET session_title = %s
+                WHERE session_id = %s
+                RETURNING session_title
+                """,
+                (session_title or None, session_id),
+            )
+            row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    invalidate_session_caches(session_id)
+    return {"id": session_id, "session_title": row.get("session_title")}
 
 
 def _get_markup_jump_calculator():
@@ -1353,6 +1389,26 @@ async def update_markup_additional_info(
         _update_markup_additional_info,
         session_id,
         additional_info,
+    )
+
+
+@app.put("/markup/sessions/{session_id}/title")
+async def update_markup_session_title(
+    session_id: int,
+    payload: Dict[str, Any] = Body(...),
+    _current_user: dict = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Edit the session title shown in the markup header."""
+    raw_title = payload.get("session_title")
+    if raw_title is not None and not isinstance(raw_title, str):
+        raise HTTPException(status_code=422, detail="session_title must be a string")
+    session_title = (raw_title or "").strip()
+    if len(session_title) > 255:
+        raise HTTPException(status_code=422, detail="session_title is too long (max 255)")
+    return await _run_markup_io(
+        _update_markup_session_title,
+        session_id,
+        session_title,
     )
 
 
