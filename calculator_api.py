@@ -13,7 +13,7 @@ import os
 from statistics import median
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Union
 
 import numpy as np
 import pandas as pd
@@ -87,6 +87,13 @@ PER_FOOT_TURN_DETECTOR_IDS = {
     "protocol-shuttle-detector",
     "protocol-beep-detector",
     "protocol-ttest-detector",
+}
+
+# Calculators that read the session column-wise and so never need the row dicts.
+# On a 121k-row export ``to_dict`` alone cost ~530 ms — more than the model it
+# was feeding — so the frame is handed over untouched.
+FRAME_CALCULATOR_IDS = {
+    "jump-events",
 }
 
 SENSOR_TO_FOOT = {
@@ -414,6 +421,21 @@ def _rows_with_time_in_ms(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return normalised
 
 
+def _frame_with_time_in_ms(df: pd.DataFrame) -> pd.DataFrame:
+    """``_rows_with_time_in_ms`` for the column-wise path — same 0.5 ms rule."""
+    if "Time" not in df.columns:
+        return df
+    head = pd.to_numeric(df["Time"].head(300), errors="coerce").dropna()
+    ordered = np.unique(head.to_numpy(float))
+    deltas = np.diff(ordered)
+    deltas = deltas[deltas > 0]
+    if deltas.size == 0 or float(np.median(deltas)) >= 0.5:
+        return df
+    out = df.copy()
+    out["Time"] = pd.to_numeric(out["Time"], errors="coerce") * 1000.0
+    return out
+
+
 def _cadence_result(
     calculator_id: str,
     rows: List[Dict[str, Any]],
@@ -586,7 +608,7 @@ def _jump_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _jump_events_result(
-    rows: List[Dict[str, Any]],
+    data: Union[pd.DataFrame, List[Dict[str, Any]]],
     protocol: str = DEFAULT_JUMP_EVENT_PROTOCOL,
 ) -> Dict[str, Any]:
     """Run the plate-trained jump detector and expose its bilateral events.
@@ -604,9 +626,10 @@ def _jump_events_result(
         get_new_jump_model_byAdil_calculator,
     )
 
-    rows = _rows_with_time_in_ms(rows)
+    data = (_frame_with_time_in_ms(data) if isinstance(data, pd.DataFrame)
+            else _rows_with_time_in_ms(data))
     calculator = get_new_jump_model_byAdil_calculator()
-    result = calculator.calculate(rows, protocol=protocol)
+    result = calculator.calculate(data, protocol=protocol)
 
     contacts = [
         {
@@ -1206,13 +1229,14 @@ def _calculate(
             sensor_name=sensor_name,
         )
 
+    if calculator_id == "jump-events":
+        return _jump_events_result(data, protocol)
+
     rows = data if isinstance(data, list) else data.to_dict(orient="records")
     if calculator_id == "step-detector-ttest":
         return _ttest_result(rows)
     if calculator_id == "jump-metrics":
         return _jump_result(rows)
-    if calculator_id == "jump-events":
-        return _jump_events_result(rows, protocol)
     if calculator_id in {"protocol-walking-detector", "protocol-running-detector"}:
         return _protocol_contact_detector_result(calculator_id, rows)
     if calculator_id == "protocol-jumping-detector":
@@ -1612,7 +1636,7 @@ async def calculate(
     if calculator_id not in CALCULATOR_LABELS:
         raise HTTPException(status_code=404, detail="Unknown calculator")
 
-    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
+    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS or calculator_id in FRAME_CALCULATOR_IDS:
         data = _extract_session_dataframe(payload)
     else:
         data = _extract_session_rows(payload)

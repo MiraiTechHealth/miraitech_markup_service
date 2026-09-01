@@ -298,6 +298,31 @@ const PER_FOOT_TURN_DETECTOR_IDS = new Set([
   'protocol-ttest-detector',
 ])
 
+// Columns a calculator actually reads, for the ones where the rest of the export
+// is dead weight in the request body. A force-plate session carries 39 columns
+// and jump-events reads 12 of them, so sending everything tripled the upload
+// (35.5 MB -> 10.3 MB on a 121k-row session). Keep in step with what the server
+// reads: _foot_frames in new_jump_model_byAdil_calculator.py (ACC_COLS,
+// ANGLE_COLS, PRESS_COLS) plus Name/Time. A column listed here but absent from
+// the session is simply left out, and the server logs the channels it missed.
+const CALCULATOR_COLUMNS = {
+  'jump-events': [
+    'Name', 'Time',
+    'AcX', 'AcY', 'AcZ',
+    'XData', 'YData', 'ZData',
+    'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4',
+  ],
+}
+
+// The whole colMap unless the calculator declared a narrower set above.
+function columnsForCalculator(calculatorId, colMap) {
+  const wanted = CALCULATOR_COLUMNS[calculatorId]
+  if (!wanted || !colMap) return colMap
+  const out = {}
+  wanted.forEach(column => { if (colMap[column]) out[column] = colMap[column] })
+  return out
+}
+
 const EVENT_STYLE_BY_KIND = {
   run: {
     label: 'Беговая фаза', color: '#16a34a', fill: 'rgba(22,163,74,0.10)', dash: 'dash', width: 1.5,
@@ -4220,7 +4245,7 @@ export default function App() {
     const dataVersion = calculatorDataVersionRef.current
     setCalculatorLoading(calculatorId)
     try {
-      const payload = { columns: parquetData }
+      const payload = { columns: columnsForCalculator(calculatorId, parquetData) }
       if (calculatorId === 'force-jump') payload.weight_kg = parsedWeight
       if (calculatorId === 'jump-events') payload.protocol = jumpEventProtocol
       if (PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)) {
