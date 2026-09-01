@@ -29,6 +29,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from jump_bilstm_runtime import MarkupJumpBiLSTMCalculator  # noqa: E402
 from app.utils.auth import get_current_user  # noqa: E402
+from loguru import logger  # noqa: E402
 
 
 app = FastAPI(title="MiraiTech Markup Calculators")
@@ -92,6 +93,59 @@ SENSOR_TO_FOOT = {
     "ESP32_Sensor_1": "left",
     "ESP32_Sensor_2": "right",
 }
+
+# Every calculator keys its feet off the firmware sensor names. The force-plate
+# research corpus labels the same rows "Right Foot" / "Left Foot", so a parquet
+# loaded straight from it used to come out with zero feet and an empty prediction
+# — no error in the UI, just contacts: []. Normalise the aliases here, at the API
+# boundary, so it costs no rewrite of the corpus and covers every calculator.
+NAME_ALIASES = {
+    "right foot": "ESP32_Sensor_2",
+    "right": "ESP32_Sensor_2",
+    "r": "ESP32_Sensor_2",
+    "left foot": "ESP32_Sensor_1",
+    "left": "ESP32_Sensor_1",
+    "l": "ESP32_Sensor_1",
+}
+
+
+def _canonical_sensor_name(name: Any) -> Any:
+    """"Right Foot" -> "ESP32_Sensor_2"; anything already canonical is untouched."""
+    if not isinstance(name, str):
+        return name
+    return NAME_ALIASES.get(name.strip().lower(), name)
+
+
+def _canonicalise_names_frame(df: pd.DataFrame) -> pd.DataFrame:
+    if "Name" not in df.columns:
+        return df
+    mapped = df["Name"].map(_canonical_sensor_name)
+    if mapped.equals(df["Name"]):
+        return df
+    renamed = sorted({str(a) for a, b in zip(df["Name"], mapped) if a != b})
+    logger.info(f"markup: Name aliases mapped to sensor names: {renamed}")
+    df = df.copy()
+    df["Name"] = mapped
+    return df
+
+
+def _canonicalise_names_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set = set()
+    out = []
+    for row in rows:
+        name = row.get("Name")
+        canon = _canonical_sensor_name(name)
+        if canon == name:
+            out.append(row)
+            continue
+        seen.add(str(name))
+        item = dict(row)
+        item["Name"] = canon
+        out.append(item)
+    if seen:
+        logger.info(f"markup: Name aliases mapped to sensor names: {sorted(seen)}")
+    return out
+
 
 _markup_jump_bilstm_calculator = None
 
@@ -1489,20 +1543,20 @@ async def update_markup_session_title(
 def _extract_session_dataframe(payload: Dict[str, Any]) -> pd.DataFrame:
     columns = payload.get("columns")
     if isinstance(columns, dict) and columns:
-        return pd.DataFrame(columns)
+        return _canonicalise_names_frame(pd.DataFrame(columns))
     rows = payload.get("rows")
     if isinstance(rows, list) and rows:
-        return pd.DataFrame(rows)
+        return _canonicalise_names_frame(pd.DataFrame(rows))
     raise HTTPException(status_code=422, detail="Session columns or rows are required")
 
 
 def _extract_session_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     columns = payload.get("columns")
     if isinstance(columns, dict) and columns:
-        return pd.DataFrame(columns).to_dict(orient="records")
+        return _canonicalise_names_rows(pd.DataFrame(columns).to_dict(orient="records"))
     rows = payload.get("rows")
     if isinstance(rows, list) and rows:
-        return rows
+        return _canonicalise_names_rows(rows)
     raise HTTPException(status_code=422, detail="Session columns or rows are required")
 
 
