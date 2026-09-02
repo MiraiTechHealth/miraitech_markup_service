@@ -57,11 +57,11 @@ CALCULATOR_MODELS = {
     "jump-metrics": "JumpBiLSTM",
     "jump-events": "NewJumpModelByAdil (plate-trained TCN)",
     "force-jump": "JumpForceBW regressor",
-    "protocol-walking-detector": "WalkBiLSTM contacts",
-    "protocol-running-detector": "WalkBiLSTM contacts",
+    "protocol-walking-detector": "GCTTCN contacts",
+    "protocol-running-detector": "GCTTCN contacts",
     "protocol-jumping-detector": "JumpBiLSTM flight detector",
     "protocol-shuttle-detector": "TurnCalculator shuttle phases",
-    "protocol-sprint-detector": "CausalSpeedTCN + StepResUNet sprint steps",
+    "protocol-sprint-detector": "CausalSpeedTCN + GCTTCN sprint steps",
     "protocol-beep-detector": "YoyoTurnCalculator phases",
     "protocol-ttest-detector": "TurnCalculator T-Test phases",
 }
@@ -70,10 +70,10 @@ CALCULATOR_MODEL_FILES = {
     "jump-metrics": "jump_bilstm.pt",
     "jump-events": "new_jump_model_byAdil.pt",
     "force-jump": "jump_force_total.pt",
-    "protocol-walking-detector": "walk_gc_bilstm.pt",
-    "protocol-running-detector": "walk_gc_bilstm.pt",
+    "protocol-walking-detector": "gct_best.pt",
+    "protocol-running-detector": "gct_best.pt",
     "protocol-jumping-detector": "jump_bilstm.pt",
-    "protocol-sprint-detector": "speed_cont_v5.pt + step_gc_model.pt",
+    "protocol-sprint-detector": "speed_cont_v5.pt + gct_best.pt",
 }
 
 # Movement one-hot the plate-trained jump model is conditioned on. It is an
@@ -443,8 +443,9 @@ def _cadence_result(
 ) -> Dict[str, Any]:
     """Turn a cadence detector's contact regions into markup overlays.
 
-    ``calculator`` lets a caller supply its own detector; walking and running
-    pass the WalkBiLSTM-backed adapter the backend uses for those protocols.
+    ``calculator`` lets a caller supply its own detector; walking, running and
+    the sprint protocol pass the GCTTCN-backed adapter the backend uses for
+    those protocols.
     """
     if calculator is None:
         if calculator_id == "tkeo-cadence":
@@ -736,10 +737,10 @@ def _protocol_contact_detector_result(
     calculator_id: str,
     rows: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Expose WalkBiLSTM contact regions as walking/running detections."""
-    from app.services.calculators.step_cadence_calculator import get_walk_cadence_calculator
+    """Expose GCTTCN contact regions as walking/running detections."""
+    from app.services.calculators.step_cadence_calculator import get_gct_cadence_calculator
 
-    base = _cadence_result("step-cadence", rows, get_walk_cadence_calculator())
+    base = _cadence_result("step-cadence", rows, get_gct_cadence_calculator())
     contacts = list(base.get("contacts") or [])
     left_count = sum(1 for event in contacts if event.get("foot") == "left")
     right_count = sum(1 for event in contacts if event.get("foot") == "right")
@@ -1070,6 +1071,7 @@ def _valid_length(value: float | None, maximum: float) -> float | None:
 def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Detect 30 m, sprint steps, step length and same-foot stride length."""
     from app.services.calculators.ml_speed_calculator import get_speed_calculator
+    from app.services.calculators.step_cadence_calculator import get_gct_cadence_calculator
 
     calculator_id = "protocol-sprint-detector"
     normalised_rows = _rows_with_time_in_ms(rows)
@@ -1128,7 +1130,9 @@ def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, An
             "confidence": None,
         })
 
-        cadence_result = _cadence_result("step-cadence", normalised_rows)
+        cadence_result = _cadence_result(
+            "step-cadence", normalised_rows, get_gct_cadence_calculator()
+        )
         cadence_spm = cadence_result.get("summary", {}).get("cadence_spm")
         detected_steps = sorted(
             (
