@@ -4632,8 +4632,13 @@ export default function App() {
             const start = Number(contact.start_time_s) * timeScale + shift
             const end = Number(contact.end_time_s) * timeScale + shift
             if (!Number.isFinite(start) || !Number.isFinite(end)) return
-            const x0 = Math.min(start, end)
-            const x1 = Math.max(start, end)
+            // GCT windows can be a few dozen ms wide - only a handful of
+            // pixels at normal zoom - so pad the hit box with the same
+            // on-screen tolerance used for activity-span snapping, or a
+            // precise contact becomes unclickable.
+            const padding = currentSnapTolerance() / 2
+            const x0 = Math.min(start, end) - padding
+            const x1 = Math.max(start, end) + padding
             if (x >= x0 && x <= x1) {
               candidates.push({ calculatorId, index, contact })
             }
@@ -5767,55 +5772,6 @@ export default function App() {
                           </div>
                         )}
 
-                        {selectedCalculatorContact && (() => {
-                          const detail = selectedCalculatorContact.contact
-                          const calculator = CALCULATOR_BY_ID[selectedCalculatorContact.calculatorId]
-                          const detailStyle = calculatorEventStyle(calculator, detail)
-                          const foot = detail.foot === 'left' ? 'L' : detail.foot === 'right' ? 'R' : 'ALL'
-                          const durationLabel = {
-                            flight: 'Flight',
-                            contact: 'GCT',
-                            step: 'Контакт шага',
-                            turn: 'Поворот',
-                            run: 'Беговая фаза',
-                            sprint: 'Спринт',
-                          }[detail.kind] || 'Событие'
-                          return (
-                            <div className="calculator-contact-detail" style={{ '--calculator-color': detailStyle.color }}>
-                              <div className="calculator-contact-head">
-                                <span>{calculator?.label || 'ML-контакт'} · {foot} · #{selectedCalculatorContact.index + 1}</span>
-                                <button
-                                  type="button"
-                                  className="calculator-contact-close"
-                                  onClick={() => setSelectedCalculatorContact(null)}
-                                  aria-label="Закрыть показатели контакта"
-                                >×</button>
-                              </div>
-                              <div className="calculator-contact-metrics">
-                                <span><b>{durationLabel}</b> {formatMetric(detail.duration_ms, 0, ' ms')}</span>
-                                <span>начало {formatMetric(detail.start_time_s, 3, ' s')}</span>
-                                <span>конец {formatMetric(detail.end_time_s, 3, ' s')}</span>
-                                {detail.confidence != null && (
-                                  <span>confidence {formatMetric(Number(detail.confidence) * 100, 0, '%')}</span>
-                                )}
-                                {detail.direction && <span>направление {detail.direction}</span>}
-                                {detail.angle_deg != null && <span>угол {formatMetric(detail.angle_deg, 0, '°')}</span>}
-                                {detail.jump_height_cm != null && (
-                                  <span><b>высота</b> {formatMetric(detail.jump_height_cm, 1, ' см')}</span>
-                                )}
-                                {detail.step_length_m != null && <span>step length {formatMetric(detail.step_length_m, 3, ' м')}</span>}
-                                {detail.stride_length_m != null && <span>stride length {formatMetric(detail.stride_length_m, 3, ' м')}</span>}
-                                {detail.distance_m != null && detail.kind === 'sprint' && (
-                                  <span><b>дистанция</b> {formatMetric(detail.distance_m, 2, ' м')}</span>
-                                )}
-                                {detail.distance_m != null && detail.kind === 'step' && (
-                                  <span>дистанция {formatMetric(detail.distance_m, 2, ' м')}</span>
-                                )}
-                              </div>
-                            </div>
-                          )
-                        })()}
-
                         <button
                           type="button"
                           className={`calculator-expand${extraCalculatorsOpen ? ' open' : ''}`}
@@ -6708,6 +6664,57 @@ export default function App() {
 
           <div className="chart-area" ref={chartAreaRef}>
             <div ref={chartDivRef} style={{ width: '100%', height: '100%' }} />
+            {selectedCalculatorContact && (() => {
+              const detail = selectedCalculatorContact.contact
+              const calculator = CALCULATOR_BY_ID[selectedCalculatorContact.calculatorId]
+              const detailStyle = calculatorEventStyle(calculator, detail)
+              const foot = detail.foot === 'left' ? 'L' : detail.foot === 'right' ? 'R' : 'ALL'
+              const durationLabel = {
+                flight: 'Flight',
+                contact: 'GCT',
+                step: 'GCT',
+                turn: 'Поворот',
+                run: 'Беговая фаза',
+                sprint: 'Спринт',
+              }[detail.kind] || 'Событие'
+              return (
+                <div
+                  className="calculator-contact-detail calculator-contact-overlay"
+                  style={{ '--calculator-color': detailStyle.color }}
+                >
+                  <div className="calculator-contact-head">
+                    <span>{calculator?.label || 'ML-контакт'} · {foot} · #{selectedCalculatorContact.index + 1}</span>
+                    <button
+                      type="button"
+                      className="calculator-contact-close"
+                      onClick={() => setSelectedCalculatorContact(null)}
+                      aria-label="Закрыть показатели контакта"
+                    >×</button>
+                  </div>
+                  <div className="calculator-contact-metrics">
+                    <span><b>{durationLabel}</b> {formatMetric(detail.duration_ms, 0, ' ms')}</span>
+                    <span>начало {formatMetric(detail.start_time_s, 3, ' s')}</span>
+                    <span>конец {formatMetric(detail.end_time_s, 3, ' s')}</span>
+                    {detail.confidence != null && (
+                      <span>confidence {formatMetric(Number(detail.confidence) * 100, 0, '%')}</span>
+                    )}
+                    {detail.direction && <span>направление {detail.direction}</span>}
+                    {detail.angle_deg != null && <span>угол {formatMetric(detail.angle_deg, 0, '°')}</span>}
+                    {detail.jump_height_cm != null && (
+                      <span><b>высота</b> {formatMetric(detail.jump_height_cm, 1, ' см')}</span>
+                    )}
+                    {detail.step_length_m != null && <span>step length {formatMetric(detail.step_length_m, 3, ' м')}</span>}
+                    {detail.stride_length_m != null && <span>stride length {formatMetric(detail.stride_length_m, 3, ' м')}</span>}
+                    {detail.distance_m != null && detail.kind === 'sprint' && (
+                      <span><b>дистанция</b> {formatMetric(detail.distance_m, 2, ' м')}</span>
+                    )}
+                    {detail.distance_m != null && detail.kind === 'step' && (
+                      <span>дистанция {formatMetric(detail.distance_m, 2, ' м')}</span>
+                    )}
+                  </div>
+                </div>
+              )
+            })()}
             {chartReady && selectedCols.length > 1 && (
               <div className="chart-reorder-layer" aria-label="Изменение порядка графиков">
                 {selectedCols.map((col, index) => (
