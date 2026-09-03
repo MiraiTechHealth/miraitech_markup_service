@@ -28,6 +28,7 @@ if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
 from jump_bilstm_runtime import MarkupJumpBiLSTMCalculator  # noqa: E402
+from plate_flight_gt import PlateFlightError, plate_flight_result  # noqa: E402
 from app.utils.auth import get_current_user  # noqa: E402
 from loguru import logger  # noqa: E402
 
@@ -41,6 +42,8 @@ CALCULATOR_LABELS = {
     "jump-metrics": "Jump BiLSTM",
     "jump-events": "Jump events · plates",
     "force-jump": "Bilateral GRF",
+    "grf-split": "Total GRF · plates",
+    "plate-flight": "Полёт по плитам · разметка v7",
     "protocol-walking-detector": "Walking Test Detector",
     "protocol-running-detector": "Running Analysis Detector",
     "protocol-jumping-detector": "Jump Analysis Detector",
@@ -57,6 +60,8 @@ CALCULATOR_MODELS = {
     "jump-metrics": "JumpBiLSTM",
     "jump-events": "NewJumpModelByAdil (plate-trained TCN)",
     "force-jump": "JumpForceBW regressor",
+    "grf-split": "JumpGRFTotal (plate-trained total regressor, 20 Hz target)",
+    "plate-flight": "plate_flight_v7 (force-plate ground truth, no ML)",
     "protocol-walking-detector": "GCTTCN contacts",
     "protocol-running-detector": "GCTTCN contacts",
     "protocol-jumping-detector": "JumpBiLSTM flight detector",
@@ -65,11 +70,18 @@ CALCULATOR_MODELS = {
     "protocol-beep-detector": "YoyoTurnCalculator phases",
     "protocol-ttest-detector": "TurnCalculator T-Test phases",
 }
+# The per-foot GRF curve is returned to the browser for plotting, so it is thinned
+# to this many points. A 20 s session at 500 Hz is 10k samples; the graph cannot
+# resolve more than a few thousand anyway, and the peaks in `events` are read off
+# the full-rate curve before thinning.
+GRF_SPLIT_MAX_POINTS = 4000
+
 CALCULATOR_MODEL_FILES = {
     "step-cadence": "step_gc_model.pt",
     "jump-metrics": "jump_bilstm.pt",
     "jump-events": "new_jump_model_byAdil.pt",
     "force-jump": "jump_force_total.pt",
+    "grf-split": "jump_grf_total.pt",
     "protocol-walking-detector": "gct_best.pt",
     "protocol-running-detector": "gct_best.pt",
     "protocol-jumping-detector": "jump_bilstm.pt",
@@ -94,6 +106,7 @@ PER_FOOT_TURN_DETECTOR_IDS = {
 # was feeding — so the frame is handed over untouched.
 FRAME_CALCULATOR_IDS = {
     "jump-events",
+    "plate-flight",
 }
 
 SENSOR_TO_FOOT = {
@@ -671,6 +684,26 @@ def _jump_events_result(
     }
 
 
+def _plate_flight_result(df: pd.DataFrame) -> Dict[str, Any]:
+    """Force-plate ground truth of the jump detector, for sessions that carry the
+    plate force as a column (``Plate_Fz_N`` from ``export_markup_parquet.py`` or
+    ``1:Fz`` / ``2:Fz`` from the synced research corpus).
+
+    No model runs here: this is the labeler the ``jump-events`` TCN is trained on
+    — both plates below 20 N, stitched over 10 ms blips, floored at 60 ms,
+    rejected when an insole is loaded (athlete beside the plate), accepted on an
+    IMU impact within 60 ms of landing OR both feet in free fall (v6), and with
+    jumps across the plate edge (onto / off the plates, only one edge visible)
+    masked as unknown rather than ground (v7). Contacts are bilateral like
+    ``jump-events`` and use ``kind`` ``plate_flight`` for jumps and ``plate_mask``
+    for segments the labeler refused to call either way; a mask's ``status`` and
+    ``hop`` say why.
+    """
+    df = _frame_with_time_in_ms(df)
+    return plate_flight_result(
+        df, CALCULATOR_LABELS["plate-flight"], CALCULATOR_MODELS["plate-flight"])
+
+
 def _force_units(units: Any) -> Dict[str, Any] | None:
     """Flatten a JumpForceUnits into the markup response's scalar fields."""
     if units is None:
@@ -729,6 +762,102 @@ def _force_result(rows: List[Dict[str, Any]], weight_kg: float) -> Dict[str, Any
             "weight_kg": _round_or_none(result.weight_kg),
             "weight_source": result.weight_source,
             "is_valid": bool(result.is_valid),
+        },
+    }
+
+
+def _grf_split_result(rows: List[Dict[str, Any]], weight_kg: float,
+                      protocol: str | None = None) -> Dict[str, Any]:
+    """Total Fz curve plus per-jump forces, for eyeballing the model on a session.
+
+    The model's target is the plate **low-passed at ``target_lowpass_hz``** (20 Hz);
+    ``export_markup_parquet.py`` writes ``Plate_Fz_total_lp20_pctBW`` so the two can
+    be laid over each other in the same definition. Against the raw plate column the
+    landing peak reads ~10% low by design.
+
+    Unlike ``_force_result`` this returns the **curves** as ``data_points``, so the
+    markup graph can draw the prediction over the pressure traces it was computed
+    from — which is the whole point of having the model here rather than only in
+    the API. The series is thinned to keep the payload sane; peaks are read off
+    the full-rate curve inside the calculator, before thinning, so a thinned
+    sample never becomes a reported peak.
+
+    Take-off and landing come from the plate-trained bilateral detector, the same
+    one the ``jump-events`` calculator exposes, so the flight bands drawn by both
+    line up.
+    """
+    from app.services.calculators.jump_grf_split_calculator import (
+        get_jump_grf_split_calculator,
+    )
+
+    rows = _rows_with_time_in_ms(rows)
+    calculator = get_jump_grf_split_calculator()
+    result = calculator.calculate(rows, weight_kg=weight_kg, protocol=protocol)
+
+    step = max(1, len(result.times_ms) // GRF_SPLIT_MAX_POINTS)
+    data_points = [
+        {"time": result.times_ms[i], "total": result.fz_total_percent_bw[i]}
+        for i in range(0, len(result.times_ms), step)
+    ]
+
+    summary = result.summary
+    test_card = (result.model_metrics or {}).get("test") or {}
+    return {
+        "calculator": "grf-split",
+        "label": CALCULATOR_LABELS["grf-split"],
+        "model": f"{CALCULATOR_MODELS['grf-split']} · {result.arch}",
+        "model_file": CALCULATOR_MODEL_FILES["grf-split"],
+        "data_points": data_points,
+        "sample_step": step,
+        "contacts": [
+            {
+                "foot": None,
+                "start_ms": jump.takeoff_time_ms,
+                "end_ms": jump.landing_time_ms,
+                "duration_ms": jump.flight_time_ms,
+                "kind": "flight",
+                "confidence": None,
+            }
+            for jump in result.jumps
+        ],
+        "events": [
+            {
+                "jump_index": jump.jump_index,
+                "takeoff_time_ms": jump.takeoff_time_ms,
+                "landing_time_ms": jump.landing_time_ms,
+                "flight_time_ms": jump.flight_time_ms,
+                "pushoff_force": _force_units(jump.pushoff_force),
+                "landing_force": _force_units(jump.landing_force),
+                "contact_impulse_bw_s": jump.contact_impulse_bw_s,
+                "contact_time_ms": jump.contact_time_ms,
+            }
+            for jump in result.jumps
+        ],
+        "summary": {
+            "jump_count": summary.n_jumps,
+            "peak_force": _force_units(summary.peak_force),
+            "peak_pushoff_force": _force_units(summary.peak_pushoff_force),
+            "peak_landing_force": _force_units(summary.peak_landing_force),
+            "avg_pushoff_force": _force_units(summary.avg_pushoff_force),
+            "avg_landing_force": _force_units(summary.avg_landing_force),
+            "mean_contact_impulse_bw_s": summary.mean_contact_impulse_bw_s,
+            # The definition the curve is in: compare with a plate filtered the same way.
+            "target_lowpass_hz": result.target_lowpass_hz,
+            "weight_kg": _round_or_none(summary.weight_kg),
+            "weight_source": summary.weight_source,
+            "event_source": result.event_source,
+            "n_samples": result.n_samples,
+            "is_valid": bool(summary.is_valid),
+            # What the plates said about these weights, on athletes they never saw.
+            # Shown beside the numbers so nobody reads a landing peak as measured.
+            "held_out_contact_rmse_pctbw": _round_or_none(
+                test_card.get("rmse_contact_pctbw"), 1),
+            "held_out_landing_peak_mae_pctbw": _round_or_none(
+                test_card.get("peak_landing_mae_pctbw"), 1),
+            "held_out_landing_peak_bias_pctbw": _round_or_none(
+                test_card.get("peak_landing_bias_pctbw"), 1),
+            "held_out_landing_peak_raw_bias_pctbw": _round_or_none(
+                test_card.get("peak_landing_raw_bias_pctbw"), 1),
         },
     }
 
@@ -1655,6 +1784,35 @@ async def calculate(
             raise HTTPException(status_code=422, detail="weight_kg must be positive")
         try:
             return await asyncio.to_thread(_force_result, data, weight_kg)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if calculator_id == "grf-split":
+        try:
+            weight_kg = float(payload.get("weight_kg"))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422,
+                                detail="weight_kg is required for Total GRF")
+        if weight_kg <= 0:
+            raise HTTPException(status_code=422, detail="weight_kg must be positive")
+        raw_protocol = payload.get("protocol")
+        grf_protocol = (str(raw_protocol) if raw_protocol not in (None, "")
+                        else DEFAULT_JUMP_EVENT_PROTOCOL)
+        if grf_protocol not in JUMP_EVENT_PROTOCOLS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"protocol must be one of: {', '.join(JUMP_EVENT_PROTOCOLS)}")
+        try:
+            return await asyncio.to_thread(_grf_split_result, data, weight_kg, grf_protocol)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if calculator_id == "plate-flight":
+        try:
+            return await asyncio.to_thread(_plate_flight_result, data)
+        except PlateFlightError as exc:
+            # Not a failure of the tool: the session has no plates, or one foot.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except Exception as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
