@@ -3136,23 +3136,54 @@ export default function App() {
       return ivs.some(([a, b]) => tv >= a && tv <= b)
     }
 
-    const hdr = [...allCols, 'Target'].join(',')
+    // step_detected is sourced from calculator/model output (GCT contacts),
+    // entirely separate from the hand-placed Target markup above - it must
+    // reflect what the model found, not get folded into or gated by it.
+    const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
+    const detectedL = []
+    const detectedR = []
+    const calculatorIds = [...new Set(['step-cadence', ...activeCalculatorsRef.current])]
+    calculatorIds.forEach(calculatorId => {
+      const contacts = calculatorResultsRef.current[calculatorId]?.contacts
+      if (!contacts?.length) return
+      contacts.forEach(contact => {
+        if (contact.kind !== 'contact' && contact.kind !== 'step') return
+        const start = Number(contact.start_time_s) * timeScale
+        const end = Number(contact.end_time_s) * timeScale
+        if (!Number.isFinite(start) || !Number.isFinite(end)) return
+        const iv = [Math.min(start, end), Math.max(start, end)]
+        if (contact.foot === 'left') detectedL.push(iv)
+        else if (contact.foot === 'right') detectedR.push(iv)
+      })
+    })
+
+    const hdr = [...allCols, 'Target', 'step_detected'].join(',')
     const rows = []
     for (let i = 0; i < n; i++) {
       const name = nameArr[i] || ''
       const t    = timeArr[i]
+      const isRight = rightSensorNames.has(name)
+      const isLeft  = leftSensorNames.has(name)
       const target = name === SPEED_TRACKER
         ? ''
-        : rightSensorNames.has(name)
+        : isRight
           ? (inIv(t, rIv) ? 1 : 0)
-          : leftSensorNames.has(name)
+          : isLeft
             ? (inIv(t, lIv) ? 1 : 0)
+            : ''
+      const stepDetected = name === SPEED_TRACKER
+        ? ''
+        : isRight
+          ? (inIv(t, detectedR) ? 1 : 0)
+          : isLeft
+            ? (inIv(t, detectedL) ? 1 : 0)
             : ''
       const vals = allCols.map(c => {
         const v = parquetData[c][i]
         return v == null ? '' : String(v)
       })
       vals.push(String(target))
+      vals.push(String(stepDetected))
       rows.push(vals.join(','))
     }
 
@@ -3353,7 +3384,11 @@ export default function App() {
       })
       return
     }
-    if (leftContactsRef.current.length === 0 && rightContactsRef.current.length === 0) {
+    const hasManualMarkup = leftContactsRef.current.length > 0 || rightContactsRef.current.length > 0
+    const hasDetectedSteps = ['step-cadence', ...activeCalculatorsRef.current].some(id =>
+      calculatorResultsRef.current[id]?.contacts?.some(c => c.kind === 'contact' || c.kind === 'step')
+    )
+    if (!hasManualMarkup && !hasDetectedSteps) {
       setStatus({ text: 'Нет разметки для сохранения', type: 'error' })
       return
     }
