@@ -1134,18 +1134,20 @@ def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, An
             "step-cadence", normalised_rows, get_gct_cadence_calculator()
         )
         cadence_spm = cadence_result.get("summary", {}).get("cadence_spm")
+        # Every step the cadence model found across the whole recording is kept
+        # for markup - this is a QA tool, not the timing product, so a step
+        # before the start gate or after the 30 m finish must stay visible and
+        # keep its real GCT. Only the 30 m-dash summary stats (step_count,
+        # median step/stride length, cadence) are scoped to the timed segment.
         detected_steps = sorted(
-            (
-                dict(event)
-                for event in cadence_result.get("contacts", [])
-                if start_time_s <= float(event.get("start_time_s", -1)) <= end_time_s
-            ),
+            (dict(event) for event in cadence_result.get("contacts", [])),
             key=lambda event: float(event["start_time_s"]),
         )
 
         previous_distance = None
         previous_foot_distance: Dict[str, float] = {}
-        for step_index, event in enumerate(detected_steps, start=1):
+        segment_step_index = 0
+        for event in detected_steps:
             event_time_ms = float(event["start_time_s"]) * 1000.0
             absolute_distance = _distance_at_time(points, event_time_ms)
             if absolute_distance is None:
@@ -1164,21 +1166,20 @@ def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, An
             previous_distance = absolute_distance
             previous_foot_distance[foot] = absolute_distance
 
-            if step_length is not None:
-                step_lengths.append(step_length)
-            if stride_length is not None:
-                stride_lengths.append(stride_length)
-                if foot in stride_lengths_by_foot:
-                    stride_lengths_by_foot[foot].append(stride_length)
+            in_segment = start_time_s <= float(event["start_time_s"]) <= end_time_s
+            if in_segment:
+                segment_step_index += 1
+                if step_length is not None:
+                    step_lengths.append(step_length)
+                if stride_length is not None:
+                    stride_lengths.append(stride_length)
+                    if foot in stride_lengths_by_foot:
+                        stride_lengths_by_foot[foot].append(stride_length)
 
-            event["end_time_s"] = min(float(event["end_time_s"]), end_time_s)
-            event["duration_ms"] = max(
-                0.0,
-                (float(event["end_time_s"]) - float(event["start_time_s"])) * 1000.0,
-            )
             event.update({
                 "kind": "step",
-                "step_index": step_index,
+                "step_index": segment_step_index if in_segment else None,
+                "in_segment": in_segment,
                 "distance_m": round(absolute_distance - start_distance, 3),
                 "step_length_m": step_length,
                 "stride_length_m": stride_length,
@@ -1198,9 +1199,9 @@ def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, An
             "sprint_count": 1 if start is not None and finish is not None else 0,
             "segment_found": bool(start is not None and end is not None),
             "distance_m": round(segment_distance_m, 3) if segment_distance_m is not None else None,
-            "step_count": len(step_contacts),
-            "left_count": sum(1 for event in step_contacts if event.get("foot") == "left"),
-            "right_count": sum(1 for event in step_contacts if event.get("foot") == "right"),
+            "step_count": sum(1 for event in step_contacts if event.get("in_segment")),
+            "left_count": sum(1 for event in step_contacts if event.get("foot") == "left" and event.get("in_segment")),
+            "right_count": sum(1 for event in step_contacts if event.get("foot") == "right" and event.get("in_segment")),
             "step_length_m": round(float(median(step_lengths)), 3) if step_lengths else None,
             "stride_length_m": round(float(median(stride_lengths)), 3) if stride_lengths else None,
             "stride_length_left_m": (
