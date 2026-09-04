@@ -1195,6 +1195,49 @@ label.lab-btn:has(input:focus-visible) {
   font-variant-numeric: tabular-nums;
 }
 .calculator-contact-metrics b { color: var(--text); }
+.calculator-contact-tag {
+  color: #b91c1c;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+}
+.calculator-contact-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 2px;
+  padding-top: 5px;
+  border-top: 1px solid color-mix(in srgb, var(--calculator-color) 30%, var(--border));
+}
+.calculator-contact-action {
+  flex: 1;
+  padding: 4px 8px;
+  border: 1px solid #fca5a5;
+  border-radius: 5px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+.calculator-contact-action:hover { background: #fee2e2; border-color: #f87171; }
+.calculator-contact-action.restore {
+  border-color: #86efac;
+  background: #f0fdf4;
+  color: #15803d;
+}
+.calculator-contact-action.restore:hover { background: #dcfce7; border-color: #4ade80; }
+.calculator-contact-kbd {
+  padding: 1px 4px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: white;
+  color: var(--text2);
+  font-family: var(--font-sans);
+  font-size: 9px;
+}
 .calculator-summary {
   color: var(--calculator-color);
   font-size: 10px;
@@ -1864,6 +1907,22 @@ label.lab-btn.import    { display: inline-flex; align-items: center; justify-con
 }
 .lab-stat-l { color: #1d4ed8; font-weight: 600 }
 .lab-stat-r { color: #c2410c; font-weight: 600 }
+
+/* What the exported Target column adds up to, next to the export button. */
+.lab-stat-target {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg2, #f8fafc);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.lab-stat-target b { color: var(--text); font-weight: 700 }
+.lab-stat-del { color: #b91c1c; font-weight: 600 }
+.lab-stat-add { color: #15803d; font-weight: 600 }
 
 /* ── Zone durations ─────────────────────────────────────────────────── */
 /* ── Activity ribbon ──────────────────────────────────────────────────────

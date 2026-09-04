@@ -353,6 +353,31 @@ const FLIGHT_EVENT_STYLE = {
   right: { color: '#7c3aed', fill: 'rgba(124,58,237,0.14)', dash: 'dot', width: 1.75 },
 }
 
+// ── Target steps ──────────────────────────────────────────────────────────
+// Target is the model's step markup after the operator has been over it: every
+// detected contact except the ones struck out by hand, plus the intervals
+// placed by hand in markup mode. A deletion is remembered by the step's own
+// times rather than its index, so re-running the same detector does not
+// resurrect a step the operator already threw away.
+const STEP_CONTACT_KINDS = new Set(['contact', 'step'])
+const isStepContact = (contact) => STEP_CONTACT_KINDS.has(contact?.kind)
+
+function stepKey(calculatorId, contact) {
+  const start = Number(contact?.start_time_s)
+  const end = Number(contact?.end_time_s)
+  return [
+    calculatorId,
+    contact?.foot || 'all',
+    Number.isFinite(start) ? start.toFixed(4) : 'na',
+    Number.isFinite(end) ? end.toFixed(4) : 'na',
+  ].join('|')
+}
+
+/** Struck-out steps stay on the chart as a grey ghost so they can be put back. */
+const DELETED_STEP_STYLE = {
+  color: '#94a3b8', fill: 'rgba(148,163,184,0.04)', dash: 'dot', width: 1,
+}
+
 function calculatorEventStyle(calculator, contact) {
   const turnFootStyle = TURN_EVENT_STYLE_BY_FOOT[contact?.foot]?.[contact?.kind]
   if (turnFootStyle) return turnFootStyle
@@ -2145,6 +2170,9 @@ export default function App() {
   const [activeCalculators, setActiveCalculators] = useState([])
   const [calculatorLoading, setCalculatorLoading] = useState('')
   const [selectedCalculatorContact, setSelectedCalculatorContact] = useState(null)
+  // Steps the operator struck out of Target, by stepKey(). Held apart from the
+  // detector results so a re-run keeps the edits instead of wiping them.
+  const [deletedStepKeys, setDeletedStepKeys] = useState(() => new Set())
   const [turnDetectionFeet, setTurnDetectionFeet] = useState({
     'protocol-shuttle-detector': 'both',
     'protocol-beep-detector': 'both',
@@ -2237,6 +2265,8 @@ export default function App() {
   const gapShapesRef     = useRef([])
   const calculatorShapesRef = useRef([])
   const calculatorResultsRef = useRef({})
+  const selectedCalculatorContactRef = useRef(null)
+  const deletedStepKeysRef = useRef(new Set())
   const activeCalculatorsRef = useRef([])
   const calculatorDataVersionRef = useRef(0)
   const cursorShapesRef  = useRef([])
@@ -2315,6 +2345,8 @@ export default function App() {
   useEffect(() => { correctedXDataColRef.current = correctedXDataCol }, [correctedXDataCol])
   useEffect(() => { relabelStepRef.current = relabelStep }, [relabelStep])
   useEffect(() => { calculatorResultsRef.current = calculatorResults }, [calculatorResults])
+  useEffect(() => { selectedCalculatorContactRef.current = selectedCalculatorContact }, [selectedCalculatorContact])
+  useEffect(() => { deletedStepKeysRef.current = deletedStepKeys }, [deletedStepKeys])
   useEffect(() => { activeCalculatorsRef.current = activeCalculators }, [activeCalculators])
   useEffect(() => { chartsLockedRef.current = chartsLocked }, [chartsLocked])
 
@@ -2578,6 +2610,8 @@ export default function App() {
     setActiveCalculators([])
     setCalculatorLoading('')
     setSelectedCalculatorContact(null)
+    // Deletions key off the old detector output, so they mean nothing here.
+    setDeletedStepKeys(new Set())
     setExtraCalculatorsOpen(false)
     setProtocolDetectorsOpen(false)
     setOffsetST(0)
@@ -2818,10 +2852,18 @@ export default function App() {
       const result = calculatorResultsRef.current[calculatorId]
       if (!style || !result?.contacts?.length) return
 
-      result.contacts.forEach(contact => {
+      const selected = selectedCalculatorContactRef.current
+      result.contacts.forEach((contact, index) => {
         if (contact.foot === 'left' && !showSensor1) return
         if (contact.foot === 'right' && !showSensor2) return
-        const eventStyle = calculatorEventStyle(style, contact)
+        // A step the operator deleted keeps its place as a grey ghost rather
+        // than vanishing, so a mis-click can be seen and taken back.
+        const isDeleted = isStepContact(contact)
+          && deletedStepKeysRef.current.has(stepKey(calculatorId, contact))
+        const isSelected = selected?.calculatorId === calculatorId && selected?.index === index
+        const eventStyle = isDeleted
+          ? DELETED_STEP_STYLE
+          : calculatorEventStyle(style, contact)
         const shift = contact.foot === 'right'
           ? offsetS2Ref.current
           : contact.foot === 'left'
@@ -2833,11 +2875,11 @@ export default function App() {
         pushAcrossSubplots(calculatorShapes, {
           type: 'rect', x0, x1,
           y0: 0, y1: 1,
-          fillcolor: eventStyle.fill,
+          fillcolor: isSelected ? SEL_FILL : eventStyle.fill,
           line: {
-            color: eventStyle.color,
-            width: eventStyle.width,
-            dash: eventStyle.dash,
+            color: isSelected ? SEL_LINE : eventStyle.color,
+            width: isSelected ? 3 : eventStyle.width,
+            dash: isSelected ? 'solid' : eventStyle.dash,
           },
           layer: 'below',
         })
@@ -2913,7 +2955,7 @@ export default function App() {
 
   useEffect(() => {
     if (plotInitRef.current && chartDivRef.current) updateOverlayShapes()
-  }, [showGaps, checkHzData, showSensor1, showSensor2, showSpeedTracker, offsetS1, offsetS2, offsetST, timeUnit, selectedCols, selectedMarkup, calculatorResults, activeCalculators, updateOverlayShapes])
+  }, [showGaps, checkHzData, showSensor1, showSensor2, showSpeedTracker, offsetS1, offsetS2, offsetST, timeUnit, selectedCols, selectedMarkup, calculatorResults, activeCalculators, selectedCalculatorContact, deletedStepKeys, updateOverlayShapes])
 
   useEffect(() => {
     if (!chartReady || !chartDivRef.current) return
@@ -2956,6 +2998,25 @@ export default function App() {
     else setRightContacts(removeInterval)
     setSelectedMarkup(null)
   }, [selectedMarkup])
+
+  // ── Target step actions ───────────────────────────────────────────────────
+  /**
+   * Strike a detected step out of Target, or put a struck-out one back. Only
+   * steps: a turn, a sprint or a flight is an event the model reports, not
+   * something the Target column ever marks.
+   */
+  const toggleDeletedStep = useCallback((entry) => {
+    if (!entry || !isStepContact(entry.contact)) return
+    const key = stepKey(entry.calculatorId, entry.contact)
+    setDeletedStepKeys(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
+
+  const restoreDeletedSteps = useCallback(() => setDeletedStepKeys(new Set()), [])
 
   // ── Activity ribbon actions ───────────────────────────────────────────────
   /** Take back the half-placed span first, then the last completed one. */
@@ -3111,6 +3172,24 @@ export default function App() {
   }, [activityMode, relabelSelectedActivity, deleteSelectedActivity, nudgeActivityEdge])
 
 
+  // Delete strikes the selected step out of Target; pressing it again on the
+  // ghost that is left puts the step back. Activity mode has its own Delete,
+  // and no calculator contact can be selected while it is on.
+  useEffect(() => {
+    if (activityMode) return undefined
+    if (!selectedCalculatorContact || !isStepContact(selectedCalculatorContact.contact)) return undefined
+    const onKey = (event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      const tag = event.target?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || event.target?.isContentEditable) return
+      if (event.key !== 'Delete' && event.key !== 'Backspace') return
+      event.preventDefault()
+      toggleDeletedStep(selectedCalculatorContact)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [activityMode, selectedCalculatorContact, toggleDeletedStep])
+
   const generateCsvString = useCallback(() => {
     if (!parquetData) return ''
     const allCols = Object.keys(parquetData)
@@ -3136,18 +3215,25 @@ export default function App() {
       return ivs.some(([a, b]) => tv >= a && tv <= b)
     }
 
-    // step_detected is sourced from calculator/model output (GCT contacts),
-    // entirely separate from the hand-placed Target markup above - it must
-    // reflect what the model found, not get folded into or gated by it.
+    // Detected steps are Target too: the model's contacts, minus the ones the
+    // operator struck out on the chart, unioned with the hand-placed zones
+    // above - which are how a step the model missed gets added. Model times
+    // come back in raw sample time, so unlike the hand-placed zones they need
+    // no offset removed.
     const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
     const detectedL = []
     const detectedR = []
-    const calculatorIds = [...new Set(['step-cadence', ...activeCalculatorsRef.current])]
+    const deleted = deletedStepKeysRef.current
+    // Only the detectors currently switched on: Target has to be what the
+    // operator can see and edit on the chart. A result left in the cache by a
+    // detector they switched off draws nothing, so it must not write 1s either.
+    const calculatorIds = activeCalculatorsRef.current
     calculatorIds.forEach(calculatorId => {
       const contacts = calculatorResultsRef.current[calculatorId]?.contacts
       if (!contacts?.length) return
       contacts.forEach(contact => {
-        if (contact.kind !== 'contact' && contact.kind !== 'step') return
+        if (!isStepContact(contact)) return
+        if (deleted.has(stepKey(calculatorId, contact))) return
         const start = Number(contact.start_time_s) * timeScale
         const end = Number(contact.end_time_s) * timeScale
         if (!Number.isFinite(start) || !Number.isFinite(end)) return
@@ -3157,7 +3243,7 @@ export default function App() {
       })
     })
 
-    const hdr = [...allCols, 'Target', 'step_detected'].join(',')
+    const hdr = [...allCols, 'Target'].join(',')
     const rows = []
     for (let i = 0; i < n; i++) {
       const name = nameArr[i] || ''
@@ -3167,23 +3253,15 @@ export default function App() {
       const target = name === SPEED_TRACKER
         ? ''
         : isRight
-          ? (inIv(t, rIv) ? 1 : 0)
+          ? (inIv(t, rIv) || inIv(t, detectedR) ? 1 : 0)
           : isLeft
-            ? (inIv(t, lIv) ? 1 : 0)
-            : ''
-      const stepDetected = name === SPEED_TRACKER
-        ? ''
-        : isRight
-          ? (inIv(t, detectedR) ? 1 : 0)
-          : isLeft
-            ? (inIv(t, detectedL) ? 1 : 0)
+            ? (inIv(t, lIv) || inIv(t, detectedL) ? 1 : 0)
             : ''
       const vals = allCols.map(c => {
         const v = parquetData[c][i]
         return v == null ? '' : String(v)
       })
       vals.push(String(target))
-      vals.push(String(stepDetected))
       rows.push(vals.join(','))
     }
 
@@ -3385,8 +3463,10 @@ export default function App() {
       return
     }
     const hasManualMarkup = leftContactsRef.current.length > 0 || rightContactsRef.current.length > 0
-    const hasDetectedSteps = ['step-cadence', ...activeCalculatorsRef.current].some(id =>
-      calculatorResultsRef.current[id]?.contacts?.some(c => c.kind === 'contact' || c.kind === 'step')
+    const hasDetectedSteps = activeCalculatorsRef.current.some(id =>
+      calculatorResultsRef.current[id]?.contacts?.some(c =>
+        isStepContact(c) && !deletedStepKeysRef.current.has(stepKey(id, c))
+      )
     )
     if (!hasManualMarkup && !hasDetectedSteps) {
       setStatus({ text: 'Нет разметки для сохранения', type: 'error' })
@@ -3551,6 +3631,8 @@ export default function App() {
         setActiveCalculators([])
         setCalculatorLoading('')
         setSelectedCalculatorContact(null)
+        // Deletions key off the old detector output, so they mean nothing here.
+        setDeletedStepKeys(new Set())
         setExtraCalculatorsOpen(false)
         setProtocolDetectorsOpen(false)
         setOffsetST(0)
@@ -3739,6 +3821,8 @@ export default function App() {
     setActiveCalculators([])
     setCalculatorLoading('')
     setSelectedCalculatorContact(null)
+    // Deletions key off the old detector output, so they mean nothing here.
+    setDeletedStepKeys(new Set())
     anglesUnwrappedRef.current = false
     setAnglesUnwrapped(false)
     mirrorLeftRef.current = false
@@ -4037,6 +4121,8 @@ export default function App() {
     setActiveCalculators([])
     setCalculatorLoading('')
     setSelectedCalculatorContact(null)
+    // Deletions key off the old detector output, so they mean nothing here.
+    setDeletedStepKeys(new Set())
     setExtraCalculatorsOpen(false)
     setProtocolDetectorsOpen(false)
     setOffsetST(0)
@@ -4652,7 +4738,7 @@ export default function App() {
 
       const findCalculatorContact = (x) => {
         const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
-        const calculatorIds = [...new Set(['step-cadence', ...activeCalculatorsRef.current])]
+        const calculatorIds = activeCalculatorsRef.current
         const candidates = []
 
         calculatorIds.forEach(calculatorId => {
@@ -5124,6 +5210,31 @@ export default function App() {
   }
 
   const totalContacts = leftContacts.length + rightContacts.length
+
+  // What the exported Target column is made of, so the operator can see the
+  // effect of a deletion without opening the CSV.
+  const targetStepStats = useMemo(() => {
+    let detected = 0
+    let removed = 0
+    activeCalculators.forEach(id => {
+      (calculatorResults[id]?.contacts || []).forEach(contact => {
+        if (!isStepContact(contact)) return
+        if (deletedStepKeys.has(stepKey(id, contact))) removed += 1
+        else detected += 1
+      })
+    })
+    const manual = Math.floor(leftContacts.length / 2) + Math.floor(rightContacts.length / 2)
+    return { detected, removed, manual, total: detected + manual }
+  }, [calculatorResults, activeCalculators, deletedStepKeys, leftContacts, rightContacts])
+
+  /** The selected contact, when it is a step Target can hold. */
+  const selectedStepEntry = selectedCalculatorContact
+    && isStepContact(selectedCalculatorContact.contact)
+    ? selectedCalculatorContact
+    : null
+  const selectedStepDeleted = selectedStepEntry
+    ? deletedStepKeys.has(stepKey(selectedStepEntry.calculatorId, selectedStepEntry.contact))
+    : false
 
   // ── Login modal ───────────────────────────────────────────────────────────
   if (!token) {
@@ -6281,6 +6392,29 @@ export default function App() {
                     <span className="lab-stat-r">S2: {Math.floor(rightContacts.length / 2)}</span>
                   </span>
                 )}
+                {targetStepStats.detected + targetStepStats.removed > 0 && (
+                  <span
+                    className="lab-stat lab-stat-target"
+                    title={'Из чего собирается колонка Target: шаги моделей минус удалённые вами '
+                      + 'плюс интервалы, размеченные вручную. Клик по шагу на графике → «Удалить из Target» или Del.'}
+                  >
+                    Target: <b>{targetStepStats.total}</b>
+                    <span className="lab-stat-sep">·</span>
+                    модель {targetStepStats.detected}
+                    {targetStepStats.removed > 0 && <> <span className="lab-stat-del">−{targetStepStats.removed}</span></>}
+                    {targetStepStats.manual > 0 && <> <span className="lab-stat-add">+{targetStepStats.manual} вручную</span></>}
+                  </span>
+                )}
+                {targetStepStats.removed > 0 && (
+                  <button
+                    type="button"
+                    className="btn-secondary lab-btn"
+                    onClick={restoreDeletedSteps}
+                    title={`Вернуть в Target все ${targetStepStats.removed} удалённых шагов`}
+                  >
+                    <UiIcon name="undo" /> Вернуть удалённые
+                  </button>
+                )}
                 <button
                   type="button"
                   className="btn-primary lab-btn save-db"
@@ -6309,7 +6443,7 @@ export default function App() {
                   onClick={exportLabels}
                   disabled={!parquetData}
                   title={parquetData
-                    ? 'Скачать CSV данных с колонкой Target (0, если разметки нет)'
+                    ? 'Скачать CSV данных с колонкой Target: шаги моделей за вычетом удалённых плюс ручная разметка (0, если разметки нет)'
                     : 'Сначала загрузите сессию, parquet или CSV'}
                 >
                   <UiIcon name="download" /> Скачать CSV
@@ -6702,7 +6836,10 @@ export default function App() {
             {selectedCalculatorContact && (() => {
               const detail = selectedCalculatorContact.contact
               const calculator = CALCULATOR_BY_ID[selectedCalculatorContact.calculatorId]
-              const detailStyle = calculatorEventStyle(calculator, detail)
+              const isStep = isStepContact(detail)
+              const detailStyle = isStep && selectedStepDeleted
+                ? DELETED_STEP_STYLE
+                : calculatorEventStyle(calculator, detail)
               const foot = detail.foot === 'left' ? 'L' : detail.foot === 'right' ? 'R' : 'ALL'
               const durationLabel = {
                 flight: 'Flight',
@@ -6718,7 +6855,10 @@ export default function App() {
                   style={{ '--calculator-color': detailStyle.color }}
                 >
                   <div className="calculator-contact-head">
-                    <span>{calculator?.label || 'ML-контакт'} · {foot} · #{selectedCalculatorContact.index + 1}</span>
+                    <span>
+                      {calculator?.label || 'ML-контакт'} · {foot} · #{selectedCalculatorContact.index + 1}
+                      {isStep && selectedStepDeleted && <span className="calculator-contact-tag"> вне Target</span>}
+                    </span>
                     <button
                       type="button"
                       className="calculator-contact-close"
@@ -6747,6 +6887,21 @@ export default function App() {
                       <span>дистанция {formatMetric(detail.distance_m, 2, ' м')}</span>
                     )}
                   </div>
+                  {isStep && (
+                    <div className="calculator-contact-actions">
+                      <button
+                        type="button"
+                        className={`calculator-contact-action${selectedStepDeleted ? ' restore' : ''}`}
+                        onClick={() => toggleDeletedStep(selectedCalculatorContact)}
+                        title={selectedStepDeleted
+                          ? 'Вернуть шаг в колонку Target (Del)'
+                          : 'Убрать шаг из колонки Target — в этом интервале станет 0 (Del)'}
+                      >
+                        {selectedStepDeleted ? '↩ Вернуть в Target' : '✕ Удалить из Target'}
+                      </button>
+                      <kbd className="calculator-contact-kbd">Del</kbd>
+                    </div>
+                  )}
                 </div>
               )
             })()}
