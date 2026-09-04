@@ -180,6 +180,12 @@ const ST_COL_COLORS = {
 // Speed/Distance-predict overlays (charts/sprint): drawn on top of their
 // respective subplots. Both read from the same fetched series.
 const SPEED_PRED_COLS = new Set(['Speed', 'VelocityMs'])
+// Virtual subplot for the per-foot GRF model. Its prediction has no raw column to
+// live on, so a panel is created for it the way `Speed` is created for speed
+// predict: the name goes into selectedCols and the traces are drawn onto it.
+const GRF_PRED_COL = 'GRF %BW'
+// Weight is a conditioning input of both force models, so it cannot be defaulted.
+const WEIGHT_REQUIRED_CALCULATORS = new Set(['force-jump', 'grf-split'])
 const DISTANCE_PRED_COLS = new Set(['Distance', 'DistanceM'])
 const PRED_COLOR = '#d62728'
 const TRACE_HOVER_TEMPLATE = '<b>%{fullData.name}</b><br>Время: %{x}<br>Значение: %{y:.4g}<extra></extra>'
@@ -225,6 +231,15 @@ const EXTRA_CALCULATORS = [
     description: 'Пиковая вертикальная сила по двум стопам',
     color: '#dc2626',
     fill: 'rgba(220,38,38,0.10)',
+  },
+  {
+    id: 'grf-split',
+    label: 'Total GRF · по платформам',
+    description: 'Кривая суммарной вертикальной силы (обе стопы) в %BW · обучена по двум '
+      + 'силовым платформам · цель — плита с low-pass 20 Гц, сравнивать с колонкой '
+      + 'Plate_Fz_total_lp20_pctBW; против сырой плиты пик приземления ниже ~10% по определению',
+    color: '#7c3aed',
+    fill: 'rgba(124,58,237,0.10)',
   },
 ]
 const FEATURED_EXTRA_CALCULATOR_IDS = new Set(['step-detector-ttest'])
@@ -291,7 +306,27 @@ const PROTOCOL_SECTION_CALCULATOR_IDS = new Set([
   ...PROTOCOL_DETECTORS.map(detector => detector.id),
   ...FEATURED_EXTRA_CALCULATORS.map(calculator => calculator.id),
 ])
-const CALCULATOR_BY_ID = { ...EXTRA_CALCULATOR_BY_ID, ...PROTOCOL_DETECTOR_BY_ID }
+// Force-plate ground truth of the jump detector. Not a calculator card: it lives
+// as a toggle in the chart toolbar (beside «Углы» / «Дрейф»), because it is a
+// property of the loaded data, not a model - it exists only when the session
+// carries the plate force. Registered here so the shared overlay / click-to-
+// inspect machinery treats its bilateral segments like any calculator's.
+const PLATE_FLIGHT_ID = 'plate-flight'
+const PLATE_FORCE_COLUMNS = ['Plate_Fz_N', '1:Fz', '2:Fz']
+const PLATE_FLIGHT_CALCULATOR = {
+  id: PLATE_FLIGHT_ID,
+  label: 'Полёт по плитам · разметка v7',
+  description: 'Ground truth прыжков по силовым платформам: обе плиты < 20 Н, '
+    + 'гейт «удар ИЛИ свободное падение», прыжки через край плиты — маска; '
+    + 'та же разметка, на которой обучается Jump events',
+  color: '#15803d',
+  fill: 'rgba(21,128,61,0.16)',
+}
+const CALCULATOR_BY_ID = {
+  ...EXTRA_CALCULATOR_BY_ID,
+  ...PROTOCOL_DETECTOR_BY_ID,
+  [PLATE_FLIGHT_ID]: PLATE_FLIGHT_CALCULATOR,
+}
 const PER_FOOT_TURN_DETECTOR_IDS = new Set([
   'protocol-shuttle-detector',
   'protocol-beep-detector',
@@ -311,6 +346,14 @@ const CALCULATOR_COLUMNS = {
     'AcX', 'AcY', 'AcZ',
     'XData', 'YData', 'ZData',
     'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4',
+  ],
+  // The labeler reads |a| (free fall + impact), the insole sum (foot on the
+  // floor beside the plate) and the plate force itself, in newtons.
+  [PLATE_FLIGHT_ID]: [
+    'Name', 'Time',
+    'AcX', 'AcY', 'AcZ',
+    'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4',
+    ...PLATE_FORCE_COLUMNS,
   ],
 }
 
@@ -332,6 +375,15 @@ const EVENT_STYLE_BY_KIND = {
   },
   sprint: {
     label: 'Отрезок 30 м', color: '#dc2626', fill: 'rgba(220,38,38,0.07)', dash: 'solid', width: 2.5,
+  },
+  // Plate ground truth: a jump the labeler accepted, and a segment it refused to
+  // call either flight or ground (no impact, no free fall, or an insole loaded
+  // beside the plate) - the model is neither taught nor scored on the grey ones.
+  plate_flight: {
+    label: 'Полёт по плитам', color: '#15803d', fill: 'rgba(21,128,61,0.16)', dash: 'solid', width: 2,
+  },
+  plate_mask: {
+    label: 'Маска: неизвестно', color: '#6b7280', fill: 'rgba(107,114,128,0.16)', dash: 'dot', width: 1.25,
   },
 }
 const TURN_EVENT_STYLE_BY_FOOT = {
@@ -421,6 +473,10 @@ function calculatorEventLegend(calculator, result) {
           ? contact?.is_complete === false ? 'Неполный спринт' : 'Отрезок 30 м'
           : kind === 'flight'
             ? `Прыжок${footSuffix}`
+            : kind === 'plate_flight'
+              ? 'Полёт по плитам'
+            : kind === 'plate_mask'
+              ? 'Маска: неизвестно'
             : kind === 'step'
               ? `Шаг ${foot}`
               : ['contact', 'plateau'].includes(kind)
@@ -4333,6 +4389,11 @@ export default function App() {
 
     if (activeCalculators.includes(calculatorId) && !force) {
       setActiveCalculators(prev => prev.filter(id => id !== calculatorId))
+      // The GRF panel exists only for the prediction, so it goes away with it -
+      // unless the session really has a column by that name.
+      if (calculatorId === 'grf-split' && !columns.includes(GRF_PRED_COL)) {
+        setSelectedCols(prev => prev.filter(col => col !== GRF_PRED_COL))
+      }
       return
     }
 
@@ -4358,8 +4419,12 @@ export default function App() {
     if (!parquetData || calculatorLoading) return
 
     const parsedWeight = Number(weightKg)
-    if (calculatorId === 'force-jump' && (!Number.isFinite(parsedWeight) || parsedWeight <= 0)) {
-      setStatus({ text: 'Укажите положительный вес для Bilateral GRF', type: 'error', area: 'models' })
+    // Both force models take body weight as a model input, not just as a unit
+    // conversion, so a missing weight is refused rather than defaulted here.
+    if (WEIGHT_REQUIRED_CALCULATORS.has(calculatorId)
+      && (!Number.isFinite(parsedWeight) || parsedWeight <= 0)) {
+      const which = calculatorId === 'grf-split' ? 'Total GRF' : 'Bilateral GRF'
+      setStatus({ text: `Укажите положительный вес для ${which}`, type: 'error', area: 'models' })
       return
     }
 
@@ -4367,8 +4432,12 @@ export default function App() {
     setCalculatorLoading(calculatorId)
     try {
       const payload = { columns: columnsForCalculator(calculatorId, parquetData) }
-      if (calculatorId === 'force-jump') payload.weight_kg = parsedWeight
+      if (WEIGHT_REQUIRED_CALCULATORS.has(calculatorId)) payload.weight_kg = parsedWeight
       if (calculatorId === 'jump-events') payload.protocol = jumpEventProtocol
+      // The GRF model reads its take-off / landing instants from the plate-trained
+      // jump detector, which is conditioned on the movement, so pass the same
+      // protocol the Jump events calculator uses.
+      if (calculatorId === 'grf-split') payload.protocol = jumpEventProtocol
       if (PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)) {
         const selectedSensorName = requestedDetectionFoot === 'both'
           ? ''
@@ -4394,6 +4463,9 @@ export default function App() {
 
       setCalculatorResults(prev => ({ ...prev, [calculatorId]: data }))
       setActiveCalculators(prev => prev.includes(calculatorId) ? prev : [...prev, calculatorId])
+      if (calculatorId === 'grf-split' && data.data_points?.length) {
+        setSelectedCols(prev => prev.includes(GRF_PRED_COL) ? prev : [...prev, GRF_PRED_COL])
+      }
       setSelectedCalculatorContact(prev => prev?.calculatorId === calculatorId ? null : prev)
 
       const left = data.summary?.left?.contact_count || 0
@@ -4405,6 +4477,17 @@ export default function App() {
           ? `${data.summary?.total_jump_count || 0} прыж. · высота ${formatMetric(data.summary?.mean_jump_height_cm, 1, ' см')}`
           : calculatorId === 'force-jump'
             ? `пик ${formatMetric(data.summary?.peak_force_n, 1, ' Н')} · ${formatMetric(data.summary?.peak_force_bw, 2, ' BW')}`
+          : calculatorId === 'grf-split'
+            ? `${data.summary?.jump_count || 0} прыж. · пик ${formatMetric(data.summary?.peak_force?.percent_bw, 0, ' %BW')}`
+              + ` · импульс ${formatMetric(data.summary?.mean_contact_impulse_bw_s, 2, ' BW·с')}`
+              + ` · ${data.data_points?.length || 0} точек кривой`
+          : calculatorId === PLATE_FLIGHT_ID
+            ? `${data.summary?.total_jump_count || 0} полётов по плитам`
+              + ` (только падение ${data.summary?.jumps_free_fall_only || 0})`
+              + ` · маска ${(data.summary?.masked_no_gate || 0) + (data.summary?.masked_insole_loaded || 0)}`
+              + ` · через край плиты ${(data.summary?.hops_onto_plate || 0) + (data.summary?.hops_off_plate || 0)}`
+              + ` · досинхр. плит ${formatMetric(data.summary?.resync_ms, 0, ' мс')}`
+              + ` · нуль L ${formatMetric(data.summary?.plate_zero_n?.left, 0, '')} / R ${formatMetric(data.summary?.plate_zero_n?.right, 0, ' Н')}`
             : `L ${left} · R ${right}${cadence != null ? ` · ${cadence.toFixed(0)} spm` : ''}`
       setStatus({
         text: `✓ ${data.label}: ${resultText}`,
@@ -4420,7 +4503,7 @@ export default function App() {
     } finally {
       if (dataVersion === calculatorDataVersionRef.current) setCalculatorLoading('')
     }
-  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg, jumpEventProtocol, turnDetectionFeet, insoleSensorNames])
+  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg, jumpEventProtocol, turnDetectionFeet, insoleSensorNames, columns])
 
   /**
    * What the chart plots: the raw columns, or the same columns with XData
@@ -4540,6 +4623,15 @@ export default function App() {
       if (showDistancePredict && DISTANCE_PRED_COLS.has(col) && speedPredict?.data_points?.length) {
         vals = [...vals, ...speedPredict.data_points.map(point => safeNum(point.distance)).filter(value => value !== null)]
       }
+      // The GRF panel has no raw data at all, so its range comes from the
+      // prediction alone.
+      if (col === GRF_PRED_COL) {
+        const grf = calculatorResults['grf-split']
+        if (grf?.data_points?.length) {
+          vals = [...vals, ...grf.data_points.map(point => safeNum(point.total))
+            .filter(value => value !== null)]
+        }
+      }
       if (!vals.length) { yRanges[col] = [-1, 1]; return }
       const mn = arrayMin(vals), mx = arrayMax(vals)
       const p  = Math.max((mx - mn) * 0.08, 0.1)
@@ -4631,6 +4723,42 @@ export default function App() {
             xaxis: xAxis, yaxis: yAxis,
             marker: { color: PRED_COLOR, size: 11, symbol: 'star', line: { color: '#fff', width: 1 } },
             hovertemplate: TRACE_HOVER_TEMPLATE,
+          })
+        }
+      }
+
+      // Total GRF overlay on its own virtual panel, in %BW where 100 is quiet
+      // standing. The model's time axis is the shared grid built from both feet,
+      // so it carries no S1/S2 shift - it is drawn unshifted on purpose, and
+      // 100 %BW gets a reference line to read the curve against. The curve is in
+      // the model's own definition (plate low-passed at target_lowpass_hz), so the
+      // legend says so; lay Plate_Fz_total_lp20_pctBW over it for a fair check.
+      if (col === GRF_PRED_COL) {
+        const grf = calculatorResults['grf-split']
+        const points = grf?.data_points || []
+        if (points.length) {
+          const grfTimeScale = timeUnitRef.current === 'ms' ? 1 : 0.001
+          const xs = points.map(point => point.time * grfTimeScale)
+          const lpHz = grf?.summary?.target_lowpass_hz
+          traces.push({
+            x: xs,
+            y: points.map(point => point.total),
+            name: lpHz ? `GRF total · ${lpHz} Гц` : 'GRF total',
+            type: 'scatter', mode: 'lines',
+            xaxis: xAxis, yaxis: yAxis,
+            line: { color: '#111827', width: 2 },
+            connectgaps: false,
+            hovertemplate: TRACE_HOVER_TEMPLATE,
+          })
+          traces.push({
+            x: [xs[0], xs[xs.length - 1]],
+            y: [100, 100],
+            name: 'стойка 100 %BW',
+            type: 'scatter', mode: 'lines',
+            xaxis: xAxis, yaxis: yAxis,
+            line: { color: '#9ca3af', width: 1, dash: 'dot' },
+            hoverinfo: 'skip',
+            showlegend: false,
           })
         }
       }
@@ -4940,7 +5068,10 @@ export default function App() {
         }
       })
     })
-  }, [chartData, selectedCols, timeCol, sensorGroups, hasSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict])
+    // calculatorResults is a dependency because the GRF panel draws its curve from
+    // the calculator's result, not from chartData - without it a fresh run would
+    // only appear on the next unrelated redraw.
+  }, [chartData, selectedCols, timeCol, sensorGroups, hasSpeedTracker, updateOverlayShapes, showSensor1, showSensor2, speedPredict, showSpeedPredict, showDistancePredict, calculatorResults])
 
   const toggleChartsLock = useCallback(() => {
     const next = !chartsLockedRef.current
@@ -4996,6 +5127,68 @@ export default function App() {
     setAnglesUnwrapped(anglesUnwrappedRef.current)
     renderChart()
   }, [parquetData, selectedCols, renderChart])
+
+  // ── Force-plate ground truth («Плиты») ────────────────────────────────────
+  // Only a session that carries the plate force can be labelled; a production
+  // session from GCS never does, so the toggle is simply off for it.
+  const hasPlateColumns = useMemo(
+    () => columns.some(col => PLATE_FORCE_COLUMNS.includes(col)),
+    [columns],
+  )
+  const plateFlightActive = activeCalculators.includes(PLATE_FLIGHT_ID)
+  const plateFlightLoading = calculatorLoading === PLATE_FLIGHT_ID
+  const plateFlightResult = calculatorResults[PLATE_FLIGHT_ID]
+
+  /** Hover copy for the toggle: why it is off, or what the labeler found. */
+  const plateFlightTitle = useMemo(() => {
+    if (!parquetData) return 'Загрузите сессию с силовыми платформами'
+    if (!hasPlateColumns) {
+      return `В данных нет силы плит (${PLATE_FORCE_COLUMNS.join(' / ')}) — ground truth по плитам недоступен`
+    }
+    const head = plateFlightActive
+      ? 'Скрыть полёты по плитам'
+      : 'Показать ground truth прыжков по силовым платформам — разметка v7: обе плиты < 20 Н, '
+        + 'гейт «удар в 60 мс ИЛИ свободное падение ≥ 7 м/с²»; обе ноги в воздухе от края до края при «нагруженной» стельке — '
+        + 'прыжок (стелька врёт, плиты главнее); прыжки с пола на плиту / с плиты на пол — маска '
+        + '(виден только один плитный край); та же разметка, на которой обучается Jump events'
+    const s = plateFlightResult?.summary
+    if (!s) return head
+    return [
+      head,
+      `${s.total_jump_count} прыжков (удар+падение ${s.jumps_impact_and_free_fall} · только удар ${s.jumps_impact_only} · только падение ${s.jumps_free_fall_only}`
+        + ` · стелька врёт ${s.jumps_insole_lies ?? 0})`,
+      `маска: ${s.masked_no_gate} без гейта · ${s.masked_insole_loaded} стелька на полу`
+        + ` · через край плиты: ${s.hops_onto_plate ?? 0} на плиту / ${s.hops_off_plate ?? 0} с плиты`,
+      `досинхронизация плит ${s.resync_ms} мс (r ${s.resync_r})`,
+      `нуль плит L ${s.plate_zero_n?.left} / R ${s.plate_zero_n?.right} Н`,
+    ].join(' · ')
+  }, [parquetData, hasPlateColumns, plateFlightActive, plateFlightResult])
+
+  /**
+   * Turn the accepted flights into markup: one S1 and one S2 interval per jump,
+   * Target=1 on both feet for the airborne rows - the bilateral convention the
+   * detector is trained and scored against. Replaces the current markup, after
+   * asking, because merging would stack duplicates on a second press.
+   */
+  const handlePlateFlightToMarkup = useCallback(() => {
+    const jumps = (plateFlightResult?.contacts || []).filter(c => c.kind === 'plate_flight')
+    if (!jumps.length) {
+      setStatus({ text: 'Полётов по плитам нет — разметка не изменена', type: 'error' })
+      return
+    }
+    const hasMarkup = leftContactsRef.current.length > 0 || rightContactsRef.current.length > 0
+    if (hasMarkup && !window.confirm(
+      `Заменить текущую разметку S1 и S2 на ${jumps.length} полётов по плитам?`)) return
+    const scale = timeUnit === 'ms' ? 1000 : 1
+    const pairs = (shift) => jumps.flatMap(c => [c.start_time_s * scale + shift, c.end_time_s * scale + shift])
+    setLeftContacts(pairs(offsetS1))
+    setRightContacts(pairs(offsetS2))
+    setSelectedMarkup(null)
+    setStatus({
+      text: `✓ ${jumps.length} полётов по плитам записаны в разметку S1 и S2 (Target=1 — полёт)`,
+      type: 'ok',
+    })
+  }, [plateFlightResult, timeUnit, offsetS1, offsetS2])
 
   const mirrorableCols = useMemo(
     () => selectedCols.filter(col => MIRRORED_LEFT_COLUMNS.has(col)),
@@ -6019,6 +6212,35 @@ export default function App() {
                                           </>
                                         : calculator.id === 'force-jump'
                                           ? `пик ${formatMetric(summary?.peak_force_n, 1, ' Н')} · ${formatMetric(summary?.peak_force_bw, 2, ' BW')}`
+                                        : calculator.id === 'grf-split'
+                                        ? <>
+                                            <span>
+                                              {summary?.jump_count || 0} прыж. · пик {formatMetric(summary?.peak_force?.percent_bw, 0, ' %BW')}
+                                              {' ('}{formatMetric(summary?.peak_force?.n, 0, ' Н')}{')'}
+                                            </span>
+                                            <br />
+                                            <span>
+                                              отталкивание {formatMetric(summary?.avg_pushoff_force?.percent_bw, 0, ' %BW')}
+                                              {' · приземление '}{formatMetric(summary?.avg_landing_force?.percent_bw, 0, ' %BW')}
+                                              {' · импульс '}{formatMetric(summary?.mean_contact_impulse_bw_s, 2, ' BW·с')}
+                                            </span>
+                                            <br />
+                                            <span title="Цель модели — сила с плиты после low-pass фильтра; сравнивайте с колонкой Plate_Fz_total_lp20_pctBW, а не с сырой плитой">
+                                              {summary?.target_lowpass_hz
+                                                ? `определение: плита low-pass ${summary.target_lowpass_hz} Гц`
+                                                : 'определение: сырая плита'}
+                                            </span>
+                                            <br />
+                                            {/* The model's own card, so a landing peak is never read as measured */}
+                                            <span title="Измерено по силовым платформам на атлетах, которых модель не видела">
+                                              на невиданных атлетах: contact RMSE {formatMetric(summary?.held_out_contact_rmse_pctbw, 1, ' %BW')}
+                                              {' · пик приземления MAE '}{formatMetric(summary?.held_out_landing_peak_mae_pctbw, 0, ' %BW')}
+                                              {' · bias '}{formatMetric(summary?.held_out_landing_peak_bias_pctbw, 0, ' %BW')}
+                                              {summary?.held_out_landing_peak_raw_bias_pctbw != null
+                                                && ` (vs сырая плита ${formatMetric(summary.held_out_landing_peak_raw_bias_pctbw, 0, ' %BW')})`}
+                                              {summary?.weight_source === 'cohort default' && ' · вес по умолчанию!'}
+                                            </span>
+                                          </>
                                           : <>
                                             <span>
                                               L {leftCount} · R {rightCount}
@@ -6327,6 +6549,30 @@ export default function App() {
                       </button>
                       {yawDrift && !yawDrift.applied && (
                         <span className="yaw-drift-note">{yawDrift.reason}</span>
+                      )}
+                    </span>
+                    {/* Force-plate ground truth. The span carries the tooltip so
+                        the reason stays readable while the button is disabled. */}
+                    <span className="plate-flight-ctl" title={plateFlightTitle}>
+                      <button
+                        type="button"
+                        className={`btn-secondary btn-unwrap${plateFlightActive ? ' active' : ''}`}
+                        disabled={!hasPlateColumns || plateFlightLoading}
+                        onClick={() => toggleAdditionalCalculator(PLATE_FLIGHT_ID)}
+                        aria-pressed={plateFlightActive}
+                        aria-label={plateFlightTitle}
+                      >
+                        <UiIcon name={plateFlightLoading ? 'loader' : 'plate'} /> Плиты
+                      </button>
+                      {plateFlightActive && plateFlightResult?.contacts?.length > 0 && (
+                        <button
+                          type="button"
+                          className="btn-secondary btn-unwrap"
+                          onClick={handlePlateFlightToMarkup}
+                          title="Записать полёты по плитам в разметку S1 и S2 как интервалы Target=1 (текущая разметка заменяется)"
+                        >
+                          <UiIcon name="pencil" /> в разметку
+                        </button>
                       )}
                     </span>
                     <button
@@ -6843,6 +7089,8 @@ export default function App() {
               const foot = detail.foot === 'left' ? 'L' : detail.foot === 'right' ? 'R' : 'ALL'
               const durationLabel = {
                 flight: 'Flight',
+                plate_flight: 'Flight · плиты',
+                plate_mask: 'Маска',
                 contact: 'GCT',
                 step: 'GCT',
                 turn: 'Поворот',
@@ -6872,6 +7120,27 @@ export default function App() {
                     <span>конец {formatMetric(detail.end_time_s, 3, ' s')}</span>
                     {detail.confidence != null && (
                       <span>confidence {formatMetric(Number(detail.confidence) * 100, 0, '%')}</span>
+                    )}
+                    {detail.status && <span><b>{detail.status}</b></span>}
+                    {detail.plate_edge_time_s != null && (
+                      <span title="единственный плитный край этого прыжка: приземление для прыжка на плиту, отрыв для прыжка с плиты">
+                        плитный край {formatMetric(detail.plate_edge_time_s, 3, ' s')}
+                      </span>
+                    )}
+                    {detail.impact_ratio != null && (
+                      <span title="макс. TKEO |a| в 60 мс после приземления, доля от p99 сессии; гейт ≥ 0.30">
+                        удар {formatMetric(detail.impact_ratio, 2, '·p99')}
+                      </span>
+                    )}
+                    {detail.free_fall_ms2 != null && (
+                      <span title="медиана min(|a| L, |a| R) в середине сегмента; полёт ≈ 9.8, гейт ≥ 7">
+                        падение {formatMetric(detail.free_fall_ms2, 1, ' м/с²')}
+                      </span>
+                    )}
+                    {detail.loaded_frac != null && (
+                      <span title="доля сегмента, где стелька нагружена (> 0.30 норм. суммы); > 0.20 — стопа на полу мимо плиты">
+                        стелька нагружена {formatMetric(Number(detail.loaded_frac) * 100, 0, '%')}
+                      </span>
                     )}
                     {detail.direction && <span>направление {detail.direction}</span>}
                     {detail.angle_deg != null && <span>угол {formatMetric(detail.angle_deg, 0, '°')}</span>}
@@ -7129,6 +7398,10 @@ function UiIcon({ name, className = '' }) {
       break
     case 'mirror':
       artwork = <><path d="M12 3v18" strokeDasharray="3 3" /><path d="M9 8 4 12l5 4z" /><path d="m15 8 5 4-5 4z" /></>
+      break
+    case 'plate':
+      // Two force plates side by side with a foot-off arrow above them.
+      artwork = <><rect x="2.5" y="15" width="8" height="5" rx="1" /><rect x="13.5" y="15" width="8" height="5" rx="1" /><path d="M12 12V4" /><path d="m8.5 7.5 3.5-3.5 3.5 3.5" /></>
       break
     case 'x':
       artwork = <path d="m6 6 12 12M18 6 6 18" />

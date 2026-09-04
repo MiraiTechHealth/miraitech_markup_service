@@ -1568,6 +1568,22 @@ label.lab-btn:has(input:focus-visible) {
   white-space: nowrap;
 }
 
+/* Force-plate ground-truth toggle («Плиты») plus its "write to markup" action,
+   which only appears while the plate flights are on the chart. */
+.plate-flight-ctl {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.plate-flight-ctl .btn-unwrap.active {
+  background: #dcfce7;
+  color: #15803d;
+  border-color: #4ade80;
+}
+
+.plate-flight-ctl .btn-unwrap.active:hover { background: #bbf7d0 }
+
 .label-toolbar-actions {
   margin-left: auto;
   padding: 4px;
