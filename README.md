@@ -22,8 +22,13 @@
   веса `0.05·S1 + 0.15·S2 + 0.50·S3 + 0.30·S4`), одна кривая на стопу вместо
   четырёх; логика идентична ноутбуку анализа силовых платформ, поэтому разметка
   ведётся по той же кривой, на которой обучается модель
-- Сворачиваемая панель калькуляторов: Speed/Distance Predict, Step Detector
-  T-Test, TKEO Cadence и Step Cadence
+- Секция «Модели и анализ»: Speed/Distance Predict (CausalSpeedTCN по
+  `charts/sprint`) и одна сворачиваемая группа **«Детекторы и модели»** —
+  детекторы протоколов (тест ходьбы · GCTTCN, челночный бег, Beep, T-тест ·
+  повороты по одной или обеим ногам) и модели по загруженным данным
+  (Step Detector T-Test, Jump events, Total GRF). Общие настройки группы —
+  вес спортсмена и тип движения — лежат сверху; результат каждой карточки
+  рисуется полосами на графике, клик по полосе открывает карточку события
 - Детектор прыжков **Jump events** — отрыв и приземление по всему телу, а не по
   каждой ноге отдельно: модель обучена по силовым платформам, где полёт начинается,
   когда земли лишается **последняя** нога, и кончается касанием **первой**. Поэтому
@@ -88,10 +93,12 @@
 - Запущенный MiraiTech Backend (для загрузки сессий и авторизации)
 - Соседний чекаут `../MiraiTech-backend` — `calculator_api.py` импортирует
   калькуляторы оттуда напрямую (путь переопределяется `MIRAITECH_BACKEND_ROOT`).
-  Модели Jump events и Total GRF берутся из
+  Модели Jump events, Total GRF и теста ходьбы берутся из
   `app/services/calculators/models/` бэкенда (`new_jump_model_byAdil.pt`,
-  `jump_grf_total.pt`); если их там нет, недоступны только эти калькуляторы,
-  остальные работают
+  `jump_grf_total.pt`, `gct_best.pt`); если их там нет, недоступны только эти
+  калькуляторы, остальные работают. Модели загружаются в фоне сразу при старте
+  companion API (`/health` отдаёт `models_ready` и список `unavailable`), так
+  что первый клик не ждёт загрузки весов
 - Действующие Application Default Credentials для Cloud SQL и GCS у companion API
 
 ## Пример использования
@@ -125,7 +132,28 @@ if ($LASTEXITCODE -eq 0) { "Google Cloud: OK" }
 # Сборка
 npm run build
 npm run preview
+
+# Smoke-тесты companion API (нужен parquet ../jump_model/sportsmen_sync/synced_7896.parquet)
+npm run test:api
 ```
+
+## Как калькуляторы получают данные
+
+`POST /calculator-api/calculate/{id}` принимает сессию двумя способами:
+
+- **parquet-байтами** (`Content-Type: application/vnd.apache.parquet`, параметры
+  калькулятора — `weight_kg`, `protocol`, `jump_pairs`, `detection_foot`,
+  `sensor_name` — в query string). Это основной путь: браузер уже держит файл
+  сессии, он уходит на сервер как есть (без сборки 8 МБ JSON), сервер парсит его
+  за ~10 мс и кеширует по хешу содержимого и разобранный DataFrame, и результат
+  каждого калькулятора с его параметрами — повторный запуск отвечает из кеша
+- **JSON** `{"columns": {...}, ...параметры}` — когда данные переписаны в браузере
+  (постпроцессинг IMU) и parquet их уже не описывает
+
+Total GRF принимает `jump_pairs` — полёты, которые Jump events уже нашёл на этих
+данных под тем же движением; тогда детектор прыжков внутри GRF не запускается
+второй раз (он стоит столько же, сколько сама модель силы), а
+`summary.event_source` = `caller`. UI передаёт их автоматически.
 
 **Типовой сценарий:**
 
@@ -149,7 +177,7 @@ npm run preview
 |-----------|------------|
 | UI | React 19, JavaScript (JSX) |
 | Сборка | Vite |
-| Графики | Plotly.js |
+| Графики | Plotly.js (`plotly.js-basic-dist-min` — рисуются только scatter-трейсы, бандл 1.1 МБ вместо 4.6) |
 | Данные | hyparquet (чтение Parquet в браузере) |
 | API | Fetch, прокси Vite → backend |
 
@@ -158,10 +186,25 @@ npm run preview
 ```
 miraitech_markup_service/
 ├── src/
-│   ├── App.jsx       # Основной UI: видео, график, разметка
+│   ├── App.jsx                 # компонент приложения: состояние, видео, график, разметка
 │   ├── App.css
-│   └── main.jsx
-├── vite.config.js    # Прокси /api → backend
+│   ├── main.jsx
+│   ├── components/ui.jsx       # SidebarSection, UploadBtn, UiIcon, SessionTitleBadge, …
+│   └── lib/                    # чистые модули без React-состояния
+│       ├── api.js              # адреса backend / companion API, parseApiError
+│       ├── calculators.js      # карточки моделей: id, колонки, стили событий, сводки
+│       ├── sensors.js          # имена сенсоров → нога, colMap загруженной сессии
+│       ├── signal.js           # производные каналы: TKEO, суммы стельки, калибровка, Sensor_Total_Weighted, пропуски
+│       ├── yawDrift.js         # оценка и коррекция дрейфа курса (порт yaw_drift_calculator.py)
+│       ├── activity.js         # сегменты активности
+│       ├── chart.js            # константы и shape-билдеры Plotly
+│       ├── format.js           # форматирование времени, метрик, метаданных
+│       ├── csv.js              # разбор CSV разметки (Target → интервалы)
+│       └── utils.js
+├── calculator_api.py           # companion API калькуляторов (FastAPI, импортирует backend)
+├── plate_flight_gt.py          # ground truth прыжков по силовым платформам (v7)
+├── tests/test_calculator_api.py # smoke-тесты API на реальной сессии
+├── vite.config.js              # прокси /api → backend, автозапуск companion API
 └── package.json
 ```
 

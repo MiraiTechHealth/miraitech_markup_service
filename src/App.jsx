@@ -1,2175 +1,18 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
-import Plotly from 'plotly.js-dist-min'
+import Plotly from 'plotly.js-basic-dist-min'
 import { parquetReadObjects } from 'hyparquet'
 import './App.css'
-
-// ── Constants ──────────────────────────────────────────────────────────────
-const API_BASE = import.meta.env.VITE_API_BASE ?? (
-  import.meta.env.DEV ? 'http://localhost:8000' : 'https://dev-api.miraitech.health'
-)
-const CALCULATOR_API = import.meta.env.VITE_CALCULATOR_API ?? '/calculator-api'
-const MARKUP_API = `${CALCULATOR_API}/markup`
-const UI_FONT_FAMILY = 'Inter, "Segoe UI Variable", "Segoe UI", Arial, sans-serif'
-
-// Math.max/min(...array) blows the call stack on long sessions (V8 caps spread
-// argument count well below typical sample counts) — reduce instead.
-function arrayMax(arr) {
-  let m = -Infinity
-  for (let i = 0; i < arr.length; i++) if (arr[i] > m) m = arr[i]
-  return m
-}
-function arrayMin(arr) {
-  let m = Infinity
-  for (let i = 0; i < arr.length; i++) if (arr[i] < m) m = arr[i]
-  return m
-}
-
-function parseApiError(errData, status) {
-  const detail = errData?.detail
-  if (typeof detail === 'string') return detail
-  if (Array.isArray(detail)) return detail.map(d => d.msg || String(d)).join('; ')
-  if (detail && typeof detail === 'object') return detail.message || JSON.stringify(detail)
-  return `Ошибка ${status}`
-}
-
-const PALETTE = [
-  '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
-  '#9467bd', '#8c564b', '#e377c2', '#17becf',
-]
-const NON_DATA_COLS = new Set([
-  'Name', 'Time', 'time', 'timestamp', 'Timestamp', 't',
-  'target', 'Target', 'label', 'Label',
-])
-const PREFERRED_COLS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'GravityZ']
-const SPEED_TRACKER = 'ESP32_SpeedTracker'
-
-// ── Activity segmentation ──────────────────────────────────────────────────
-// Free-mode recordings are labelled with independent [from, to] spans, marked
-// the way contacts are: click the start, click the end. Unmarked stretches stay
-// unlabelled rather than being guessed at, and export them with an empty
-// Activity so the training set can drop or keep them deliberately.
-const ACTIVITY_KINDS = [
-  { id: 'stand', label: 'Стоит',    color: '#64748b', key: '1' },
-  { id: 'walk',  label: 'Идёт',     color: '#2ca02c', key: '2' },
-  { id: 'run',   label: 'Бежит',    color: '#ff7f0e', key: '3' },
-  { id: 'jump',  label: 'Прыгает',  color: '#9467bd', key: '4' },
-  { id: 'turn',  label: 'Разворот', color: '#17becf', key: '5' },
-  // Putting the insoles on, walking back to the phone: real signal, but not an
-  // exercise. Kept as a label rather than a gap so the ribbon stays unbroken
-  // and the export can drop these rows deliberately.
-  { id: 'junk',  label: 'Мусор',    color: '#d62728', key: '6' },
-]
-const ACTIVITY_BY_ID = Object.fromEntries(ACTIVITY_KINDS.map(a => [a.id, a]))
-const DEFAULT_ACTIVITY = 'stand'
-const ACTIVITY_FILE_TYPE = 'activity_segments'
-
-/** markup_files holds both markups; the contact UI must not see the ribbon. */
-function contactMarkupFiles(files) {
-  return (files || []).filter(f => f.type !== ACTIVITY_FILE_TYPE)
-}
-
-/** Load stored spans back into plot time by re-adding the saved offset. */
-function activitySpansFromFiles(files, offset) {
-  const file = (files || []).find(f => f.type === ACTIVITY_FILE_TYPE)
-  if (!file || !Array.isArray(file.activitySpans)) return []
-  return file.activitySpans
-    .map(sp => ({
-      from: Number(sp.from) + offset,
-      to: Number(sp.to) + offset,
-      activity: sp.activity,
-      ...(Number.isFinite(Number(sp.angleDeg)) ? { angleDeg: Number(sp.angleDeg) } : {}),
-    }))
-    .filter(sp => Number.isFinite(sp.from) && Number.isFinite(sp.to)
-      && sp.to > sp.from && ACTIVITY_BY_ID[sp.activity])
-    .sort((a, b) => a.from - b.from)
-}
-
-/** Close the pending span at t, ordering the ends so a backwards drag works. */
-function closeActivitySpan(pendingFrom, t, activity) {
-  return {
-    from: Math.min(pendingFrom, t),
-    to: Math.max(pendingFrom, t),
-    activity,
-  }
-}
-
-/** Index of the span containing t, or -1. Later spans win where they overlap. */
-function activitySpanAt(spans, t) {
-  for (let i = spans.length - 1; i >= 0; i--) {
-    if (t >= spans[i].from && t <= spans[i].to) return i
-  }
-  return -1
-}
-
-// Hitting an exact boundary by eye is not realistic, so a new edge lands on a
-// neighbour's edge when it is within this fraction of the visible span. It is
-// relative to the zoom, not absolute, so it stays usable at every scale.
-const ACTIVITY_SNAP_FRACTION = 0.012
-
-/** Pull t onto the nearest existing edge within tolerance, else leave it be. */
-function snapActivityEdge(spans, t, tolerance, skipIndex = -1) {
-  if (!(tolerance > 0)) return t
-  let best = t
-  let bestGap = tolerance
-  spans.forEach((span, i) => {
-    if (i === skipIndex) return
-    for (const edge of [span.from, span.to]) {
-      const gap = Math.abs(edge - t)
-      if (gap < bestGap) { bestGap = gap; best = edge }
-    }
-  })
-  return best
-}
-
-/**
- * Insert a span, carving it out of whatever it overlaps: an activity happens at
- * one time or another, never both at once. Older spans are trimmed, split when
- * the newcomer lands inside them, and dropped when fully covered.
- */
-function insertActivitySpan(spans, incoming) {
-  const out = []
-  spans.forEach(span => {
-    if (span.to <= incoming.from || span.from >= incoming.to) { out.push(span); return }
-    // Covered entirely — the old span disappears.
-    if (span.from >= incoming.from && span.to <= incoming.to) return
-    // Split in two: the newcomer sits strictly inside.
-    if (span.from < incoming.from && span.to > incoming.to) {
-      out.push({ ...span, to: incoming.from })
-      out.push({ ...span, from: incoming.to })
-      return
-    }
-    out.push(span.from < incoming.from
-      ? { ...span, to: incoming.from }
-      : { ...span, from: incoming.to })
-  })
-  out.push(incoming)
-  return out.sort((a, b) => a.from - b.from)
-}
-
-/** Move one edge of a span, refusing to invert it or cross a neighbour. */
-function resizeActivitySpan(spans, index, edge, t) {
-  const span = spans[index]
-  if (!span) return spans
-  const others = spans.filter((_, i) => i !== index)
-  const MIN = 1e-6
-  let next
-  if (edge === 'from') {
-    const limit = others.reduce(
-      (acc, o) => (o.to <= span.to && o.to > acc ? o.to : acc), -Infinity)
-    next = { ...span, from: Math.min(Math.max(t, limit), span.to - MIN) }
-  } else {
-    const limit = others.reduce(
-      (acc, o) => (o.from >= span.from && o.from < acc ? o.from : acc), Infinity)
-    next = { ...span, to: Math.max(Math.min(t, limit), span.from + MIN) }
-  }
-  const copy = [...spans]
-  copy[index] = next
-  return copy
-}
-
-const ST_COLOR = '#2ca02c'
-const ST_COL_NAMES = ['Distance', 'Speed', 'DistanceM', 'VelocityMs']
-const ST_ONLY_COLS = new Set(ST_COL_NAMES)
-// Distinct colours per SpeedTracker column so Distance and Speed don't look alike.
-const ST_COL_COLORS = {
-  Speed: '#2ca02c',       // green — keeps the SpeedTracker brand colour
-  VelocityMs: '#2ca02c',
-  Distance: '#9467bd',    // purple
-  DistanceM: '#9467bd',
-}
-// Speed/Distance-predict overlays (charts/sprint): drawn on top of their
-// respective subplots. Both read from the same fetched series.
-const SPEED_PRED_COLS = new Set(['Speed', 'VelocityMs'])
-// Virtual subplot for the per-foot GRF model. Its prediction has no raw column to
-// live on, so a panel is created for it the way `Speed` is created for speed
-// predict: the name goes into selectedCols and the traces are drawn onto it.
-const GRF_PRED_COL = 'GRF %BW'
-// Weight is a conditioning input of both force models, so it cannot be defaulted.
-const WEIGHT_REQUIRED_CALCULATORS = new Set(['force-jump', 'grf-split'])
-const DISTANCE_PRED_COLS = new Set(['Distance', 'DistanceM'])
-const PRED_COLOR = '#d62728'
-const TRACE_HOVER_TEMPLATE = '<b>%{fullData.name}</b><br>Время: %{x}<br>Значение: %{y:.4g}<extra></extra>'
-const EXTRA_CALCULATORS = [
-  {
-    id: 'step-detector-ttest',
-    label: 'T-тест · Step detector',
-    description: 'Детектирует шаги левой и правой ноги по давлению Sensor 1 + Sensor 2',
-    color: '#7c3aed',
-    fill: 'rgba(124,58,237,0.10)',
-  },
-  {
-    id: 'tkeo-cadence',
-    label: 'TKEO Cadence · без ML',
-    description: 'Каденс и контакты по TKEO акселерометра',
-    color: '#0891b2',
-    fill: 'rgba(8,145,178,0.10)',
-  },
-  {
-    id: 'step-cadence',
-    label: 'Step Cadence · StepResUNet',
-    description: 'ML-контакты, GCT и метрики по клику на колонку',
-    color: '#d97706',
-    fill: 'rgba(217,119,6,0.10)',
-  },
-  {
-    id: 'jump-metrics',
-    label: 'Jump BiLSTM',
-    description: '24 признака IMU + давление · flight time, высота, contact time и RSI',
-    color: '#db2777',
-    fill: 'rgba(219,39,119,0.10)',
-  },
-  {
-    id: 'jump-events',
-    label: 'Jump events · по платформам',
-    description: 'Отрыв и приземление по всему телу (не по ногам) · TCN, обучен по силовым платформам',
-    color: '#0d9488',
-    fill: 'rgba(13,148,136,0.10)',
-  },
-  {
-    id: 'force-jump',
-    label: 'Bilateral GRF · BiLSTM+CNN',
-    description: 'Пиковая вертикальная сила по двум стопам',
-    color: '#dc2626',
-    fill: 'rgba(220,38,38,0.10)',
-  },
-  {
-    id: 'grf-split',
-    label: 'Total GRF · по платформам',
-    description: 'Кривая суммарной вертикальной силы (обе стопы) в %BW · обучена по двум '
-      + 'силовым платформам · цель — плита с low-pass 20 Гц, сравнивать с колонкой '
-      + 'Plate_Fz_total_lp20_pctBW; против сырой плиты пик приземления ниже ~10% по определению',
-    color: '#7c3aed',
-    fill: 'rgba(124,58,237,0.10)',
-  },
-]
-const FEATURED_EXTRA_CALCULATOR_IDS = new Set(['step-detector-ttest'])
-const FEATURED_EXTRA_CALCULATORS = EXTRA_CALCULATORS.filter(
-  calculator => FEATURED_EXTRA_CALCULATOR_IDS.has(calculator.id),
-)
-const COLLAPSIBLE_EXTRA_CALCULATORS = EXTRA_CALCULATORS.filter(
-  calculator => !FEATURED_EXTRA_CALCULATOR_IDS.has(calculator.id),
-)
-const PROTOCOL_DETECTORS = [
-  {
-    id: 'protocol-walking-detector',
-    label: 'Тест ходьбы · Step detector',
-    description: 'Определяет интервалы контакта стоп при ходьбе',
-    color: '#2563eb',
-    fill: 'rgba(37,99,235,0.10)',
-  },
-  {
-    id: 'protocol-running-detector',
-    label: 'Анализ бега · Run detector',
-    description: 'Определяет контакты левой и правой стопы в беге',
-    color: '#16a34a',
-    fill: 'rgba(22,163,74,0.10)',
-  },
-  {
-    id: 'protocol-jumping-detector',
-    label: 'Анализ прыжков · Jump detector',
-    description: 'Определяет интервалы отрыва и приземления',
-    color: '#db2777',
-    fill: 'rgba(219,39,119,0.10)',
-  },
-  {
-    id: 'protocol-shuttle-detector',
-    label: 'Челночный бег · Turn detector',
-    description: 'Определяет повороты и беговые отрезки',
-    color: '#d97706',
-    fill: 'rgba(217,119,6,0.10)',
-  },
-  {
-    id: 'protocol-sprint-detector',
-    label: 'Спринт 30 м · Sprint detector',
-    description: 'Старт/финиш 30 м, шаги, step length и stride length',
-    color: '#dc2626',
-    fill: 'rgba(220,38,38,0.10)',
-  },
-  {
-    id: 'protocol-beep-detector',
-    label: 'Тест Beep · Yo-Yo detector',
-    description: 'Определяет развороты на 180° и беговые фазы',
-    color: '#0891b2',
-    fill: 'rgba(8,145,178,0.10)',
-  },
-  {
-    id: 'protocol-ttest-detector',
-    label: 'T-тест · Phase detector',
-    description: 'Определяет четыре поворота и беговые фазы T-теста',
-    color: '#7c3aed',
-    fill: 'rgba(124,58,237,0.10)',
-  },
-]
-const EXTRA_CALCULATOR_BY_ID = Object.fromEntries(EXTRA_CALCULATORS.map(calc => [calc.id, calc]))
-const PROTOCOL_DETECTOR_BY_ID = Object.fromEntries(PROTOCOL_DETECTORS.map(detector => [detector.id, detector]))
-const PROTOCOL_SECTION_CALCULATOR_IDS = new Set([
-  ...PROTOCOL_DETECTORS.map(detector => detector.id),
-  ...FEATURED_EXTRA_CALCULATORS.map(calculator => calculator.id),
-])
-// Force-plate ground truth of the jump detector. Not a calculator card: it lives
-// as a toggle in the chart toolbar (beside «Углы» / «Дрейф»), because it is a
-// property of the loaded data, not a model - it exists only when the session
-// carries the plate force. Registered here so the shared overlay / click-to-
-// inspect machinery treats its bilateral segments like any calculator's.
-const PLATE_FLIGHT_ID = 'plate-flight'
-const PLATE_FORCE_COLUMNS = ['Plate_Fz_N', '1:Fz', '2:Fz']
-const PLATE_FLIGHT_CALCULATOR = {
-  id: PLATE_FLIGHT_ID,
-  label: 'Полёт по плитам · разметка v7',
-  description: 'Ground truth прыжков по силовым платформам: обе плиты < 20 Н, '
-    + 'гейт «удар ИЛИ свободное падение», прыжки через край плиты — маска; '
-    + 'та же разметка, на которой обучается Jump events',
-  color: '#15803d',
-  fill: 'rgba(21,128,61,0.16)',
-}
-const CALCULATOR_BY_ID = {
-  ...EXTRA_CALCULATOR_BY_ID,
-  ...PROTOCOL_DETECTOR_BY_ID,
-  [PLATE_FLIGHT_ID]: PLATE_FLIGHT_CALCULATOR,
-}
-const PER_FOOT_TURN_DETECTOR_IDS = new Set([
-  'protocol-shuttle-detector',
-  'protocol-beep-detector',
-  'protocol-ttest-detector',
-])
-
-// Columns a calculator actually reads, for the ones where the rest of the export
-// is dead weight in the request body. A force-plate session carries 39 columns
-// and jump-events reads 12 of them, so sending everything tripled the upload
-// (35.5 MB -> 10.3 MB on a 121k-row session). Keep in step with what the server
-// reads: _foot_frames in new_jump_model_byAdil_calculator.py (ACC_COLS,
-// ANGLE_COLS, PRESS_COLS) plus Name/Time. A column listed here but absent from
-// the session is simply left out, and the server logs the channels it missed.
-const CALCULATOR_COLUMNS = {
-  'jump-events': [
-    'Name', 'Time',
-    'AcX', 'AcY', 'AcZ',
-    'XData', 'YData', 'ZData',
-    'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4',
-  ],
-  // The labeler reads |a| (free fall + impact), the insole sum (foot on the
-  // floor beside the plate) and the plate force itself, in newtons.
-  [PLATE_FLIGHT_ID]: [
-    'Name', 'Time',
-    'AcX', 'AcY', 'AcZ',
-    'Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4',
-    ...PLATE_FORCE_COLUMNS,
-  ],
-}
-
-// The whole colMap unless the calculator declared a narrower set above.
-function columnsForCalculator(calculatorId, colMap) {
-  const wanted = CALCULATOR_COLUMNS[calculatorId]
-  if (!wanted || !colMap) return colMap
-  const out = {}
-  wanted.forEach(column => { if (colMap[column]) out[column] = colMap[column] })
-  return out
-}
-
-const EVENT_STYLE_BY_KIND = {
-  run: {
-    label: 'Беговая фаза', color: '#16a34a', fill: 'rgba(22,163,74,0.10)', dash: 'dash', width: 1.5,
-  },
-  turn: {
-    label: 'Поворот', color: '#f97316', fill: 'rgba(249,115,22,0.18)', dash: 'solid', width: 2.25,
-  },
-  sprint: {
-    label: 'Отрезок 30 м', color: '#dc2626', fill: 'rgba(220,38,38,0.07)', dash: 'solid', width: 2.5,
-  },
-  // Plate ground truth: a jump the labeler accepted, and a segment it refused to
-  // call either flight or ground (no impact, no free fall, or an insole loaded
-  // beside the plate) - the model is neither taught nor scored on the grey ones.
-  plate_flight: {
-    label: 'Полёт по плитам', color: '#15803d', fill: 'rgba(21,128,61,0.16)', dash: 'solid', width: 2,
-  },
-  plate_mask: {
-    label: 'Маска: неизвестно', color: '#6b7280', fill: 'rgba(107,114,128,0.16)', dash: 'dot', width: 1.25,
-  },
-}
-const TURN_EVENT_STYLE_BY_FOOT = {
-  left: {
-    run: { color: '#2563eb', fill: 'rgba(37,99,235,0.11)', dash: 'dash', width: 1.75 },
-    turn: { color: '#db2777', fill: 'rgba(219,39,119,0.20)', dash: 'solid', width: 2.5 },
-  },
-  right: {
-    run: { color: '#0f766e', fill: 'rgba(15,118,110,0.11)', dash: 'dash', width: 1.75 },
-    turn: { color: '#f97316', fill: 'rgba(249,115,22,0.20)', dash: 'solid', width: 2.5 },
-  },
-}
-const FOOT_EVENT_STYLE = {
-  left: { color: '#2563eb', fill: 'rgba(37,99,235,0.13)', dash: 'dash', width: 1.5 },
-  right: { color: '#f97316', fill: 'rgba(249,115,22,0.13)', dash: 'dot', width: 1.5 },
-}
-const FLIGHT_EVENT_STYLE = {
-  left: { color: '#db2777', fill: 'rgba(219,39,119,0.14)', dash: 'dash', width: 1.75 },
-  right: { color: '#7c3aed', fill: 'rgba(124,58,237,0.14)', dash: 'dot', width: 1.75 },
-}
-
-// ── Target steps ──────────────────────────────────────────────────────────
-// Target is the model's step markup after the operator has been over it: every
-// detected contact except the ones struck out by hand, plus the intervals
-// placed by hand in markup mode. A deletion is remembered by the step's own
-// times rather than its index, so re-running the same detector does not
-// resurrect a step the operator already threw away.
-const STEP_CONTACT_KINDS = new Set(['contact', 'step'])
-const isStepContact = (contact) => STEP_CONTACT_KINDS.has(contact?.kind)
-
-function stepKey(calculatorId, contact) {
-  const start = Number(contact?.start_time_s)
-  const end = Number(contact?.end_time_s)
-  return [
-    calculatorId,
-    contact?.foot || 'all',
-    Number.isFinite(start) ? start.toFixed(4) : 'na',
-    Number.isFinite(end) ? end.toFixed(4) : 'na',
-  ].join('|')
-}
-
-/** Struck-out steps stay on the chart as a grey ghost so they can be put back. */
-const DELETED_STEP_STYLE = {
-  color: '#94a3b8', fill: 'rgba(148,163,184,0.04)', dash: 'dot', width: 1,
-}
-
-function calculatorEventStyle(calculator, contact) {
-  const turnFootStyle = TURN_EVENT_STYLE_BY_FOOT[contact?.foot]?.[contact?.kind]
-  if (turnFootStyle) return turnFootStyle
-  const semanticStyle = EVENT_STYLE_BY_KIND[contact?.kind]
-  if (semanticStyle) return semanticStyle
-  if (contact?.kind === 'flight' && FLIGHT_EVENT_STYLE[contact?.foot]) {
-    return FLIGHT_EVENT_STYLE[contact.foot]
-  }
-  if (FOOT_EVENT_STYLE[contact?.foot]) return FOOT_EVENT_STYLE[contact.foot]
-  return {
-    color: calculator?.color || '#64748b',
-    fill: calculator?.fill || 'rgba(100,116,139,0.10)',
-    dash: 'dash',
-    width: 1.25,
-  }
-}
-
-function calculatorEventLegend(calculator, result) {
-  const items = new Map()
-  ;(result?.contacts || []).forEach(contact => {
-    const selectedTurnFoot = PER_FOOT_TURN_DETECTOR_IDS.has(calculator?.id)
-      && ['left', 'right'].includes(result?.summary?.detection_foot)
-      ? result.summary.detection_foot
-      : ''
-    const eventFoot = ['left', 'right'].includes(contact.foot) ? contact.foot : selectedTurnFoot
-    const foot = eventFoot === 'left' ? 'L' : eventFoot === 'right' ? 'R' : ''
-    const kind = contact.kind || 'event'
-    const footSpecificKind = ['step', 'contact', 'plateau', 'flight', 'run', 'turn'].includes(kind)
-    const key = footSpecificKind && foot ? `${kind}-${foot}` : kind
-    if (items.has(key)) return
-    const style = calculatorEventStyle(
-      calculator,
-      eventFoot && contact.foot !== eventFoot ? { ...contact, foot: eventFoot } : contact,
-    )
-    const footSuffix = foot ? ` ${foot}` : ''
-    const label = kind === 'run'
-      ? `Беговая фаза${footSuffix}`
-      : kind === 'turn'
-        ? `Поворот${footSuffix}`
-        : kind === 'sprint'
-          ? contact?.is_complete === false ? 'Неполный спринт' : 'Отрезок 30 м'
-          : kind === 'flight'
-            ? `Прыжок${footSuffix}`
-            : kind === 'plate_flight'
-              ? 'Полёт по плитам'
-            : kind === 'plate_mask'
-              ? 'Маска: неизвестно'
-            : kind === 'step'
-              ? `Шаг ${foot}`
-              : ['contact', 'plateau'].includes(kind)
-                ? `Контакт ${foot}`
-                : `Событие ${foot}`.trim()
-    items.set(key, { key, label, ...style })
-  })
-  return [...items.values()]
-}
-
-// Insole pressure channels and the device-name → foot mapping used for
-// per-foot calibration/normalization (mirrors the backend: ESP32_Sensor_1 is
-// the left insole, ESP32_Sensor_2 the right).
-const SENSOR_COLS = ['Sensor_1', 'Sensor_2', 'Sensor_3', 'Sensor_4']
-const SENSOR_NAME_TO_FOOT = { ESP32_Sensor_1: 'left', ESP32_Sensor_2: 'right' }
-// Движение — это входной канал модели (one-hot), поэтому одна и та же сессия
-// под разным протоколом даёт разные события. Оператор выбирает его сам;
-// «вертикальный» по умолчанию — самый частый случай разметки и протокол, на
-// котором модель сильнее всего (F1@20мс 0.963/0.973 против 0.896/0.852 в среднем).
-const JUMP_EVENT_PROTOCOL_OPTIONS = [
-  { value: 'vert', label: 'Вертикальный' },
-  { value: 'fwd_sl', label: 'SL вперёд' },
-  { value: 'side_sl', label: 'SL вбок' },
-  { value: 'sl_hop', label: 'SL hopping' },
-  { value: 'mv3', label: 'Движение 3' },
-  { value: 'mv5', label: 'Движение 5' },
-  { value: 'mv6', label: 'Движение 6' },
-]
-
-const TURN_DETECTION_FOOT_OPTIONS = [
-  { value: 'both', label: 'L+R', title: 'Наложить независимые детекции левой и правой ног' },
-  { value: 'left', label: 'L', title: 'Детектировать только по левой ноге' },
-  { value: 'right', label: 'R', title: 'Детектировать только по правой ноге' },
-]
-
-function inferSensorFoot(name) {
-  if (!name) return null
-  if (SENSOR_NAME_TO_FOOT[name]) return SENSOR_NAME_TO_FOOT[name]
-
-  const normalized = String(name).trim().toLowerCase()
-  if (/(^|[_\s-])left($|[_\s-])/.test(normalized)) return 'left'
-  if (/(^|[_\s-])right($|[_\s-])/.test(normalized)) return 'right'
-  if (/^(?:esp32_)?sensor[_\s-]*1(?:\D|$)/.test(normalized)) return 'left'
-  if (/^(?:esp32_)?sensor[_\s-]*2(?:\D|$)/.test(normalized)) return 'right'
-  return null
-}
-
-function groupSensorNamesByFoot(names) {
-  const groups = { left: [], right: [] }
-  const unknown = []
-
-  names.forEach(name => {
-    const foot = inferSensorFoot(name)
-    if (foot) groups[foot].push(name)
-    else unknown.push(name)
-  })
-
-  // Legacy parquet files sometimes carry anonymous device names. Keep their
-  // original ordering as a deterministic left/right fallback.
-  unknown.forEach((name, index) => {
-    const foot = groups.left.length === 0
-      ? 'left'
-      : groups.right.length === 0
-        ? 'right'
-        : index % 2 === 0 ? 'left' : 'right'
-    groups[foot].push(name)
-  })
-
-  return groups
-}
-
-function sensorFootForName(name, names) {
-  const inferred = inferSensorFoot(name)
-  if (inferred) return inferred
-  const groups = groupSensorNamesByFoot(names)
-  if (groups.left.includes(name)) return 'left'
-  if (groups.right.includes(name)) return 'right'
-  return null
-}
-
-function sensorNameForFoot(names, foot) {
-  return groupSensorNamesByFoot(names)[foot]?.[0] || ''
-}
-
-function rowsToColMap(rows) {
-  const colMap = {}
-  rows.forEach((row, index) => {
-    Object.keys(row).forEach(k => {
-      if (!colMap[k]) colMap[k] = Array(index).fill(null)
-    })
-    Object.keys(colMap).forEach(k => {
-      const value = row[k]
-      colMap[k].push(typeof value === 'bigint' ? Number(value) : (value ?? null))
-    })
-  })
-  return colMap
-}
-
-function colMapToRows(colMap) {
-  const columns = Object.keys(colMap || {})
-  if (!columns.length) return []
-  const length = Math.max(...columns.map(column => colMap[column]?.length || 0))
-  return Array.from({ length }, (_, index) => {
-    const row = {}
-    columns.forEach(column => { row[column] = colMap[column]?.[index] ?? null })
-    return row
-  })
-}
-
-function detectTimeCol(allCols) {
-  return allCols.find(c => c === 'Time')
-    || allCols.find(c => ['time', 'timestamp', 'Timestamp', 't'].includes(c))
-    || allCols[0]
-}
-
-function computeNumericColumns(colMap, tCol) {
-  return Object.keys(colMap).filter(c => {
-    if (NON_DATA_COLS.has(c) || c === tCol) return false
-    return (colMap[c] || []).some(v => safeNum(v) !== null)
-  })
-}
-
-function sortSensorNames(colMap) {
-  if (!colMap['Name']) return []
-  return [...new Set(colMap['Name'].filter(v => v != null && v !== ''))]
-    .sort((a, b) => a.localeCompare(b))
-}
-
-function computeAutoOffsetST(colMap, timeCol, insoleNames) {
-  if (!insoleNames.length || !colMap[timeCol] || !colMap['Name']) return 0
-  const times = colMap[timeCol]
-  const names = colMap['Name']
-  let insoleMin = Infinity
-  let stMin = Infinity
-  for (let i = 0; i < times.length; i++) {
-    const t = safeNum(times[i])
-    if (t === null) continue
-    const n = names[i]
-    if (n === SPEED_TRACKER) { if (t < stMin) stMin = t }
-    else if (insoleNames.includes(n)) { if (t < insoleMin) insoleMin = t }
-  }
-  if (!isFinite(insoleMin) || !isFinite(stMin)) return 0
-  return insoleMin - stMin
-}
-
-function resolveStDataCol(data, col) {
-  if ((data[col] || []).some(v => safeNum(v) !== null)) return col
-  const alt = { Distance: 'DistanceM', Speed: 'VelocityMs', DistanceM: 'Distance', VelocityMs: 'Speed' }[col]
-  if (alt && (data[alt] || []).some(v => safeNum(v) !== null)) return alt
-  return col
-}
-
-function buildDefaultCols(numCols, hasSpeedTracker, colMap, sensorNames) {
-  const sensorSet = new Set(sensorNames)
-  const nameArr = colMap?.Name
-  const hasVisibleData = (col) => {
-    const values = colMap?.[col] || []
-    return values.some((value, index) => (
-      safeNum(value) !== null
-      && (!nameArr || sensorSet.size === 0 || sensorSet.has(nameArr[index]))
-    ))
-  }
-  const plottable = numCols.filter(hasVisibleData)
-  const imu = PREFERRED_COLS.filter(c => plottable.includes(c)).slice(0, 3)
-  const st  = hasSpeedTracker ? ST_COL_NAMES.filter(c => numCols.includes(c)) : []
-  const merged = [...imu]
-  st.forEach(c => { if (!merged.includes(c)) merged.push(c) })
-  return merged.length ? merged : plottable.slice(0, 3)
-}
-
-const TKEO_WIN = 15
-const TKEO_PLOT_COLS = ['TKEO_AcX', 'TKEO_AcY', 'TKEO_AcZ', 'TKEO_AccMag']
-const SENSOR_SUM_RAW_COL = 'Sensor_Sum_Raw'
-const SENSOR_SUM_NORM_COL = 'Sensor_Sum_Normalized'
-
-// pandas Series.rolling(win, center=True, min_periods=1).mean() over TKEO psi.
-function tkeoSeries(x, win = TKEO_WIN) {
-  const m = x.length
-  const psi = new Array(m).fill(0)
-  if (m >= 3) {
-    for (let k = 1; k < m - 1; k++) psi[k] = x[k] * x[k] - x[k - 1] * x[k + 1]
-  }
-  const back = Math.floor(win / 2)
-  const fwd = Math.floor((win - 1) / 2)
-  const cum = new Array(m + 1)
-  cum[0] = 0
-  for (let k = 0; k < m; k++) cum[k + 1] = cum[k] + psi[k]
-  const out = new Array(m)
-  for (let k = 0; k < m; k++) {
-    const lo = Math.max(0, k - back)
-    const hi = Math.min(m - 1, k + fwd)
-    out[k] = Math.max((cum[hi + 1] - cum[lo]) / (hi - lo + 1), 0)
-  }
-  return out
-}
-
-// Derived channel: TKEO of the accel magnitude, mirroring the backend
-// (ml_speed_calculator._foot_features / build_session_parquets._tkeo):
-// psi[i] = x[i]² − x[i−1]·x[i+1], centered rolling mean over
-// max(3, round(0.03 s · fs)) samples, clamped to ≥ 0 after smoothing.
-// Computed per sensor (rows are interleaved across sensors) in time order.
-function addAccTkeoColumn(colMap, tCol) {
-  if (colMap['acc_tkeo']) return // parquet already carries it
-  const { AcX, AcY, AcZ } = colMap
-  const times = colMap[tCol]
-  const names = colMap['Name']
-  if (!AcX || !AcY || !AcZ || !times) return
-
-  const n = times.length
-  const out = new Array(n).fill(null)
-  const sensors = names
-    ? [...new Set(names.filter(v => v != null && v !== ''))]
-    : [null]
-
-  sensors.forEach(sensor => {
-    const idx = []
-    for (let i = 0; i < n; i++) {
-      if (sensor !== null && names[i] !== sensor) continue
-      if (safeNum(times[i]) === null) continue
-      if (safeNum(AcX[i]) === null || safeNum(AcY[i]) === null || safeNum(AcZ[i]) === null) continue
-      idx.push(i)
-    }
-    if (idx.length < 3) return
-    idx.sort((a, b) => safeNum(times[a]) - safeNum(times[b]))
-
-    const t   = idx.map(i => safeNum(times[i]))
-    const mag = idx.map(i => Math.hypot(safeNum(AcX[i]), safeNum(AcY[i]), safeNum(AcZ[i])))
-
-    // Sample rate from the median dt; Time can be ms or s (~500 Hz either way).
-    const dts = []
-    for (let k = 1; k < t.length; k++) { const d = t[k] - t[k - 1]; if (d > 0) dts.push(d) }
-    if (!dts.length) return
-    dts.sort((a, b) => a - b)
-    let dt = dts[Math.floor(dts.length / 2)]
-    if (dt > 0.5) dt /= 1000 // ms → s
-    const fs = 1 / dt
-
-    const m = mag.length
-    const psi = new Array(m).fill(0)
-    for (let k = 1; k < m - 1; k++) psi[k] = mag[k] * mag[k] - mag[k - 1] * mag[k + 1]
-
-    // pandas rolling(win, center=True, min_periods=1): [k−⌊win/2⌋, k+⌊(win−1)/2⌋]
-    const win  = Math.max(3, Math.round(0.03 * fs))
-    const back = Math.floor(win / 2)
-    const fwd  = Math.floor((win - 1) / 2)
-    const cum = new Array(m + 1)
-    cum[0] = 0
-    for (let k = 0; k < m; k++) cum[k + 1] = cum[k] + psi[k]
-    for (let k = 0; k < m; k++) {
-      const lo = Math.max(0, k - back)
-      const hi = Math.min(m - 1, k + fwd)
-      out[idx[k]] = Math.max((cum[hi + 1] - cum[lo]) / (hi - lo + 1), 0)
-    }
-  })
-
-  colMap['acc_tkeo'] = out
-}
-
-// Extra TKEO traces for the column picker: AcX / AcY / AcZ and
-// magg(Acc) = sqrt(AcX² + AcY² + AcZ²). Same operator as the backend
-// `_tkeo` (psi = x² − x[i−1]·x[i+1], centered rolling mean, clamp ≥ 0),
-// computed per sensor in time order.
-function addTkeoColumns(colMap, tCol) {
-  const times = colMap[tCol]
-  const names = colMap['Name']
-  if (!times) return []
-  const n = times.length
-  const sources = [
-    { col: 'TKEO_AcX', from: 'AcX' },
-    { col: 'TKEO_AcY', from: 'AcY' },
-    { col: 'TKEO_AcZ', from: 'AcZ' },
-    { col: 'TKEO_AccMag', from: 'mag' },
-  ]
-  const needed = sources.filter(s => !colMap[s.col])
-  if (!needed.length) return sources.map(s => s.col).filter(c => colMap[c])
-
-  const buffers = {}
-  needed.forEach(s => { buffers[s.col] = new Array(n).fill(null) })
-
-  const sensors = names
-    ? [...new Set(names.filter(v => v != null && v !== ''))]
-    : [null]
-
-  sensors.forEach(sensor => {
-    const idx = []
-    for (let i = 0; i < n; i++) {
-      if (sensor !== null && names[i] !== sensor) continue
-      if (safeNum(times[i]) === null) continue
-      idx.push(i)
-    }
-    if (idx.length < 3) return
-    idx.sort((a, b) => safeNum(times[a]) - safeNum(times[b]))
-
-    needed.forEach(({ col, from }) => {
-      const series = []
-      const seriesIdx = []
-      for (let k = 0; k < idx.length; k++) {
-        const i = idx[k]
-        let v = null
-        if (from === 'mag') {
-          const ax = safeNum(colMap.AcX?.[i])
-          const ay = safeNum(colMap.AcY?.[i])
-          const az = safeNum(colMap.AcZ?.[i])
-          if (ax !== null && ay !== null && az !== null) v = Math.hypot(ax, ay, az)
-        } else {
-          v = safeNum(colMap[from]?.[i])
-        }
-        if (v === null) continue
-        series.push(v)
-        seriesIdx.push(i)
-      }
-      if (series.length < 3) return
-      const tkeo = tkeoSeries(series, TKEO_WIN)
-      for (let k = 0; k < seriesIdx.length; k++) buffers[col][seriesIdx[k]] = tkeo[k]
-    })
-  })
-
-  const added = []
-  needed.forEach(({ col }) => {
-    if (buffers[col].some(v => v !== null)) {
-      colMap[col] = buffers[col]
-      added.push(col)
-    }
-  })
-  return added
-}
-
-function sumSensorColumns(colMap, sourceCols, outCol) {
-  if (colMap[outCol]) return outCol
-  if (sourceCols.some(col => !colMap[col])) return null
-  const n = colMap[sourceCols[0]].length
-  const out = new Array(n).fill(null)
-  let wrote = false
-  for (let i = 0; i < n; i++) {
-    let total = 0
-    let ok = true
-    for (let s = 0; s < sourceCols.length; s++) {
-      const v = safeNum(colMap[sourceCols[s]][i])
-      if (v === null) { ok = false; break }
-      total += v
-    }
-    if (!ok) continue
-    out[i] = total
-    wrote = true
-  }
-  if (!wrote) return null
-  colMap[outCol] = out
-  return outCol
-}
-
-function addSensorSumColumns(colMap) {
-  const added = []
-  const raw = sumSensorColumns(colMap, SENSOR_COLS, SENSOR_SUM_RAW_COL)
-  if (raw) added.push(raw)
-  const norm = sumSensorColumns(
-    colMap,
-    SENSOR_COLS.map(col => `${col}_Normalized`),
-    SENSOR_SUM_NORM_COL,
-  )
-  if (norm) added.push(norm)
-  return added
-}
-
-function addDerivedSessionColumns(colMap, tCol, additionalInfo) {
-  addAccTkeoColumn(colMap, tCol)
-  addTkeoColumns(colMap, tCol)
-  addNormalizedSensorColumns(colMap, additionalInfo)
-  addWeightedInsoleTotalColumn(colMap, tCol, additionalInfo)
-  addSensorSumColumns(colMap)
-}
-
-// A stored additional_info blob can arrive JSON-encoded one or more levels deep
-// (the backend double/triple-encodes it). Peel string layers until we reach a
-// real value or give up.
-function deepUnwrapJson(value, maxDepth = 4) {
-  let v = value
-  for (let i = 0; i < maxDepth && typeof v === 'string'; i++) {
-    try { v = JSON.parse(v) } catch { break }
-  }
-  return v
-}
-
-// A calibration bound must be exactly four finite numbers (booleans excluded —
-// typeof true !== 'number').
-function isCalibQuad(a) {
-  return Array.isArray(a) && a.length === 4
-    && a.every(x => typeof x === 'number' && isFinite(x))
-}
-
-// Pull { left, right } insole calibration out of a session's additional_info,
-// mirroring the backend shape
-// additional_info.intake_data.insole_calibration.{left,right}.{min,max}.
-// Returns null when it's absent or invalid, so callers fall back to the raw
-// Sensor_* values untouched.
-function extractInsoleCalibration(additionalInfo) {
-  const info = deepUnwrapJson(additionalInfo)
-  if (!info || typeof info !== 'object') return null
-  const intake = deepUnwrapJson(info.intake_data)
-  if (!intake || typeof intake !== 'object') return null
-  const calib = deepUnwrapJson(intake.insole_calibration)
-  if (!calib || typeof calib !== 'object') return null
-
-  const parseFoot = (footRaw) => {
-    const foot = deepUnwrapJson(footRaw)
-    if (!foot || typeof foot !== 'object') return null
-    const min = deepUnwrapJson(foot.min)
-    const max = deepUnwrapJson(foot.max)
-    return isCalibQuad(min) && isCalibQuad(max) ? { min, max } : null
-  }
-
-  const left = parseFoot(calib.left)
-  const right = parseFoot(calib.right)
-  if (!left && !right) return null
-  return { left, right }
-}
-
-// Per-timestep min-max normalization of one sensor reading. Values outside the
-// calibration's [min, max] are left unclamped (can go <0 or >1).
-// Degenerate calibration (max <= min) contributes nothing (0).
-function normalizeSensorValue(value, mn, mx) {
-  const range = mx - mn
-  if (range <= 0) return 0.0
-  return (value - mn) / range
-}
-
-// Derived channels: Sensor_1..4_Normalized in [0, 1]. Each row is normalized
-// with its own foot's calibration (ESP32_Sensor_1 → left, ESP32_Sensor_2 →
-// right), mirroring the backend insole_normalization but WITHOUT the
-// session-level aggregation to percentages — these stay raw per-timestep
-// normalized values so they can be plotted over time. Returns the list of
-// columns added (empty when the session carries no valid calibration, in which
-// case consumers keep using the raw Sensor_* columns).
-function addNormalizedSensorColumns(colMap, additionalInfo) {
-  const calib = extractInsoleCalibration(additionalInfo)
-  if (!calib) return []
-  const names = colMap['Name']
-  const added = []
-
-  SENSOR_COLS.forEach((col, si) => {
-    const raw = colMap[col]
-    if (!raw) return
-    const normCol = `${col}_Normalized`
-    if (colMap[normCol]) { added.push(normCol); return }
-
-    const out = new Array(raw.length).fill(null)
-    for (let i = 0; i < raw.length; i++) {
-      const v = safeNum(raw[i])
-      if (v === null) continue
-      const foot = names ? inferSensorFoot(names[i]) : null
-      const footCalib = foot ? calib[foot] : null
-      if (!footCalib) continue // this foot lacks calibration → leave as no-data
-      out[i] = normalizeSensorValue(v, footCalib.min[si], footCalib.max[si])
-    }
-    colMap[normCol] = out
-    added.push(normCol)
-  })
-
-  return added
-}
-
-// ── Weighted insole total ──────────────────────────────────────────────────
-// Derived channel `Sensor_Total_Weighted`: one summary trace per foot, because
-// reading four pressure pads at once is not how you check whether an insole saw
-// a step. Ported from the force-plate analysis notebook so a contact marked
-// against this curve here is the same curve the model is trained on.
-//
-// Per foot, over that foot's rows in time order:
-//   raw ADC → 25 Hz zero-phase Butterworth low-pass → per-pad normalization
-//   → weighted sum.
-//
-// The low-pass runs on the raw ADC *before* normalizing. Normalization is affine
-// per pad so the two commute, except for the clamp at 0 — and clamping an
-// already-smooth signal is cleaner than smoothing a truncated one.
-//
-// The sum is WEIGHTED, not the flat S1+S2+S3+S4 that `Sensor_Total` means
-// elsewhere, and the weights come from what each pad is worth against a force
-// plate. Over 58 clean single-foot stances the mean within-stance correlation of
-// one normalized pad against that plate's Fz is S4 heel +0.756, S3 arch +0.735,
-// S2 forefoot +0.541, S1 big toe +0.115 — S3 and S4 carry load across the whole
-// stance, S2 only sees push-off and S1 sees essentially nothing, which is why
-// the flat sum (+0.681) scores worse than S3 alone. Against the flat sum this
-// weighting lifts mean within-stance r to +0.763, loading-onset error 32 → 24 ms
-// median and peak-time error 72 → 59 ms. The weights are FIXED, not fitted:
-// fitted per session they disagree wildly and generalize worse held out. They
-// sum to 1, so the curve sits in the same 0..1 band as the normalized pads.
-//
-// What it does not do is reproduce Fz's double hump — it tracks the loading
-// envelope, when the foot took weight and let it go, not the M-shape inside it.
-const INSOLE_TOTAL_COL = 'Sensor_Total_Weighted'
-const INSOLE_TOTAL_WEIGHTS = { Sensor_1: 0.05, Sensor_2: 0.15, Sensor_3: 0.50, Sensor_4: 0.30 }
-
-// The pads are read by a 10-bit ADC at 500 Hz and what looks like noise on the
-// raw trace is mostly the quantization staircase, so they go through a 4th-order
-// Butterworth low-pass applied forwards and backwards — zero-phase, no group
-// delay at any frequency, which is what keeps the curve on the same clock as the
-// video and the markup. 25 Hz because noise removal saturates well below it
-// (15/25/30 Hz all land at ~0.46% jitter) while a higher cutoff keeps the peaks
-// as sharp as the data supports; measured across walking and running sessions a
-// 25 Hz cut moves gait-peak FWHM by −0.8% and apex height by +0.05%.
-const INSOLE_LP_HZ = 25.0
-const INSOLE_LP_ORDER = 4
-const INSOLE_CLOCK_MS = 2.0   // the 500 Hz insole clock these cutoffs were chosen for
-
-function medianOf(values) {
-  const sorted = [...values].sort((a, b) => a - b)
-  const mid = sorted.length >> 1
-  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
-}
-
-// scipy.signal.butter(order, cutoffHz, 'lowpass', fs=fs, output='sos') for an
-// even order: analog Butterworth prototype poles, scaled to the pre-warped
-// cutoff, bilinear-transformed, then paired into biquads ordered by increasing
-// pole radius with the whole gain in the first section — the layout scipy emits.
-function butterLowpassSos(order, cutoffHz, fs) {
-  const wn = (2 * cutoffHz) / fs          // cutoff normalized so Nyquist = 1
-  const warped = 4 * Math.tan((Math.PI * wn) / 2)
-  const angleOf = k => (Math.PI * (-order + 1 + 2 * k)) / (2 * order)
-
-  // Prototype pole -exp(i·θ) scaled by `warped`, mapped through (4 + s)/(4 − s).
-  const poles = []
-  for (let k = 0; k < order; k++) {
-    const theta = angleOf(k)
-    const re = -Math.cos(theta) * warped
-    const im = -Math.sin(theta) * warped
-    const dRe = 4 - re, dIm = -im
-    const den = dRe * dRe + dIm * dIm
-    poles.push([((4 + re) * dRe + im * dIm) / den, (im * dRe - (4 + re) * dIm) / den])
-  }
-
-  // Gain warped**order · Re(1 / Π(4 − s_k)); the transform leaves no analog zeros.
-  let pRe = 1, pIm = 0
-  for (let k = 0; k < order; k++) {
-    const theta = angleOf(k)
-    const dRe = 4 + Math.cos(theta) * warped
-    const dIm = Math.sin(theta) * warped
-    const nRe = pRe * dRe - pIm * dIm
-    pIm = pRe * dIm + pIm * dRe
-    pRe = nRe
-  }
-  const gain = Math.pow(warped, order) * (pRe / (pRe * pRe + pIm * pIm))
-
-  const sos = poles
-    .filter(([, im]) => im > 0)
-    .sort((a, b) => (a[0] * a[0] + a[1] * a[1]) - (b[0] * b[0] + b[1] * b[1]))
-    .map(([re, im]) => [1, 2, 1, 1, -2 * re, re * re + im * im])
-  sos[0][0] *= gain
-  sos[0][1] *= gain
-  sos[0][2] *= gain
-  return sos
-}
-
-// scipy.signal.sosfilt_zi: the steady-state delays each section holds for a unit
-// step, scaled by the DC gain of the sections ahead of it.
-function sosfiltZi(sos) {
-  const zi = []
-  let scale = 1
-  sos.forEach(([b0, b1, b2, , a1, a2]) => {
-    const c0 = b1 - a1 * b0
-    const c1 = b2 - a2 * b0
-    const det = 1 + a1 + a2
-    zi.push([scale * ((c0 + c1) / det), scale * (((1 + a1) * c1 - a2 * c0) / det)])
-    scale *= (b0 + b1 + b2) / det
-  })
-  return zi
-}
-
-// scipy.signal.sosfilt with initial conditions: transposed direct form II, each
-// sample carried through every section before the next sample is read.
-function sosfilt(sos, x, zi) {
-  const out = new Float64Array(x.length)
-  const z = zi.map(([z0, z1]) => [z0, z1])
-  for (let i = 0; i < x.length; i++) {
-    let v = x[i]
-    for (let s = 0; s < sos.length; s++) {
-      const [b0, b1, b2, , a1, a2] = sos[s]
-      const y = b0 * v + z[s][0]
-      z[s][0] = b1 * v - a1 * y + z[s][1]
-      z[s][1] = b2 * v - a2 * y
-      v = y
-    }
-    out[i] = v
-  }
-  return out
-}
-
-// scipy.signal.sosfiltfilt(sos, x) at its defaults (padtype='odd', padlen=None):
-// odd-extend both ends by 3·(2·sections+1), filter forwards then backwards from
-// step-matched initial conditions, then trim the extension back off.
-function sosfiltfilt(sos, x) {
-  const n = x.length
-  const edge = 3 * (2 * sos.length + 1)
-  if (n <= edge) return Float64Array.from(x)
-
-  const ext = new Float64Array(n + 2 * edge)
-  for (let i = 0; i < edge; i++) ext[i] = 2 * x[0] - x[edge - i]
-  ext.set(x, edge)
-  for (let i = 0; i < edge; i++) ext[edge + n + i] = 2 * x[n - 1] - x[n - 2 - i]
-
-  const zi = sosfiltZi(sos)
-  const scaled = k => zi.map(([z0, z1]) => [z0 * k, z1 * k])
-
-  let y = sosfilt(sos, ext, scaled(ext[0]))
-  y.reverse()
-  y = sosfilt(sos, y, scaled(y[0]))
-  y.reverse()
-  return y.slice(edge, y.length - edge)
-}
-
-// Zero-phase low-pass one foot's four pressure channels, already in time order.
-// `fs` is read off the median sample interval rather than assumed, so a foot that
-// did not record at 500 Hz is still filtered against its own clock. A block too
-// short for the filter to settle, or one carrying a non-finite reading, comes back
-// untouched rather than mangled — filtfilt would otherwise raise, or smear a
-// single missing sample across the whole trace.
-function smoothInsole(channels, times, label) {
-  const n = times.length
-  const bail = (reason) => {
-    console.warn(`${INSOLE_TOTAL_COL} (${label}): ${reason} — leaving ${n} samples unfiltered`)
-    return channels
-  }
-  if (n < 2) return channels
-  if (times.some(v => !isFinite(v))) return bail('the time column has non-finite values')
-  if (channels.some(ch => ch.some(v => !isFinite(v)))) return bail('a pad reading is missing')
-
-  const steps = []
-  for (let i = 1; i < n; i++) steps.push(times[i] - times[i - 1])
-  const dt = medianOf(steps)
-  if (!(dt > 0)) return bail(`the median sample interval is ${dt}, not a usable clock`)
-  // Session parquet carries Time in ms; some imported files use seconds. The same
-  // test addAccTkeoColumn uses tells them apart at any plausible insole rate.
-  const dtMs = dt > 0.5 ? dt : dt * 1000
-  const fs = 1000 / dtMs
-
-  // An unexpected clock is reported rather than quietly filtered against. The
-  // tolerance is relative, unlike the notebook's exact comparison: seconds-based
-  // timestamps carry float dust that an exact test reports as half the samples
-  // being off clock, which buries the real dropped-sample case.
-  const offClock = steps.filter(s => Math.abs(s - dt) > 1e-6 * dt).length / steps.length
-  if (Math.abs(dtMs - INSOLE_CLOCK_MS) > 0.1 || offClock > 0.01) {
-    console.warn(`${INSOLE_TOTAL_COL} (${label}): clock is ${dtMs.toFixed(3)} ms `
-      + `(${fs.toFixed(0)} Hz) with ${Math.round(offClock * 100)}% of samples off it, `
-      + `not the expected ${INSOLE_CLOCK_MS} ms — filtering against ${fs.toFixed(0)} Hz`)
-  }
-  // Too low an fs is the one thing here that really would distort a trace, because
-  // the cutoff then bites far harder than the 25 Hz it claims to.
-  if (!(INSOLE_LP_HZ > 0 && INSOLE_LP_HZ < 0.5 * fs)) {
-    return bail(`${INSOLE_LP_HZ} Hz is not below this block's ${(0.5 * fs).toFixed(0)} Hz Nyquist`)
-  }
-
-  const sos = butterLowpassSos(INSOLE_LP_ORDER, INSOLE_LP_HZ, fs)
-  if (n <= 3 * (2 * sos.length + 1)) return channels   // too short for filtfilt to settle
-  return channels.map(ch => sosfiltfilt(sos, ch))
-}
-
-// The production normalizer (insole_normalization.normalize_matrix):
-// (value − min) / (max − min) per pad against the session's intake calibration,
-// clamped at 0 with no upper bound, so a reading above the calibrated max
-// legitimately exceeds 1. Unlike the Sensor_*_Normalized display channels above,
-// which deliberately leave negatives in so a drifting pad stays visible, this one
-// clamps — the weighted total has to match what the calculators see.
-function normalizeInsoleValue(value, mn, mx) {
-  const range = mx - mn
-  if (range <= 0) return 0.0
-  return Math.max((value - mn) / range, 0)
-}
-
-// Build INSOLE_TOTAL_COL into `colMap`. Returns the columns added, empty when the
-// session carries no pressure pads at all. Without calibration the curve falls
-// back to weighted raw ADC counts exactly as production does — it still shows
-// where the foot loaded, just not on a 0..1 scale.
-function addWeightedInsoleTotalColumn(colMap, tCol, additionalInfo) {
-  if (colMap[INSOLE_TOTAL_COL]) return [INSOLE_TOTAL_COL]   // parquet already carries it
-  const times = colMap[tCol]
-  if (!times || SENSOR_COLS.some(col => !colMap[col])) return []
-
-  const calib = extractInsoleCalibration(additionalInfo)
-  const names = colMap['Name']
-  const weights = SENSOR_COLS.map(col => INSOLE_TOTAL_WEIGHTS[col])
-  const n = times.length
-  const out = new Array(n).fill(null)
-  let wrote = false
-
-  // Rows of the two insoles are interleaved in a session frame, so each foot is
-  // filtered over its own rows in its own time order, as the notebook does.
-  const sensors = names
-    ? [...new Set(names.filter(v => v != null && v !== ''))]
-    : [null]
-
-  sensors.forEach(sensor => {
-    const foot = inferSensorFoot(sensor)
-    // The SpeedTracker and any unrecognised device carry no pads; they stay empty.
-    if (names && !foot) return
-    // A calibrated session missing this one foot leaves it as no-data rather than
-    // mixing a normalized foot and a raw one into the same column.
-    const footCalib = foot && calib ? calib[foot] : null
-    if (calib && !footCalib) return
-
-    const at = i => { const v = safeNum(times[i]); return v === null ? NaN : v }
-    const idx = []
-    for (let i = 0; i < n; i++) {
-      if (sensor !== null && names[i] !== sensor) continue
-      idx.push(i)
-    }
-    if (!idx.length) return
-    idx.sort((a, b) => at(a) - at(b))
-
-    const smoothed = smoothInsole(
-      SENSOR_COLS.map(col => Float64Array.from(idx, i => {
-        const v = safeNum(colMap[col][i])
-        return v === null ? NaN : v
-      })),
-      idx.map(at),
-      sensor || 'insole',
-    )
-
-    for (let k = 0; k < idx.length; k++) {
-      let total = 0
-      let ok = true
-      for (let s = 0; s < SENSOR_COLS.length; s++) {
-        const v = smoothed[s][k]
-        if (!isFinite(v)) { ok = false; break }
-        total += weights[s] * (footCalib
-          ? normalizeInsoleValue(v, footCalib.min[s], footCalib.max[s])
-          : v)
-      }
-      if (!ok) continue
-      out[idx[k]] = total
-      wrote = true
-    }
-  })
-
-  if (!wrote) return []
-  colMap[INSOLE_TOTAL_COL] = out
-  return [INSOLE_TOTAL_COL]
-}
-
-const L_FILL = 'rgba(31,119,180,0.35)'
-const R_FILL = 'rgba(255,127,14,0.35)'
-const L_LINE = 'rgba(31,119,180,0.9)'
-const R_LINE = 'rgba(255,127,14,0.9)'
-const GAP_FILL = 'rgba(220,53,69,0.35)'
-const GAP_LINE = 'rgba(220,53,69,0.92)'
-const SEL_FILL = 'rgba(234,179,8,0.5)'
-const SEL_LINE = '#ca8a04'
-
-function buildGapBandShapes(intervals, nSubplots) {
-  if (!intervals.length || nSubplots < 1) return []
-  const shapes = []
-  for (const [x0, x1] of intervals) {
-    for (let i = 0; i < nSubplots; i++) {
-      shapes.push({
-        type: 'rect',
-        x0, x1,
-        xref: i === 0 ? 'x' : `x${i + 1}`,
-        y0: 0, y1: 1,
-        yref: i === 0 ? 'y domain' : `y${i + 1} domain`,
-        fillcolor: GAP_FILL,
-        line: { color: GAP_LINE, width: 1.5 },
-        layer: 'below',
-      })
-    }
-  }
-  return shapes
-}
-
-function safeNum(v) {
-  if (v === null || v === undefined) return null
-  const n = typeof v === 'bigint' ? Number(v) : Number(v)
-  return isFinite(n) ? n : null
-}
-
-function computeGapStats(colMap, timeColumn) {
-  const names = colMap?.Name || []
-  const times = colMap?.[timeColumn] || []
-  if (!names.length || !times.length) return {}
-
-  const bySensor = new Map()
-  for (let index = 0; index < Math.min(names.length, times.length); index++) {
-    const name = names[index]
-    const time = safeNum(times[index])
-    if (!name || time === null) continue
-    if (!bySensor.has(name)) bySensor.set(name, [])
-    bySensor.get(name).push(time)
-  }
-
-  const result = {}
-  bySensor.forEach((sensorTimes, name) => {
-    sensorTimes.sort((a, b) => a - b)
-    const diffs = []
-    for (let index = 1; index < sensorTimes.length; index++) {
-      const diff = sensorTimes[index] - sensorTimes[index - 1]
-      if (diff > 0) diffs.push(diff)
-    }
-    const mean = diffs.length
-      ? diffs.reduce((sum, value) => sum + value, 0) / diffs.length
-      : null
-    const threshold = mean === null ? null : mean * 2
-    const gaps = []
-    if (threshold !== null) {
-      for (let index = 1; index < sensorTimes.length; index++) {
-        if (sensorTimes[index] - sensorTimes[index - 1] > threshold) {
-          gaps.push([sensorTimes[index - 1], sensorTimes[index]])
-        }
-      }
-    }
-    result[name] = {
-      count: sensorTimes.length,
-      time_diff_mean: mean,
-      time_diff_max: diffs.length ? arrayMax(diffs) : null,
-      gaps,
-    }
-  })
-  return result
-}
-
-function unwrapAngleDegrees(arr, threshold = 180.0) {
-  if (!arr || arr.length === 0) return arr
-  const result = new Array(arr.length)
-  result[0] = arr[0]
-  let offset = 0
-  for (let i = 1; i < arr.length; i++) {
-    const curr = safeNum(arr[i])
-    const prev = safeNum(arr[i - 1])
-    if (curr === null || prev === null) { result[i] = arr[i]; continue }
-    const diff = curr - prev
-    if (diff > threshold) offset -= 360
-    else if (diff < -threshold) offset += 360
-    result[i] = arr[i] + offset
-  }
-  return result
-}
-
-const UNWRAPPABLE_ANGLE_COLUMNS = new Set(['XData', 'YData', 'ZData'])
-// The left insole is mounted mirrored relative to the right one, so its X and Y
-// accelerations point the opposite way and the two feet plot as reflections of
-// each other. Negating these channels on the left puts both feet in one frame.
-const MIRRORED_LEFT_COLUMNS = new Set(['AcX', 'AcY'])
-// Channels the IMU postprocessing rewrites — snapshotted so it can be undone.
-const IMU_SNAPSHOT_COLUMNS = ['AcX', 'AcY', 'AcZ', 'XData', 'YData', 'ZData', 'acc_tkeo', ...TKEO_PLOT_COLS]
-
-// ── Gyro yaw drift ───────────────────────────────────────────────────────────
-// A port of the backend's app/services/calculators/yaw_drift_calculator.py,
-// kept numerically identical so the markup tool shows the same corrected
-// heading the analysis pipeline computes. Runs on the Parquet already in memory.
-//
-// XData is a bounded 0..359° heading at ~500 Hz. The gyro behind it integrates a
-// constant bias, so one foot's unwrapped heading drifts away from the other's —
-// thousands of degrees over a four-minute recording. Drift and real turning are
-// encoded identically in ONE foot's signal, so a single foot cannot be
-// detrended: a per-foot least-squares fit on a real session read +8.18 °/s of
-// "drift" on the left and 0 on the right, when the right foot's -5 °/s bias was
-// merely cancelling 2380° of real turning. Both boards are strapped to one body
-// and must accumulate the same net yaw, so real rotation cancels in
-// (yawLeft - yawRight) and any slow trend left in that difference is drift by
-// construction. Only that difference is identifiable; a bias both feet SHARE
-// cannot be told apart from the athlete genuinely turning, and is left alone.
-//
-// The correction is split symmetrically — half to each foot, opposite signs — so
-// the body yaw (left + right) / 2 is arithmetically unchanged whatever shape the
-// curve takes. Nothing here can flatten a real rotation or invent a turn.
-//
-// Output contract: the corrected yaw is CONTINUOUS. It is no longer bounded to
-// 0..359 and may exceed 360 or go negative.
-const YAW_LEFT_DEVICE = 'ESP32_Sensor_1'
-const YAW_RIGHT_DEVICE = 'ESP32_Sensor_2'
-// Angle into fixed time blocks before the baseline fit: denoises the per-step
-// wobble and makes the rolling statistics cheap (5 minutes becomes ~300 points).
-const BLOCK_WIN_S = 1.0
-// Window of the rolling median+mean that separates drift from gait. Long enough
-// that the feet's turn-by-turn differences average out instead of being mistaken
-// for drift, short enough to follow a drift rate that CHANGES mid-session.
-const DRIFT_WINDOW_S = 31.0
-// A recording shorter than one window cannot be detrended, only offset.
-const MIN_SPAN_S = DRIFT_WINDOW_S
-// Absolute sanity ceiling on one foot's gyro bias, °/s.
-const MAX_DRIFT_DEG_S = 15.0
-// A differential this small over a whole recording is noise, not drift.
-const MIN_DRIFT_DEG = 5.0
-
-// Number(value) or NaN — the counterpart of pandas' to_numeric(errors='coerce').
-// Blank strings are NaN, not 0: Number('') is 0 in JavaScript but float('')
-// raises in Python, and a blank reading is missing data, not a heading of zero.
-function yawNumber(value) {
-  if (value === null || value === undefined) return NaN
-  if (typeof value === 'bigint') return Number(value)
-  if (typeof value === 'string' && value.trim() === '') return NaN
-  const n = Number(value)
-  return isFinite(n) ? n : NaN
-}
-
-// np.median — the mean of the two middle values on even lengths.
-function median(values) {
-  const n = values.length
-  if (!n) return NaN
-  const sorted = [...values].sort((a, b) => a - b)
-  const mid = n >> 1
-  return n % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
-}
-
-// Population standard deviation — divides by N, matching np.std.
-function populationStd(values) {
-  const n = values.length
-  if (!n) return NaN
-  let sum = 0
-  for (let i = 0; i < n; i++) sum += values[i]
-  const mean = sum / n
-  let acc = 0
-  for (let i = 0; i < n; i++) { const d = values[i] - mean; acc += d * d }
-  return Math.sqrt(acc / n)
-}
-
-// Linear interpolation of (xp, fp) at each x, CLAMPED at both ends. Never
-// extrapolates: outside the curve's range there is no evidence, and both feet
-// holding the same constant is what makes the correction cancel out of the body
-// average. `x` must be ascending — a cursor walks xp alongside it.
-function interpClamped(x, xp, fp) {
-  const n = xp.length
-  const out = new Float64Array(x.length)
-  if (!n) { out.fill(NaN); return out }
-  let cursor = 0
-  for (let i = 0; i < x.length; i++) {
-    const v = x[i]
-    if (v <= xp[0]) { out[i] = fp[0]; continue }
-    if (v >= xp[n - 1]) { out[i] = fp[n - 1]; continue }
-    while (cursor < n - 2 && xp[cursor + 1] <= v) cursor++
-    const span = xp[cursor + 1] - xp[cursor]
-    out[i] = span === 0
-      ? fp[cursor]
-      : fp[cursor] + (fp[cursor + 1] - fp[cursor]) * ((v - xp[cursor]) / span)
-  }
-  return out
-}
-
-// (row positions, t_ms, unwrapped yaw) for one device, time-sorted and finite.
-// The positions are offsets into the input, so the apply step can write values
-// back to the exact rows they came from. Null under two usable samples.
-function footYaw(names, times, yaw, device) {
-  const positions = []
-  for (let i = 0; i < times.length; i++) {
-    if (names[i] !== device) continue
-    if (!isFinite(times[i]) || !isFinite(yaw[i])) continue
-    positions.push(i)
-  }
-  if (positions.length < 2) return null
-
-  // Array.prototype.sort is stable, which keeps samples sharing a timestamp in
-  // recording order — the same tie-break as np.argsort(kind='stable').
-  positions.sort((a, b) => times[a] - times[b])
-
-  const count = positions.length
-  const tMs = new Float64Array(count)
-  const raw = new Float64Array(count)
-  for (let i = 0; i < count; i++) {
-    tMs[i] = times[positions[i]]
-    raw[i] = yaw[positions[i]]
-  }
-  return { positions, tMs, yaw: unwrapAngleDegrees(raw) }
-}
-
-// Average `values` into fixed BLOCK_WIN_S time blocks, dropping empty ones.
-function blockMeans(timeS, values, winS = BLOCK_WIN_S) {
-  const n = timeS.length
-  const t0 = timeS[0]
-  const size = Math.floor((timeS[n - 1] - t0) / winS) + 1
-  const count = new Float64Array(size)
-  const sumT = new Float64Array(size)
-  const sumV = new Float64Array(size)
-  for (let i = 0; i < n; i++) {
-    const idx = Math.floor((timeS[i] - t0) / winS)
-    count[idx] += 1
-    sumT[idx] += timeS[i]
-    sumV[idx] += values[i]
-  }
-
-  let kept = 0
-  for (let i = 0; i < size; i++) if (count[i] > 0) kept++
-  const blockT = new Float64Array(kept)
-  const blockValue = new Float64Array(kept)
-  let w = 0
-  for (let i = 0; i < size; i++) {
-    if (count[i] <= 0) continue
-    blockT[w] = sumT[i] / count[i]
-    blockValue[w] = sumV[i] / count[i]
-    w++
-  }
-  return { blockT, blockValue }
-}
-
-// Centred rolling statistic requiring a FULL window — no shrinking at the edges,
-// matching pandas rolling(win, center=True, min_periods=win). NaN therefore
-// propagates outward by half a window on each pass.
-function rollingCentered(values, win, reduce) {
-  const n = values.length
-  const out = new Float64Array(n).fill(NaN)
-  const half = (win - 1) >> 1
-  for (let i = half; i < n - half; i++) {
-    const window = []
-    let ok = true
-    for (let k = i - half; k <= i + half; k++) {
-      if (!isFinite(values[k])) { ok = false; break }
-      window.push(values[k])
-    }
-    if (ok) out[i] = reduce(window)
-  }
-  return out
-}
-
-// Fill the half-window of NaN at each end by continuing the nearest drift rate.
-// Letting the window shrink there biases it toward the middle of the recording:
-// the curve goes flat exactly where the drift is still climbing, leaving the
-// first and last seconds under-corrected.
-//
-// Null when there is less than a window of interior to shape a curve from — a
-// recording barely longer than the window is nearly all extrapolation, and a
-// curve fitted there tracks its own edge noise. The caller falls back to a rate.
-function extendEdges(t, smooth, win) {
-  const valid = []
-  for (let i = 0; i < smooth.length; i++) if (isFinite(smooth[i])) valid.push(i)
-  if (valid.length < win) return null
-
-  const out = Float64Array.from(smooth)
-  const lo = valid[0]
-  const hi = valid[valid.length - 1]
-  const reach = Math.min(win, hi - lo)
-  const slopeLo = (out[lo + reach] - out[lo]) / (t[lo + reach] - t[lo])
-  const slopeHi = (out[hi] - out[hi - reach]) / (t[hi] - t[hi - reach])
-  for (let i = 0; i < lo; i++) out[i] = out[lo] + slopeLo * (t[i] - t[lo])
-  for (let i = hi + 1; i < out.length; i++) out[i] = out[hi] + slopeHi * (t[i] - t[hi])
-  return out
-}
-
-// One drift rate for a recording too short to shape a curve, °/s. Theil-Sen —
-// the median of the slopes between pairs at least a third of the recording apart
-// — rather than least squares, which cannot tell a trend from a wiggle over a
-// handful of turns: on a real 34 s session least squares read the gait as
-// +0.83 °/s and over-corrected it, where the paired median gave +0.18 °/s.
-function singleRate(t, y) {
-  const n = t.length
-  if (n < 2) return 0
-  const minDt = (t[n - 1] - t[0]) / 3
-  const slopes = []
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      const dt = t[j] - t[i]
-      if (dt >= minDt) slopes.push((y[j] - y[i]) / dt)
-    }
-  }
-  return slopes.length === 0 ? 0 : median(slopes)
-}
-
-// (block times, drift curve) — the slow, drift-only part of the divergence. A
-// rolling median over DRIFT_WINDOW_S keeps the gyros' slow disagreement and
-// rejects the feet's turn-by-turn differences — median rather than mean because
-// a turn is a one-sided excursion, not symmetric noise; the second pass takes
-// the staircase off the median's output. The curve is zero-referenced (a
-// constant offset between the feet is not drift) and its rate is clipped.
-function differentialBaseline(timeS, divergence) {
-  const { blockT, blockValue: blockDiv } = blockMeans(timeS, divergence, BLOCK_WIN_S)
-  const win = Math.max(3, Math.round(DRIFT_WINDOW_S / BLOCK_WIN_S)) | 1
-
-  const meanOf = (w) => { let s = 0; for (let i = 0; i < w.length; i++) s += w[i]; return s / w.length }
-  const smoothed = rollingCentered(rollingCentered(blockDiv, win, median), win, meanOf)
-  let smooth = extendEdges(blockT, smoothed, win)
-  if (smooth === null) {
-    const rate = singleRate(blockT, blockDiv)
-    smooth = new Float64Array(blockT.length)
-    for (let i = 0; i < blockT.length; i++) smooth[i] = rate * (blockT[i] - blockT[0])
-  }
-
-  const curve = new Float64Array(blockT.length)
-  let acc = 0
-  for (let i = 1; i < blockT.length; i++) {
-    const ceiling = 2 * MAX_DRIFT_DEG_S * (blockT[i] - blockT[i - 1])
-    let step = smooth[i] - smooth[i - 1]
-    if (step > ceiling) step = ceiling
-    else if (step < -ceiling) step = -ceiling
-    acc += step
-    curve[i] = acc
-  }
-  return { blockT, curve }
-}
-
-function readYawColumns(colMap) {
-  const { Name, Time, XData } = colMap || {}
-  if (!Name || !Time || !XData) return null
-  const n = Math.min(Name.length, Time.length, XData.length)
-  const times = new Float64Array(n)
-  const yaw = new Float64Array(n)
-  for (let i = 0; i < n; i++) {
-    times[i] = yawNumber(Time[i])
-    yaw[i] = yawNumber(XData[i])
-  }
-  return { names: Name, times, yaw }
-}
-
-function noYawDrift(reason, overrides = {}) {
-  return {
-    applied: false,
-    reason,
-    differentialDegS: 0,
-    leftDegS: 0,
-    rightDegS: 0,
-    nonlinearityDeg: 0,
-    divergenceStdBefore: 0,
-    divergenceStdAfter: 0,
-    spanS: 0,
-    curveTMs: null,
-    curveDeg: null,
-    ...overrides,
-  }
-}
-
-// Columns with Time in milliseconds, which is the clock the estimate assumes.
-// The backend never needs this — its analysis loader is fed ms. The markup tool
-// reads Parquet directly and some sessions carry Time in SECONDS; the companion
-// API already rescales those (_rows_with_time_in_ms) using this same rule: a
-// median positive interval under 0.5 means seconds. Without it a whole class of
-// real sessions fails the overlap gate with a nonsense "overlap for 0.2 s".
-// Scaling the clock moves no heading, so the corrected XData is identical either
-// way — only spanS and curveTMs are expressed in the clock passed in.
-function withTimeInMs(colMap) {
-  const time = colMap?.Time
-  if (!time) return colMap
-
-  const values = []
-  for (let i = 0; i < time.length; i++) {
-    const v = yawNumber(time[i])
-    if (isFinite(v)) values.push(v)
-  }
-  if (values.length < 2) return colMap
-
-  const ordered = [...new Set(values)].sort((a, b) => a - b)
-  const deltas = []
-  for (let i = 1; i < ordered.length; i++) {
-    const d = ordered[i] - ordered[i - 1]
-    if (d > 0) deltas.push(d)
-  }
-  if (!deltas.length || median(deltas) >= 0.5) return colMap
-
-  const scaled = new Array(time.length)
-  for (let i = 0; i < time.length; i++) scaled[i] = yawNumber(time[i]) * 1000
-  return { ...colMap, Time: scaled }
-}
-
-// Per-foot gyro drift from the trend of yawLeft - yawRight. Both feet are
-// required — the whole method is one foot checking the other. Time is read as
-// milliseconds; run withTimeInMs first if the session might carry seconds.
-function estimateYawDrift(colMap) {
-  const read = readYawColumns(colMap)
-  if (read === null) return noYawDrift('no Name/Time/XData columns')
-
-  const left = footYaw(read.names, read.times, read.yaw, YAW_LEFT_DEVICE)
-  const right = footYaw(read.names, read.times, read.yaw, YAW_RIGHT_DEVICE)
-  if (left === null || right === null) {
-    const missing = [
-      left === null ? YAW_LEFT_DEVICE : null,
-      right === null ? YAW_RIGHT_DEVICE : null,
-    ].filter(Boolean).join(' and ')
-    return noYawDrift(`no usable yaw for ${missing}`)
-  }
-
-  // Only the window both feet actually recorded is evidence. Outside it there is
-  // nothing to compare against: interpolation would hold the shorter foot's last
-  // heading flat while the other keeps moving, and that manufactured divergence
-  // is indistinguishable from drift. Real recordings hit this — a foot whose
-  // Time rolls over at 2^32 µs claims a 4295 s span against a partner covering
-  // 12 s, and fitting the overhang removed thousands of degrees never recorded.
-  const first = Math.max(left.tMs[0], right.tMs[0])
-  const last = Math.min(left.tMs[left.tMs.length - 1], right.tMs[right.tMs.length - 1])
-  const spanS = (last - first) / 1000
-
-  const sharedIdx = []
-  for (let i = 0; i < left.tMs.length; i++) {
-    if (left.tMs[i] >= first && left.tMs[i] <= last) sharedIdx.push(i)
-  }
-  if (spanS < MIN_SPAN_S || sharedIdx.length < 2) {
-    return noYawDrift(
-      `the feet overlap for ${Math.max(spanS, 0).toFixed(1)} s, under the ${MIN_SPAN_S} s drift window`,
-      { spanS: Math.max(spanS, 0) },
-    )
-  }
-
-  const tShared = new Float64Array(sharedIdx.length)
-  const yawShared = new Float64Array(sharedIdx.length)
-  const tSharedS = new Float64Array(sharedIdx.length)
-  for (let i = 0; i < sharedIdx.length; i++) {
-    tShared[i] = left.tMs[sharedIdx[i]]
-    yawShared[i] = left.yaw[sharedIdx[i]]
-    tSharedS[i] = tShared[i] / 1000
-  }
-
-  // Body rotation cancels in the difference, so what is left is drift alone.
-  const rightAtLeft = interpClamped(tShared, right.tMs, right.yaw)
-  const divergence = new Float64Array(tShared.length)
-  for (let i = 0; i < tShared.length; i++) divergence[i] = yawShared[i] - rightAtLeft[i]
-
-  const { blockT, curve } = differentialBaseline(tSharedS, divergence)
-
-  const excursion = arrayMax(curve) - arrayMin(curve)
-  if (excursion < MIN_DRIFT_DEG) {
-    const std = populationStd(divergence)
-    return noYawDrift(
-      `the feet drift apart by ${excursion.toFixed(1)}°, under ${MIN_DRIFT_DEG}°`,
-      { divergenceStdBefore: std, divergenceStdAfter: std, spanS },
-    )
-  }
-
-  // Removing the curve from the divergence is the same as splitting it
-  // symmetrically between the feet, which is what yawCorrection does.
-  const curveAtLeft = interpClamped(tSharedS, blockT, curve)
-  const corrected = new Float64Array(divergence.length)
-  for (let i = 0; i < divergence.length; i++) corrected[i] = divergence[i] - curveAtLeft[i]
-
-  const lastBlock = curve.length - 1
-  const differential = (curve[lastBlock] - curve[0]) / spanS
-  const straight = interpClamped(
-    blockT,
-    Float64Array.of(blockT[0], blockT[lastBlock]),
-    Float64Array.of(curve[0], curve[lastBlock]),
-  )
-  let nonlinearity = 0
-  for (let i = 0; i < curve.length; i++) {
-    const d = Math.abs(curve[i] - straight[i])
-    if (d > nonlinearity) nonlinearity = d
-  }
-
-  const curveTMs = new Float64Array(blockT.length)
-  for (let i = 0; i < blockT.length; i++) curveTMs[i] = blockT[i] * 1000
-
-  return {
-    applied: true,
-    reason: 'differential drift split between the feet',
-    differentialDegS: differential,
-    leftDegS: differential / 2,
-    rightDegS: -differential / 2,
-    nonlinearityDeg: nonlinearity,
-    divergenceStdBefore: populationStd(divergence),
-    divergenceStdAfter: populationStd(corrected),
-    spanS,
-    curveTMs,
-    curveDeg: curve,
-  }
-}
-
-// Degrees to SUBTRACT from one foot's yaw at each of tMs. Equal and opposite
-// between the feet, so the body yaw (left + right) / 2 comes out of this
-// untouched, whatever shape the curve has.
-function yawCorrection(drift, foot, tMs) {
-  const out = new Float64Array(tMs.length)
-  if (!drift.curveTMs || !drift.curveDeg) return out
-  const half = foot === 'left' ? 0.5 : -0.5
-  const curve = interpClamped(tMs, drift.curveTMs, drift.curveDeg)
-  for (let i = 0; i < out.length; i++) out[i] = half * curve[i]
-  return out
-}
-
-// A copy of the XData column with both feet replaced by drift-corrected yaw. The
-// written values are UNWRAPPED (continuous, not 0..359). Other devices and a
-// foot's own unusable rows are passed through exactly as they came in. Null when
-// the correction does not apply, so callers keep the raw column.
-function correctedXData(colMap, drift) {
-  if (!drift.applied) return null
-  const read = readYawColumns(colMap)
-  if (read === null) return null
-
-  const out = [...colMap.XData]
-  for (const [foot, device] of [['left', YAW_LEFT_DEVICE], ['right', YAW_RIGHT_DEVICE]]) {
-    const got = footYaw(read.names, read.times, read.yaw, device)
-    if (got === null) return null
-    const correction = yawCorrection(drift, foot, got.tMs)
-    for (let i = 0; i < got.positions.length; i++) {
-      out[got.positions[i]] = got.yaw[i] - correction[i]
-    }
-  }
-  return out
-}
-
-// How far the two feet may disagree before an angle is refused. Kept very wide
-// on purpose: measured over 158 turns in five sessions, the turns a tighter
-// limit would have dropped had a median error of 2.3 degrees against the body's
-// own rotation — BETTER than the ones it kept (3.8). Feet disagreeing is normal
-// asynchrony, not a fault, and averaging already handles it, so a strict limit
-// only discards good measurements. What remains here is a guard against a board
-// that has genuinely failed, where one foot reports rotation the other never saw.
-const TURN_DISAGREEMENT_BASE_DEG = 200.0
-const TURN_DISAGREEMENT_PER_S_DEG = 40.0
-const TURN_DISAGREEMENT_MAX_DEG = 720.0
-
-/** Tolerance for the feet disagreeing over a span of the given length. */
-function turnDisagreementLimitDeg(spanMs) {
-  const seconds = Math.max(0, spanMs) / 1000
-  return Math.min(
-    TURN_DISAGREEMENT_BASE_DEG + seconds * TURN_DISAGREEMENT_PER_S_DEG,
-    TURN_DISAGREEMENT_MAX_DEG,
-  )
-}
-
-/**
- * Net rotation over [fromMs, toMs], in degrees. Signed: positive and negative
- * are turns in opposite directions, which a classifier wants kept apart rather
- * than collapsed to a magnitude.
- *
- * Averages the two feet. They swing out of phase, so either one alone overshoots
- * or undershoots the body by tens of degrees; the average cancels most of that,
- * and it cancels a per-foot gyro bias too, since the drift correction splits
- * equally with opposite signs.
- *
- * Measured against the body's own rotation over 139 turns in three sessions,
- * grouped by how large the turn actually was — free-mode turns are any angle,
- * not just 180. Median absolute error:
- *
- *   true angle    average   furthest foot
- *     40-90         1-3         16-47
- *     90-150        2-6          9-12
- *     150+          3-5          5-10
- *
- * Taking the foot that rotated furthest was tried and is clearly worse: on small
- * turns it reads one foot's overswing as the turn itself, biasing 40-90 degree
- * turns upward by a median of +47 degrees.
- *
- * Null when the heading is missing, a foot has no samples inside the span, or
- * the feet disagree so badly that the number would be meaningless.
- */
-function turnAngleDeg(colMap, fromMs, toMs, correctedCol = null) {
-  // The corrected heading is passed in when the session has one: reading the raw
-  // XData instead would fold a few deg/s of gyro bias into every long span.
-  const source = correctedCol ? { ...colMap, XData: correctedCol } : colMap
-  const read = readYawColumns(source)
-  if (read === null) return null
-
-  const perFoot = []
-  for (const device of [YAW_LEFT_DEVICE, YAW_RIGHT_DEVICE]) {
-    const got = footYaw(read.names, read.times, read.yaw, device)
-    if (got === null) return null
-    // First and last sample inside the span; the heading is already unwrapped,
-    // so the net rotation is simply the difference between the two ends.
-    let first = -1
-    let last = -1
-    for (let i = 0; i < got.tMs.length; i++) {
-      if (got.tMs[i] < fromMs) continue
-      if (got.tMs[i] > toMs) break
-      if (first < 0) first = i
-      last = i
-    }
-    if (first < 0 || last <= first) return null
-    perFoot.push(got.yaw[last] - got.yaw[first])
-  }
-
-  // Some disagreement is normal — the feet swing out of phase — but past the
-  // span's limit one board is broken and any number would be invented.
-  if (Math.abs(perFoot[0] - perFoot[1]) > turnDisagreementLimitDeg(toMs - fromMs)) return null
-  return (perFoot[0] + perFoot[1]) / 2
-}
-
-function formatTime(s) {
-  if (!isFinite(s) || s < 0) return '0:00.0'
-  const m = Math.floor(s / 60)
-  const sec = (s % 60).toFixed(1).padStart(4, '0')
-  return `${m}:${sec}`
-}
-function formatDuration(d, unit) {
-  if (!isFinite(d) || d < 0) return '—'
-  if (unit === 'ms') {
-    if (d >= 1000) return (d / 1000).toFixed(2) + 'с'
-    return d.toFixed(0) + 'мс'
-  }
-  return d.toFixed(3) + 'с'
-}
-
-function formatMetric(value, digits = 2, suffix = '') {
-  if (value == null || !Number.isFinite(Number(value))) return '—'
-  return `${Number(value).toFixed(digits)}${suffix}`
-}
-
-function formatInterval(value) {
-  const number = Number(value)
-  if (!Number.isFinite(number)) return '—'
-  if (Number.isInteger(number)) return String(number)
-  return number.toFixed(number < 10 ? 2 : 1).replace(/0+$/, '').replace(/\.$/, '')
-}
-
-function protocolDetectorSummary(result) {
-  const summary = result?.summary
-  if (!summary) return 'события ещё не рассчитаны'
-  if (summary.turn_count != null) {
-    const detectionFoot = PER_FOOT_TURN_DETECTOR_IDS.has(result?.calculator)
-      ? { both: 'L+R', left: 'L', right: 'R' }[summary.detection_foot || 'both']
-      : ''
-    if (detectionFoot === 'L+R' && summary.left_turn_count != null && summary.right_turn_count != null) {
-      return `L+R · повороты L ${summary.left_turn_count} / R ${summary.right_turn_count} · фазы L ${summary.left_run_count || 0} / R ${summary.right_run_count || 0}`
-    }
-    return `${detectionFoot ? `${detectionFoot} · ` : ''}повороты ${summary.turn_count} · беговые фазы ${summary.run_count || 0}`
-  }
-  if (summary.sprint_count != null) {
-    if (summary.sprint_count === 0 && summary.segment_found) {
-      return `неполный спринт ${formatMetric(summary.distance_m, 1, ' м')} · шаги ${summary.step_count || 0} (L ${summary.left_count || 0} / R ${summary.right_count || 0}) · step ${formatMetric(summary.step_length_m, 2, ' м')} · stride ${formatMetric(summary.stride_length_m, 2, ' м')}`
-    }
-    if (summary.sprint_count === 0) return 'старт спринта не найден'
-    return `30 м найдено · шаги ${summary.step_count || 0} (L ${summary.left_count || 0} / R ${summary.right_count || 0}) · step ${formatMetric(summary.step_length_m, 2, ' м')} · stride ${formatMetric(summary.stride_length_m, 2, ' м')}`
-  }
-  if (summary.flight_count != null) {
-    return `прыжки ${summary.flight_count} · L ${summary.left_count || 0} · R ${summary.right_count || 0}`
-  }
-  return `контакты ${summary.contact_count || 0} · L ${summary.left_count || 0} · R ${summary.right_count || 0}`
-}
-
-function normaliseSpeedPrediction(data) {
-  const modelPoints = Array.isArray(data?.speed_series)
-    ? data.speed_series
-      .map(point => ({
-        // Charts API returns CausalSpeedTCN timestamps in milliseconds.
-        time: Number(point.time) / 1000,
-        speed: Number(point.speed),
-        distance: Number(point.distance),
-      }))
-      .filter(point => Number.isFinite(point.time) && Number.isFinite(point.speed) && Number.isFinite(point.distance))
-    : []
-
-  const trackerPoints = Array.isArray(data?.speed?.data_points)
-    ? data.speed.data_points
-      .map(point => ({
-        time: Number(point.time),
-        speed: Number(point.speed),
-        distance: Number(point.distance),
-      }))
-      .filter(point => Number.isFinite(point.time) && Number.isFinite(point.speed) && Number.isFinite(point.distance))
-    : []
-
-  const dataPoints = modelPoints.length > 0 ? modelPoints : trackerPoints
-  if (!modelPoints.length) {
-    return {
-      ...data,
-      data_points: dataPoints,
-      stat: data?.speed?.stat || null,
-      model: 'SpeedTracker',
-    }
-  }
-
-  const peak = dataPoints.reduce((best, point) => point.speed > best.speed ? point : best, dataPoints[0])
-  const start = dataPoints.find(point => point.speed > 0 && point.distance > 0) || dataPoints[0]
-  const finish = dataPoints.find(point => point.distance >= 30)
-  const duration = finish && finish.time > start.time ? finish.time - start.time : null
-
-  return {
-    ...data,
-    data_points: dataPoints,
-    stat: {
-      timestep_at_peak_speed: peak.time,
-      distance_at_peak_speed: peak.distance,
-      peak_speed: peak.speed,
-      start_time: start.time,
-      end_time: finish?.time ?? null,
-      average_speed: duration ? 30 / duration : null,
-      duration,
-    },
-    model: 'CausalSpeedTCN ensemble',
-  }
-}
-
-function buildCursorShapes(x, n) {
-  return Array.from({ length: n }, (_, i) => ({
-    type: 'line',
-    x0: x, x1: x,
-    y0: 0, y1: 1,
-    xref: i === 0 ? 'x' : `x${i + 1}`,
-    yref: i === 0 ? 'y domain' : `y${i + 1} domain`,
-    line: { color: 'rgba(220,40,40,0.85)', width: 2, dash: 'dot' },
-  }))
-}
-
-function buildSelectedPointShapes(x, n) {
-  return Array.from({ length: n }, (_, i) => ({
-    type: 'line',
-    x0: x, x1: x,
-    y0: 0, y1: 1,
-    xref: i === 0 ? 'x' : `x${i + 1}`,
-    yref: i === 0 ? 'y domain' : `y${i + 1} domain`,
-    line: { color: SEL_LINE, width: 3.5 },
-    layer: 'above',
-  }))
-}
-
-function chartSubplotCenterTop(index, total) {
-  if (total <= 0) return '50%'
-  const gap = 0.03
-  const subplotHeight = (1 - gap * (total - 1)) / total
-  const centerDomain = 1 - index * (subplotHeight + gap) - subplotHeight / 2
-  return `calc(12px + (100% - 54px) * ${1 - centerDomain})`
-}
-
-function chartSubplotMetrics(index, total, chartHeight) {
-  const gap = 0.03
-  const plotTop = 12
-  const plotHeight = Math.max(1, chartHeight - 54)
-  const subplotHeight = total > 0 ? (1 - gap * (total - 1)) / total : 1
-  const topDomain = 1 - index * (subplotHeight + gap)
-  return {
-    top: plotTop + (1 - topDomain) * plotHeight,
-    height: subplotHeight * plotHeight,
-  }
-}
-
-function plotAxisKey(index, axis) {
-  return index === 0 ? axis : `${axis}${index + 1}`
-}
-
-function readPlotRange(eventData, axisKey) {
-  if (!eventData) return null
-  const start = eventData[`${axisKey}.range[0]`]
-  const end = eventData[`${axisKey}.range[1]`]
-  if (start !== undefined && end !== undefined) return [Number(start), Number(end)]
-  const nested = eventData[`${axisKey}.range`] ?? eventData[axisKey]?.range
-  if (Array.isArray(nested) && nested.length >= 2) return [Number(nested[0]), Number(nested[1])]
-  return null
-}
-
-function currentAxisRange(gd, axisKey) {
-  const layoutRange = gd?.layout?.[axisKey]?.range
-  if (Array.isArray(layoutRange) && layoutRange.length >= 2) {
-    return [Number(layoutRange[0]), Number(layoutRange[1])]
-  }
-  const fullRange = gd?._fullLayout?.[axisKey]?.range
-  if (Array.isArray(fullRange) && fullRange.length >= 2) {
-    return [Number(fullRange[0]), Number(fullRange[1])]
-  }
-  return null
-}
-
-function hasSessionMetaValue(value) {
-  return value != null && value !== ''
-}
-
-// sessions.time_offset is an integer number of milliseconds (the column spans
-// -3469..11221 across the DB). The sign is always explicit so a measured zero
-// reads as a real value; a NULL is filtered out by the callers instead.
-function formatTimeOffset(value) {
-  if (!hasSessionMetaValue(value)) return ''
-  const ms = typeof value === 'number' ? value : Number(value)
-  if (!Number.isFinite(ms)) return String(value).trim()
-  return `${ms >= 0 ? '+' : ''}${ms} ms`
-}
-
-// The S1/S2 shift that sessions.time_offset implies, in the unit the shift boxes
-// are currently reading. The sign is flipped: the column records how far the
-// device clock ran ahead, so the traces move the other way to meet the video.
-// Confirmed by hand on session 7797 (-1753 in the DB, +1753 ms on screen lines
-// the video up); the column is otherwise undocumented — the backend schema calls
-// it seconds, which the values contradict.
-function timeOffsetAsShift(value, unit) {
-  if (!hasSessionMetaValue(value)) return null
-  const ms = typeof value === 'number' ? value : Number(value)
-  if (!Number.isFinite(ms)) return null
-  const shift = -ms
-  return unit === 'ms' ? shift : Math.round(shift) / 1000
-}
-
-// The markup API fills an absent athlete with an em dash; the header badge is
-// hidden instead of showing a placeholder.
-function normalizeMemberName(value) {
-  const name = typeof value === 'string' ? value.trim() : ''
-  return name && name !== '—' ? name : ''
-}
-
-function normalizeSessionTitle(value) {
-  return typeof value === 'string' ? value.trim() : ''
-}
-
-function getPairStartIndex(index) {
-  return index - (index % 2)
-}
-
-function parseCsvRow(line) {
-  const out = []
-  let cur = ''
-  let inQuotes = false
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]
-    if (inQuotes) {
-      if (ch === '"') {
-        if (line[i + 1] === '"') { cur += '"'; i++ }
-        else inQuotes = false
-      } else cur += ch
-    } else if (ch === '"') {
-      inQuotes = true
-    } else if (ch === ',') {
-      out.push(cur)
-      cur = ''
-    } else {
-      cur += ch
-    }
-  }
-  out.push(cur)
-  return out
-}
-
-function parseCsvText(text) {
-  const lines = text.replace(/^\uFEFF/, '').trim().split(/\r?\n/)
-  if (!lines.length) throw new Error('CSV пустой')
-  const headers = parseCsvRow(lines[0]).map(h => h.trim())
-  const rows = []
-  for (let i = 1; i < lines.length; i++) {
-    if (!lines[i].trim()) continue
-    const vals = parseCsvRow(lines[i])
-    const row = {}
-    headers.forEach((h, j) => { row[h] = vals[j] ?? '' })
-    rows.push(row)
-  }
-  return { headers, rows }
-}
-
-// CSV cells arrive as strings; parquet columns are already typed. Convert the
-// columns that hold only numbers so the chart, calculators and gap stats see
-// the same shape from both sources ('' → null, text columns kept as is).
-function coerceCsvColumnsToNumbers(colMap) {
-  Object.keys(colMap).forEach(col => {
-    const arr = colMap[col] || []
-    let hasNumber = false
-    for (let i = 0; i < arr.length; i++) {
-      const v = arr[i]
-      if (v === null || v === undefined || v === '') continue
-      if (safeNum(v) === null) return // non-numeric column (Name, …)
-      hasNumber = true
-    }
-    if (!hasNumber) return
-    colMap[col] = arr.map(v => (v === null || v === undefined || v === '' ? null : safeNum(v)))
-  })
-}
-
-function isTargetOne(v) {
-  if (v === 1 || v === '1' || v === 1.0) return true
-  const s = String(v ?? '').trim()
-  return s === '1' || s === '1.0'
-}
-
-function extractContactPairsFromTargetRuns(times, targets, offset = 0) {
-  const contacts = []
-  let i = 0
-  while (i < targets.length) {
-    while (i < targets.length && !isTargetOne(targets[i])) i++
-    if (i >= targets.length) break
-    const startT = safeNum(times[i])
-    if (startT === null) { i++; continue }
-    let endT = startT
-    while (i < targets.length && isTargetOne(targets[i])) {
-      const t = safeNum(times[i])
-      if (t !== null) endT = t
-      i++
-    }
-    contacts.push(startT + offset, endT + offset)
-  }
-  return contacts
-}
-
-function extractContactsFromLabeledCsv(rows, timeCol, leftSensors, rightSensors, offsetS1, offsetS2) {
-  const bySensors = (sensorNames) => {
-    const candidates = sensorNames.map(sensorName => rows
-      .filter(r => (r.Name || r.name) === sensorName)
-      .map(r => ({
-        t: safeNum(r[timeCol]),
-        target: r.Target ?? r.target ?? r.Label ?? r.label ?? '',
-      }))
-      .filter(r => r.t !== null)
-      .sort((a, b) => a.t - b.t))
-      .filter(candidate => candidate.length > 0)
-
-    // A foot can have separate pressure and IMU devices. Prefer the densest
-    // labeled timeline instead of interleaving timestamps from both devices.
-    return candidates.sort((a, b) => {
-      const aTargets = a.reduce((n, row) => n + Number(isTargetOne(row.target)), 0)
-      const bTargets = b.reduce((n, row) => n + Number(isTargetOne(row.target)), 0)
-      return bTargets - aTargets || b.length - a.length
-    })[0] || []
-  }
-
-  const leftRows = bySensors(leftSensors)
-  const rightRows = bySensors(rightSensors)
-  if (!leftRows.length && !rightRows.length) {
-    throw new Error('Строки для сенсоров левой и правой ноги не найдены')
-  }
-
-  const leftContacts = extractContactPairsFromTargetRuns(
-    leftRows.map(r => r.t),
-    leftRows.map(r => r.target),
-    offsetS1,
-  )
-  const rightContacts = extractContactPairsFromTargetRuns(
-    rightRows.map(r => r.t),
-    rightRows.map(r => r.target),
-    offsetS2,
-  )
-
-  return { leftContacts, rightContacts, leftCount: leftContacts.length / 2, rightCount: rightContacts.length / 2 }
-}
+import { FileBadge, OffsetInput, SessionInfoCard, SessionTitleBadge, SidebarSection, UiIcon, UploadBtn } from './components/ui.jsx'
+import { ACTIVITY_BY_ID, ACTIVITY_FILE_TYPE, ACTIVITY_KINDS, ACTIVITY_SNAP_FRACTION, DEFAULT_ACTIVITY, activitySpanAt, activitySpansFromFiles, closeActivitySpan, contactMarkupFiles, insertActivitySpan, resizeActivitySpan, snapActivityEdge } from './lib/activity.js'
+import { API_BASE, CALCULATOR_API, MARKUP_API, parseApiError } from './lib/api.js'
+import { CALCULATOR_BY_ID, DELETED_STEP_STYLE, EXTRA_CALCULATORS, GRF_PRED_COL, JUMP_EVENT_PROTOCOL_OPTIONS, MODEL_SECTION_CALCULATOR_IDS, PER_FOOT_TURN_DETECTOR_IDS, PLATE_FLIGHT_ID, PLATE_FORCE_COLUMNS, PROTOCOL_DETECTORS, PROTOCOL_DETECTOR_BY_ID, TURN_DETECTION_FOOT_OPTIONS, WEIGHT_REQUIRED_CALCULATORS, calculatorEventLegend, calculatorEventStyle, calculatorQuery, columnsForCalculator, isStepContact, normaliseSpeedPrediction, protocolDetectorSummary, stepKey } from './lib/calculators.js'
+import { DISTANCE_PRED_COLS, L_FILL, L_LINE, PALETTE, PRED_COLOR, R_FILL, R_LINE, SEL_FILL, SEL_LINE, SPEED_PRED_COLS, ST_COLOR, ST_COL_COLORS, ST_ONLY_COLS, TRACE_HOVER_TEMPLATE, UI_FONT_FAMILY, buildCursorShapes, buildGapBandShapes, buildSelectedPointShapes, chartSubplotCenterTop, chartSubplotMetrics, currentAxisRange, plotAxisKey, readPlotRange } from './lib/chart.js'
+import { coerceCsvColumnsToNumbers, extractContactsFromLabeledCsv, getPairStartIndex, parseCsvText } from './lib/csv.js'
+import { formatDuration, formatInterval, formatMetric, formatTime, formatTimeOffset, hasSessionMetaValue, normalizeMemberName, normalizeSessionTitle, timeOffsetAsShift } from './lib/format.js'
+import { SPEED_TRACKER, buildDefaultCols, computeAutoOffsetST, computeNumericColumns, detectTimeCol, groupSensorNamesByFoot, resolveStDataCol, rowsToColMap, sensorFootForName, sensorNameForFoot, sortSensorNames } from './lib/sensors.js'
+import { IMU_SNAPSHOT_COLUMNS, INSOLE_TOTAL_COL, MIRRORED_LEFT_COLUMNS, SENSOR_SUM_NORM_COL, TKEO_PLOT_COLS, UNWRAPPABLE_ANGLE_COLUMNS, addAccTkeoColumn, addDerivedSessionColumns, addNormalizedSensorColumns, addSensorSumColumns, addTkeoColumns, addWeightedInsoleTotalColumn, computeGapStats } from './lib/signal.js'
+import { arrayMax, arrayMin, safeNum, unwrapAngleDegrees } from './lib/utils.js'
+import { correctedXData, estimateYawDrift, turnAngleDeg, withTimeInMs } from './lib/yawDrift.js'
 
 // ── Main App ───────────────────────────────────────────────────────────────
 export default function App() {
@@ -2220,8 +63,7 @@ export default function App() {
   const [predictLoading, setPredictLoading] = useState(false)
   const [showSpeedPredict, setShowSpeedPredict] = useState(false)
   const [showDistancePredict, setShowDistancePredict] = useState(false)
-  const [extraCalculatorsOpen, setExtraCalculatorsOpen] = useState(false)
-  const [protocolDetectorsOpen, setProtocolDetectorsOpen] = useState(false)
+  const [modelCardsOpen, setModelCardsOpen] = useState(false)
   const [calculatorResults, setCalculatorResults] = useState({})
   const [activeCalculators, setActiveCalculators] = useState([])
   const [calculatorLoading, setCalculatorLoading] = useState('')
@@ -2368,6 +210,12 @@ export default function App() {
   const skipClearImportCsvRef = useRef(false)
   // Raw IMU channels as loaded, kept until the postprocessing is undone.
   const imuOriginalRef = useRef(null)
+  // The parquet file the session was read from, exactly as fetched. Sent to the
+  // calculators as-is instead of an 8 MB JSON rebuilt from the columns: the
+  // server parses it in ~10 ms and caches both the frame and the results by
+  // content hash. Null for a CSV dataset (nothing to send but the columns), and
+  // ignored while IMU post-processing has rewritten the channels in the browser.
+  const parquetBytesRef = useRef(null)
 
   const insoleSensorNames = useMemo(
     () => sensorNames.filter(n => n !== SPEED_TRACKER),
@@ -2639,6 +487,7 @@ export default function App() {
       Plotly.purge(chartDivRef.current)
     }
     setParquetData(null)
+    parquetBytesRef.current = null
     setColumns([])
     setColumnsPanelOpen(false)
     setSensorNames([])
@@ -2668,8 +517,7 @@ export default function App() {
     setSelectedCalculatorContact(null)
     // Deletions key off the old detector output, so they mean nothing here.
     setDeletedStepKeys(new Set())
-    setExtraCalculatorsOpen(false)
-    setProtocolDetectorsOpen(false)
+    setModelCardsOpen(false)
     setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
@@ -2738,7 +586,8 @@ export default function App() {
         }
       }
 
-      const rows = await parquetReadObjects({ file: await parquetResp.arrayBuffer() })
+      const parquetBuffer = await parquetResp.arrayBuffer()
+      const rows = await parquetReadObjects({ file: parquetBuffer })
 
       if (!rows?.length) { setStatus({ text: 'Сессия пустая', type: 'error' }); return }
 
@@ -2746,6 +595,7 @@ export default function App() {
       const tCol = detectTimeCol(Object.keys(colMap))
       addDerivedSessionColumns(colMap, tCol, result.additional_info)
       setParquetData(colMap)
+      parquetBytesRef.current = parquetBuffer
       setTimeCol(tCol)
       const drift = prepareYawDrift(colMap)
 
@@ -3689,8 +1539,7 @@ export default function App() {
         setSelectedCalculatorContact(null)
         // Deletions key off the old detector output, so they mean nothing here.
         setDeletedStepKeys(new Set())
-        setExtraCalculatorsOpen(false)
-        setProtocolDetectorsOpen(false)
+        setModelCardsOpen(false)
         setOffsetST(0)
         setShowGaps(false)
         setCheckHzData(null)
@@ -3706,6 +1555,7 @@ export default function App() {
 
         addDerivedSessionColumns(colMap, tCol, null)
         setParquetData(colMap)
+        parquetBytesRef.current = null   // a CSV: the columns are all there is
         setTimeCol(tCol)
         prepareYawDrift(colMap)
 
@@ -4179,8 +2029,7 @@ export default function App() {
     setSelectedCalculatorContact(null)
     // Deletions key off the old detector output, so they mean nothing here.
     setDeletedStepKeys(new Set())
-    setExtraCalculatorsOpen(false)
-    setProtocolDetectorsOpen(false)
+    setModelCardsOpen(false)
     setOffsetST(0)
     setShowGaps(false)
     setCheckHzData(null)
@@ -4208,6 +2057,7 @@ export default function App() {
       const tCol = detectTimeCol(Object.keys(colMap))
       addDerivedSessionColumns(colMap, tCol, null)
       setParquetData(colMap)
+      parquetBytesRef.current = arrayBuffer
       setTimeCol(tCol)
       const drift = prepareYawDrift(colMap)
 
@@ -4398,19 +2248,19 @@ export default function App() {
     }
 
     const cachedResult = calculatorResults[calculatorId]
-    const cacheHasSprintSteps = calculatorId !== 'protocol-sprint-detector'
-      || cachedResult?.summary?.step_count != null
-    const isJumpDetector = ['jump-metrics', 'protocol-jumping-detector'].includes(calculatorId)
-    const cacheHasJumpHeights = !isJumpDetector
-      || cachedResult?.contacts?.every(contact => contact.jump_height_cm != null)
-    const cacheMatchesJumpProtocol = calculatorId !== 'jump-events'
+    // Both jump-conditioned models take the movement as an input channel, so a
+    // result computed under another protocol is not the same result.
+    const cacheMatchesJumpProtocol = !['jump-events', 'grf-split'].includes(calculatorId)
       || (cachedResult?.summary?.protocol || 'vert') === jumpEventProtocol
+    // The server echoes the weight rounded to 0.1 kg, so compare with that slack.
+    const cacheMatchesWeight = calculatorId !== 'grf-split'
+      || Math.abs(Number(cachedResult?.summary?.weight_kg) - Number(weightKg)) < 0.1
     const cacheMatchesDetectionFoot = !PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)
       || (cachedResult?.summary?.detection_foot || 'both') === requestedDetectionFoot
     const cacheHasSeparateFootOverlay = !PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)
       || requestedDetectionFoot !== 'both'
       || (cachedResult?.summary?.left_turn_count != null && cachedResult?.summary?.right_turn_count != null)
-    if (!force && cachedResult && cacheHasSprintSteps && cacheHasJumpHeights && cacheMatchesJumpProtocol
+    if (!force && cachedResult && cacheMatchesJumpProtocol && cacheMatchesWeight
       && cacheMatchesDetectionFoot && cacheHasSeparateFootOverlay) {
       setActiveCalculators(prev => prev.includes(calculatorId) ? prev : [...prev, calculatorId])
       return
@@ -4419,25 +2269,33 @@ export default function App() {
     if (!parquetData || calculatorLoading) return
 
     const parsedWeight = Number(weightKg)
-    // Both force models take body weight as a model input, not just as a unit
+    // The force model takes body weight as a model input, not just as a unit
     // conversion, so a missing weight is refused rather than defaulted here.
     if (WEIGHT_REQUIRED_CALCULATORS.has(calculatorId)
       && (!Number.isFinite(parsedWeight) || parsedWeight <= 0)) {
-      const which = calculatorId === 'grf-split' ? 'Total GRF' : 'Bilateral GRF'
-      setStatus({ text: `Укажите положительный вес для ${which}`, type: 'error', area: 'models' })
+      setStatus({ text: 'Укажите положительный вес для Total GRF', type: 'error', area: 'models' })
       return
     }
 
     const dataVersion = calculatorDataVersionRef.current
     setCalculatorLoading(calculatorId)
     try {
-      const payload = { columns: columnsForCalculator(calculatorId, parquetData) }
-      if (WEIGHT_REQUIRED_CALCULATORS.has(calculatorId)) payload.weight_kg = parsedWeight
-      if (calculatorId === 'jump-events') payload.protocol = jumpEventProtocol
-      // The GRF model reads its take-off / landing instants from the plate-trained
-      // jump detector, which is conditioned on the movement, so pass the same
-      // protocol the Jump events calculator uses.
-      if (calculatorId === 'grf-split') payload.protocol = jumpEventProtocol
+      const options = {}
+      if (WEIGHT_REQUIRED_CALCULATORS.has(calculatorId)) options.weight_kg = parsedWeight
+      if (calculatorId === 'jump-events') options.protocol = jumpEventProtocol
+      if (calculatorId === 'grf-split') {
+        // The GRF model reads its take-off / landing instants from the plate-trained
+        // jump detector, which is conditioned on the movement, so pass the same
+        // protocol the Jump events calculator uses - and, when that calculator has
+        // already run on this data under this movement, its flights themselves, so
+        // the detector is not run a second time (it costs as much as the force model).
+        options.protocol = jumpEventProtocol
+        const jumpEvents = calculatorResults['jump-events']
+        if (jumpEvents?.contacts?.length
+          && (jumpEvents.summary?.protocol || 'vert') === jumpEventProtocol) {
+          options.jump_pairs = jumpEvents.contacts.map(c => [c.start_time_s, c.end_time_s])
+        }
+      }
       if (PER_FOOT_TURN_DETECTOR_IDS.has(calculatorId)) {
         const selectedSensorName = requestedDetectionFoot === 'both'
           ? ''
@@ -4445,14 +2303,24 @@ export default function App() {
         if (requestedDetectionFoot !== 'both' && !selectedSensorName) {
           throw new Error(`В данных нет ${requestedDetectionFoot === 'left' ? 'левой' : 'правой'} ноги`)
         }
-        payload.detection_foot = requestedDetectionFoot
-        if (selectedSensorName) payload.sensor_name = selectedSensorName
+        options.detection_foot = requestedDetectionFoot
+        if (selectedSensorName) options.sensor_name = selectedSensorName
       }
-      const resp = await fetch(`/calculator-api/calculate/${calculatorId}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'accept': 'application/json' },
-        body: JSON.stringify(payload),
-      })
+      // The parquet bytes describe the session only while nothing rewrote it in
+      // the browser; after IMU post-processing the columns are the truth.
+      const parquetBytes = imuApplied ? null : parquetBytesRef.current
+      const url = `${CALCULATOR_API}/calculate/${calculatorId}`
+      const resp = parquetBytes
+        ? await fetch(`${url}?${calculatorQuery(options)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/vnd.apache.parquet', 'accept': 'application/json' },
+          body: parquetBytes,
+        })
+        : await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'accept': 'application/json' },
+          body: JSON.stringify({ columns: columnsForCalculator(calculatorId, parquetData), ...options }),
+        })
       if (!resp.ok) {
         const errData = await resp.json().catch(() => ({}))
         throw new Error(parseApiError(errData, resp.status))
@@ -4473,10 +2341,8 @@ export default function App() {
       const cadence = data.summary?.cadence_spm
       const resultText = PROTOCOL_DETECTOR_BY_ID[calculatorId]
         ? protocolDetectorSummary(data)
-        : ['jump-metrics', 'jump-events'].includes(calculatorId)
+        : calculatorId === 'jump-events'
           ? `${data.summary?.total_jump_count || 0} прыж. · высота ${formatMetric(data.summary?.mean_jump_height_cm, 1, ' см')}`
-          : calculatorId === 'force-jump'
-            ? `пик ${formatMetric(data.summary?.peak_force_n, 1, ' Н')} · ${formatMetric(data.summary?.peak_force_bw, 2, ' BW')}`
           : calculatorId === 'grf-split'
             ? `${data.summary?.jump_count || 0} прыж. · пик ${formatMetric(data.summary?.peak_force?.percent_bw, 0, ' %BW')}`
               + ` · импульс ${formatMetric(data.summary?.mean_contact_impulse_bw_s, 2, ' BW·с')}`
@@ -4503,7 +2369,7 @@ export default function App() {
     } finally {
       if (dataVersion === calculatorDataVersionRef.current) setCalculatorLoading('')
     }
-  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg, jumpEventProtocol, turnDetectionFeet, insoleSensorNames, columns])
+  }, [activeCalculators, calculatorResults, parquetData, calculatorLoading, weightKg, jumpEventProtocol, turnDetectionFeet, insoleSensorNames, columns, imuApplied])
 
   /**
    * What the chart plots: the raw columns, or the same columns with XData
@@ -4866,10 +2732,9 @@ export default function App() {
 
       const findCalculatorContact = (x) => {
         const timeScale = timeUnitRef.current === 'ms' ? 1000 : 1
-        const calculatorIds = activeCalculatorsRef.current
         const candidates = []
 
-        calculatorIds.forEach(calculatorId => {
+        activeCalculatorsRef.current.forEach(calculatorId => {
           const result = calculatorResultsRef.current[calculatorId]
           if (!result?.contacts?.length) return
           result.contacts.forEach((contact, index) => {
@@ -4894,11 +2759,9 @@ export default function App() {
           })
         })
 
-        candidates.sort((a, b) => {
-          if (a.calculatorId === 'step-cadence' && b.calculatorId !== 'step-cadence') return -1
-          if (b.calculatorId === 'step-cadence' && a.calculatorId !== 'step-cadence') return 1
-          return Number(a.contact.duration_ms || 0) - Number(b.contact.duration_ms || 0)
-        })
+        // The narrowest event under the cursor wins, so a GCT window inside a
+        // longer phase stays clickable.
+        candidates.sort((a, b) => Number(a.contact.duration_ms || 0) - Number(b.contact.duration_ms || 0))
         return candidates[0] || null
       }
 
@@ -5477,6 +3340,7 @@ export default function App() {
   const activeModelCount = activeCalculators.length
     + Number(showSpeedPredict)
     + Number(showDistancePredict)
+  const activeModelCardCount = activeCalculators.filter(id => MODEL_SECTION_CALCULATOR_IDS.has(id)).length
   const chartReorderTargetMetrics = chartReorder
     ? chartSubplotMetrics(chartReorder.targetIndex, selectedCols.length, chartReorder.chartHeight)
     : null
@@ -5930,24 +3794,55 @@ export default function App() {
 
                         <button
                           type="button"
-                          className={`calculator-expand${protocolDetectorsOpen ? ' open' : ''}`}
-                          onClick={() => setProtocolDetectorsOpen(open => !open)}
-                          aria-expanded={protocolDetectorsOpen}
-                          aria-controls="protocol-detectors"
+                          className={`calculator-expand${modelCardsOpen ? ' open' : ''}`}
+                          onClick={() => setModelCardsOpen(open => !open)}
+                          aria-expanded={modelCardsOpen}
+                          aria-controls="model-cards"
                         >
                           <span>
-                            Детекторы протоколов
-                            {activeCalculators.some(id => PROTOCOL_SECTION_CALCULATOR_IDS.has(id)) && (
-                              <span className="calculator-active-count">
-                                {activeCalculators.filter(id => PROTOCOL_SECTION_CALCULATOR_IDS.has(id)).length}
-                              </span>
+                            Детекторы и модели
+                            {activeModelCardCount > 0 && (
+                              <span className="calculator-active-count">{activeModelCardCount}</span>
                             )}
                           </span>
                           <span className="calculator-expand-chevron">⌄</span>
                         </button>
 
-                        {protocolDetectorsOpen && (
-                          <div id="protocol-detectors" className="calculator-options">
+                        {modelCardsOpen && (
+                          <div id="model-cards" className="calculator-options">
+                            <div className="calculator-advanced-settings">
+                              <div className="calculator-weight-row">
+                                <label htmlFor="calculator-weight">Вес, кг</label>
+                                <input
+                                  id="calculator-weight"
+                                  type="number"
+                                  min="1"
+                                  max="300"
+                                  step="0.1"
+                                  value={weightKg}
+                                  onChange={event => setWeightKg(event.target.value)}
+                                  title="Вес — входной канал модели силы, а не только множитель для ньютонов"
+                                />
+                                <span>для Total GRF</span>
+                              </div>
+                              <div className="calculator-weight-row">
+                                <label htmlFor="calculator-jump-protocol">Движение</label>
+                                <select
+                                  id="calculator-jump-protocol"
+                                  value={jumpEventProtocol}
+                                  onChange={event => setJumpEventProtocol(event.target.value)}
+                                  title="Тип прыжка подаётся модели входным каналом — от него зависят найденные события"
+                                >
+                                  {JUMP_EVENT_PROTOCOL_OPTIONS.map(option => (
+                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                  ))}
+                                </select>
+                                <span>для Jump events и Total GRF</span>
+                              </div>
+                              <div className="calculator-model-note">
+                                Модели: <b>gct_best.pt</b>, <b>new_jump_model_byAdil.pt</b>, <b>jump_grf_total.pt</b>
+                              </div>
+                            </div>
                             {PROTOCOL_DETECTORS.map(detector => {
                               const active = activeCalculators.includes(detector.id)
                               const loading = calculatorLoading === detector.id
@@ -6034,137 +3929,7 @@ export default function App() {
                                 </div>
                               )
                             })}
-                          </div>
-                        )}
-
-                        {protocolDetectorsOpen && (
-                          <div className="calculator-options calculator-featured-options">
-                            {FEATURED_EXTRA_CALCULATORS.map(calculator => {
-                            const active = activeCalculators.includes(calculator.id)
-                            const loading = calculatorLoading === calculator.id
-                            const result = calculatorResults[calculator.id]
-                            const summary = result?.summary
-                            const leftCount = summary?.left?.contact_count || 0
-                            const rightCount = summary?.right?.contact_count || 0
-                            const eventLegend = calculatorEventLegend(calculator, result)
-                            return (
-                              <div
-                                key={calculator.id}
-                                className="calculator-option calculator-option-featured"
-                                style={{ '--calculator-color': calculator.color }}
-                              >
-                                <button
-                                  type="button"
-                                  className={`btn-secondary btn-calculator${active ? ' active' : ''}`}
-                                  style={{ '--calculator-color': calculator.color }}
-                                  disabled={!parquetData || !!calculatorLoading}
-                                  onClick={() => toggleAdditionalCalculator(calculator.id)}
-                                  title={active
-                                    ? `Убрать ${calculator.label} с графика`
-                                    : `Запустить ${calculator.label} для загруженных данных`}
-                                >
-                                  <span className="calculator-dot" />
-                                  {loading ? 'Детектирую…' : active ? `Убрать ${calculator.label}` : calculator.label}
-                                </button>
-                                <span className="calculator-description">{calculator.description}</span>
-                                {result?.model && (
-                                  <span className="calculator-model">
-                                    Детектор: {result.model}{result.model_file ? ` · ${result.model_file}` : ''}
-                                  </span>
-                                )}
-                                {result && (
-                                  <span className="calculator-summary" style={{ '--calculator-color': calculator.color }}>
-                                    <span>L {leftCount} · R {rightCount}</span>
-                                    <br />
-                                    <span>
-                                      GCT L {formatMetric(summary?.left?.mean_contact_duration_s != null
-                                        ? summary.left.mean_contact_duration_s * 1000 : null, 0, ' ms')}
-                                      {' · '}
-                                      GCT R {formatMetric(summary?.right?.mean_contact_duration_s != null
-                                        ? summary.right.mean_contact_duration_s * 1000 : null, 0, ' ms')}
-                                    </span>
-                                    <br />
-                                    <span>
-                                      step L {formatMetric(summary?.left?.mean_step_interval_s, 3, ' s')}
-                                      {' · '}
-                                      step R {formatMetric(summary?.right?.mean_step_interval_s, 3, ' s')}
-                                    </span>
-                                  </span>
-                                )}
-                                {active && eventLegend.length > 0 && (
-                                  <div className="calculator-event-legend" aria-label="Легенда шагов T-теста">
-                                    {eventLegend.map(item => (
-                                      <span
-                                        key={item.key}
-                                        className="calculator-event-key"
-                                        style={{ '--event-color': item.color, '--event-fill': item.fill }}
-                                      >
-                                        <span className="calculator-event-swatch" />
-                                        {item.label}
-                                      </span>
-                                    ))}
-                                  </div>
-                                )}
-                              </div>
-                            )
-                            })}
-                          </div>
-                        )}
-
-                        <button
-                          type="button"
-                          className={`calculator-expand${extraCalculatorsOpen ? ' open' : ''}`}
-                          onClick={() => setExtraCalculatorsOpen(open => !open)}
-                          aria-expanded={extraCalculatorsOpen}
-                          aria-controls="extra-calculators"
-                        >
-                          <span>
-                            Другие калькуляторы
-                            {activeCalculators.some(id => COLLAPSIBLE_EXTRA_CALCULATORS.some(calculator => calculator.id === id)) && (
-                              <span className="calculator-active-count">
-                                {activeCalculators.filter(id => COLLAPSIBLE_EXTRA_CALCULATORS.some(calculator => calculator.id === id)).length}
-                              </span>
-                            )}
-                          </span>
-                          <span className="calculator-expand-chevron">⌄</span>
-                        </button>
-
-                        {extraCalculatorsOpen && (
-                          <div id="extra-calculators" className="calculator-options">
-                            <div className="calculator-advanced-settings">
-                              <div className="calculator-weight-row">
-                                <label htmlFor="calculator-weight">Вес для GRF, кг</label>
-                                <input
-                                  id="calculator-weight"
-                                  type="number"
-                                  min="1"
-                                  max="300"
-                                  step="0.1"
-                                  value={weightKg}
-                                  onChange={event => setWeightKg(event.target.value)}
-                                />
-                                <span>для Bilateral GRF</span>
-                              </div>
-                              <div className="calculator-weight-row">
-                                <label htmlFor="calculator-jump-protocol">Движение</label>
-                                <select
-                                  id="calculator-jump-protocol"
-                                  value={jumpEventProtocol}
-                                  onChange={event => setJumpEventProtocol(event.target.value)}
-                                  title="Тип прыжка подаётся модели входным каналом — от него зависят найденные события"
-                                >
-                                  {JUMP_EVENT_PROTOCOL_OPTIONS.map(option => (
-                                    <option key={option.value} value={option.value}>{option.label}</option>
-                                  ))}
-                                </select>
-                                <span>для Jump events</span>
-                              </div>
-                              <div className="calculator-model-note">
-                                Модели: <b>step_gc_model.pt</b>, <b>jump_bilstm.pt</b>, <b>jump_force_total.pt</b>,{' '}
-                                <b>new_jump_model_byAdil.pt</b>
-                              </div>
-                            </div>
-                            {COLLAPSIBLE_EXTRA_CALCULATORS.map(calculator => {
+                            {EXTRA_CALCULATORS.map(calculator => {
                               const active = activeCalculators.includes(calculator.id)
                               const loading = calculatorLoading === calculator.id
                               const result = calculatorResults[calculator.id]
@@ -6185,7 +3950,7 @@ export default function App() {
                                       : `Запустить ${calculator.label} для загруженных данных`}
                                   >
                                     <span className="calculator-dot" />
-                                    {loading ? 'Считаю…' : active ? `Убрать ${calculator.label}` : calculator.label}
+                                    {loading ? 'Детектирую…' : active ? `Убрать ${calculator.label}` : calculator.label}
                                   </button>
                                   <span className="calculator-description">{calculator.description}</span>
                                   {result?.model && (
@@ -6195,9 +3960,7 @@ export default function App() {
                                   )}
                                   {result && (
                                     <span className="calculator-summary" style={{ '--calculator-color': calculator.color }}>
-                                      {calculator.id === 'jump-metrics'
-                                        ? `${summary?.total_jump_count || 0} прыж. · высота ${formatMetric(summary?.mean_jump_height_cm, 1, ' см')} · flight ${formatMetric(summary?.left_mean_flight_time_ms, 0, ' мс')}`
-                                        : calculator.id === 'jump-events'
+                                      {calculator.id === 'jump-events'
                                         ? <>
                                             <span>
                                               {summary?.total_jump_count || 0} прыж. · высота {formatMetric(summary?.mean_jump_height_cm, 1, ' см')}
@@ -6210,8 +3973,6 @@ export default function App() {
                                               {summary?.mean_rsi != null && ` · RSI ${summary.mean_rsi.toFixed(2)}`}
                                             </span>
                                           </>
-                                        : calculator.id === 'force-jump'
-                                          ? `пик ${formatMetric(summary?.peak_force_n, 1, ' Н')} · ${formatMetric(summary?.peak_force_bw, 2, ' BW')}`
                                         : calculator.id === 'grf-split'
                                         ? <>
                                             <span>
@@ -6229,6 +3990,11 @@ export default function App() {
                                               {summary?.target_lowpass_hz
                                                 ? `определение: плита low-pass ${summary.target_lowpass_hz} Гц`
                                                 : 'определение: сырая плита'}
+                                              {summary?.event_source === 'caller'
+                                                ? ' · полёты из Jump events'
+                                                : summary?.event_source === 'unavailable'
+                                                  ? ' · детектор прыжков недоступен'
+                                                  : ' · полёты: детектор прыжков'}
                                             </span>
                                             <br />
                                             {/* The model's own card, so a landing peak is never read as measured */}
@@ -7095,7 +4861,6 @@ export default function App() {
                 step: 'GCT',
                 turn: 'Поворот',
                 run: 'Беговая фаза',
-                sprint: 'Спринт',
               }[detail.kind] || 'Событие'
               return (
                 <div
@@ -7147,13 +4912,19 @@ export default function App() {
                     {detail.jump_height_cm != null && (
                       <span><b>высота</b> {formatMetric(detail.jump_height_cm, 1, ' см')}</span>
                     )}
-                    {detail.step_length_m != null && <span>step length {formatMetric(detail.step_length_m, 3, ' м')}</span>}
-                    {detail.stride_length_m != null && <span>stride length {formatMetric(detail.stride_length_m, 3, ' м')}</span>}
-                    {detail.distance_m != null && detail.kind === 'sprint' && (
-                      <span><b>дистанция</b> {formatMetric(detail.distance_m, 2, ' м')}</span>
+                    {detail.contact_time_ms != null && (
+                      <span title="от этого приземления до следующего отрыва">контакт {formatMetric(detail.contact_time_ms, 0, ' ms')}</span>
                     )}
-                    {detail.distance_m != null && detail.kind === 'step' && (
-                      <span>дистанция {formatMetric(detail.distance_m, 2, ' м')}</span>
+                    {detail.rsi != null && <span>RSI {formatMetric(detail.rsi, 2, '')}</span>}
+                    {/* Total GRF: peaks read off the predicted curve around this jump */}
+                    {detail.pushoff_pct_bw != null && (
+                      <span title="пик суммарной силы в окне перед отрывом, %BW (100 = спокойная стойка)">отталкивание {formatMetric(detail.pushoff_pct_bw, 0, ' %BW')}</span>
+                    )}
+                    {detail.landing_pct_bw != null && (
+                      <span title="пик суммарной силы в окне после приземления, плита low-pass 20 Гц">приземление {formatMetric(detail.landing_pct_bw, 0, ' %BW')}</span>
+                    )}
+                    {detail.contact_impulse_bw_s != null && (
+                      <span title="∫F dt от приземления до следующего отрыва, BW·с">импульс {formatMetric(detail.contact_impulse_bw_s, 2, ' BW·с')}</span>
                     )}
                   </div>
                   {isStep && (
@@ -7288,348 +5059,6 @@ export default function App() {
           <span>График</span>
         </button>
       </nav>
-    </div>
-  )
-}
-
-function SidebarSection({ title, open, onToggle, children }) {
-  return (
-    <section className="sidebar-section">
-      <button type="button" className="sidebar-section-head" onClick={onToggle}>
-        <span className="sidebar-section-title">{title}</span>
-        <span className="sidebar-section-chevron">{open ? '▾' : '▸'}</span>
-      </button>
-      {open && <div className="sidebar-section-body">{children}</div>}
-    </section>
-  )
-}
-
-function UploadBtn({ accept, onFile, children, className = 'btn-upload btn-secondary', disabled = false, title }) {
-  return (
-    <label
-      className={`${className}${disabled ? ' disabled' : ''}`}
-      title={title}
-      style={disabled ? { opacity: 0.4, pointerEvents: 'none', cursor: 'not-allowed' } : undefined}
-    >
-      {children}
-      <input
-        type="file"
-        accept={accept}
-        hidden
-        disabled={disabled}
-        onChange={e => {
-          if (e.target.files[0]) onFile(e.target.files[0])
-          e.target.value = ''
-        }}
-      />
-    </label>
-  )
-}
-
-function UiIcon({ name, className = '' }) {
-  let artwork
-
-  switch (name) {
-    case 'video':
-      artwork = <><rect x="3" y="6" width="13" height="12" rx="2" /><path d="m16 10 5-3v10l-5-3z" /></>
-      break
-    case 'database':
-      artwork = <><ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5" /><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6" /></>
-      break
-    case 'database-check':
-      artwork = <><ellipse cx="10" cy="5" rx="7" ry="3" /><path d="M3 5v6c0 1.7 3.1 3 7 3h1" /><path d="M3 11v6c0 1.6 2.8 2.8 6.4 3" /><path d="m14 17 2 2 5-6" /></>
-      break
-    case 'file-table':
-      artwork = <><path d="M6 3h8l4 4v14H6z" /><path d="M14 3v5h5" /><path d="M9 12h6M9 16h6M12 11v6" /></>
-      break
-    case 'download':
-      artwork = <><path d="M12 3v12" /><path d="m7 10 5 5 5-5" /><path d="M5 21h14" /></>
-      break
-    case 'upload':
-      artwork = <><path d="M12 21V9" /><path d="m7 14 5-5 5 5" /><path d="M5 3h14" /></>
-      break
-    case 'pencil':
-      artwork = <><path d="m4 20 4.2-1 10.9-10.9a2.1 2.1 0 0 0-3-3L5.2 16z" /><path d="m14.8 6.4 3 3" /></>
-      break
-    case 'gaps':
-      artwork = <><path d="M3 12h6M15 12h6" /><path d="m10 8 4 8M14 8l-4 8" /></>
-      break
-    case 'undo':
-      artwork = <><path d="m8 7-5 5 5 5" /><path d="M3 12h10a6 6 0 0 1 6 6v1" /></>
-      break
-    case 'rotate':
-      artwork = <><path d="M20 7v5h-5" /><path d="M19 12a7 7 0 1 0-2 5" /></>
-      break
-    case 'grip':
-      artwork = <><circle cx="9" cy="6" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="6" r="1" fill="currentColor" stroke="none" /><circle cx="9" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="12" r="1" fill="currentColor" stroke="none" /><circle cx="9" cy="18" r="1" fill="currentColor" stroke="none" /><circle cx="15" cy="18" r="1" fill="currentColor" stroke="none" /></>
-      break
-    case 'pin':
-      artwork = <><path d="M12 17v5" /><path d="M9 3h6l1 7 3 3H5l3-3z" /></>
-      break
-    case 'chart':
-      artwork = <><path d="M4 19h16" /><path d="M7 16v-6" /><path d="M12 16V8" /><path d="M17 16v-9" /></>
-      break
-    case 'check':
-      artwork = <path d="m5 13 4 4 10-11" />
-      break
-    case 'tag':
-      artwork = <><path d="M11 3H4v7l10 10 7-7z" /><circle cx="7.5" cy="6.5" r="1.2" /></>
-      break
-    case 'user':
-      artwork = <><circle cx="12" cy="8" r="4" /><path d="M5 21v-1.5A4.5 4.5 0 0 1 9.5 15h5a4.5 4.5 0 0 1 4.5 4.5V21" /></>
-      break
-    case 'logout':
-      artwork = <><path d="M10 5H5v14h5" /><path d="M13 8l4 4-4 4M8 12h9" /></>
-      break
-    case 'plus':
-      artwork = <path d="M12 5v14M5 12h14" />
-      break
-    case 'minus':
-      artwork = <path d="M5 12h14" />
-      break
-    case 'maximize':
-      artwork = <><path d="M9 4H4v5M15 4h5v5M9 20H4v-5M15 20h5v-5" /><path d="m4 9 5-5M20 9l-5-5M4 15l5 5M20 15l-5 5" /></>
-      break
-    case 'bolt':
-      artwork = <path d="m13 2-8 12h7l-1 8 8-12h-7z" />
-      break
-    case 'ruler':
-      artwork = <><path d="m4 15 11-11 5 5-11 11H4z" /><path d="m12 7 2 2M9 10l2 2M6 13l2 2" /></>
-      break
-    case 'mirror':
-      artwork = <><path d="M12 3v18" strokeDasharray="3 3" /><path d="M9 8 4 12l5 4z" /><path d="m15 8 5 4-5 4z" /></>
-      break
-    case 'plate':
-      // Two force plates side by side with a foot-off arrow above them.
-      artwork = <><rect x="2.5" y="15" width="8" height="5" rx="1" /><rect x="13.5" y="15" width="8" height="5" rx="1" /><path d="M12 12V4" /><path d="m8.5 7.5 3.5-3.5 3.5 3.5" /></>
-      break
-    case 'x':
-      artwork = <path d="m6 6 12 12M18 6 6 18" />
-      break
-    case 'loader':
-      artwork = <><circle cx="12" cy="12" r="9" opacity=".25" /><path d="M21 12a9 9 0 0 0-9-9" /></>
-      break
-    default:
-      artwork = <circle cx="12" cy="12" r="8" />
-  }
-
-  return (
-    <svg
-      className={`ui-icon${name === 'loader' ? ' ui-icon-spin' : ''}${className ? ` ${className}` : ''}`}
-      viewBox="0 0 24 24"
-      aria-hidden="true"
-    >
-      {artwork}
-    </svg>
-  )
-}
-
-// The title is free text an athlete typed on their phone, so it can be far
-// wider than the header allows: it stays clamped to one line until clicked,
-// and the expanded form doubles as the editor. The caller keys it on the
-// session and the title, so a save or a session switch remounts it and the
-// draft never survives into a different title.
-function SessionTitleBadge({ title, expanded, onToggle, onSave }) {
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState(title)
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState('')
-  const inputRef = useRef(null)
-
-  useEffect(() => {
-    if (editing && inputRef.current) {
-      inputRef.current.focus()
-      inputRef.current.select()
-    }
-  }, [editing])
-
-  const startEditing = () => {
-    setDraft(title)
-    setError('')
-    setEditing(true)
-  }
-
-  const commit = async () => {
-    const next = draft.trim().slice(0, 255)
-    if (next === title) { setEditing(false); return }
-    setSaving(true)
-    setError('')
-    try {
-      await onSave(next)
-      setEditing(false)
-    } catch (err) {
-      setError(err.message || 'Не удалось сохранить')
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  const cancel = () => {
-    setDraft(title)
-    setError('')
-    setEditing(false)
-  }
-
-  if (editing) {
-    return (
-      <span className="file-badge badge-title badge-expanded badge-title-edit">
-        <UiIcon name="tag" />
-        <input
-          ref={inputRef}
-          className="badge-title-input"
-          value={draft}
-          maxLength={255}
-          placeholder="Название сессии"
-          disabled={saving}
-          onChange={e => setDraft(e.target.value)}
-          onKeyDown={e => {
-            if (e.key === 'Enter') { e.preventDefault(); commit() }
-            if (e.key === 'Escape') { e.preventDefault(); cancel() }
-          }}
-        />
-        <button
-          type="button"
-          className="badge-title-act"
-          onClick={commit}
-          disabled={saving}
-          title="Сохранить (Enter)"
-        >
-          <UiIcon name={saving ? 'loader' : 'check'} />
-        </button>
-        <button
-          type="button"
-          className="badge-title-act"
-          onClick={cancel}
-          disabled={saving}
-          title="Отмена (Esc)"
-        >
-          <UiIcon name="x" />
-        </button>
-        {error && <span className="badge-title-error">{error}</span>}
-      </span>
-    )
-  }
-
-  return (
-    <span
-      className={`file-badge badge-title${expanded ? ' badge-expanded' : ''}`}
-    >
-      <button
-        type="button"
-        className="badge-title-text"
-        onClick={onToggle}
-        title={expanded ? 'Свернуть' : (title || 'Название не задано')}
-        aria-expanded={expanded}
-      >
-        <UiIcon name="tag" />
-        <span className={title ? '' : 'badge-title-empty'}>{title || 'Пусто'}</span>
-      </button>
-      <button
-        type="button"
-        className="badge-title-act"
-        onClick={startEditing}
-        title="Изменить название"
-      >
-        <UiIcon name="pencil" />
-      </button>
-    </span>
-  )
-}
-
-function FileBadge({ type, title, children }) {
-  return <span className={`file-badge badge-${type}`} title={title}>{children}</span>
-}
-
-function SessionInfoCard({ protocolName, deviceId, timeOffset, gapCount, gapsKnown }) {
-  const gapsLabel = !gapsKnown ? '—' : gapCount > 0 ? String(gapCount) : 'нет'
-  return (
-    <div className="session-info-card" aria-label="Данные сессии">
-      <div className="session-info-row">
-        <span className="session-info-key">Протокол</span>
-        <span className="session-info-val">{protocolName || '—'}</span>
-      </div>
-      <div className="session-info-row">
-        <span className="session-info-key">Device ID</span>
-        <span className="session-info-val">{hasSessionMetaValue(deviceId) ? String(deviceId) : '—'}</span>
-      </div>
-      <div className="session-info-row">
-        <span className="session-info-key">Time offset</span>
-        <span className="session-info-val">{formatTimeOffset(timeOffset) || '—'}</span>
-      </div>
-      <div className="session-info-row">
-        <span className="session-info-key">Пропуски</span>
-        <span className={`session-info-val${gapsKnown && gapCount > 0 ? ' session-info-warn' : ''}`}>
-          {gapsLabel}
-        </span>
-      </div>
-    </div>
-  )
-}
-
-function OffsetInput({ value, step, title, onChange }) {
-  const [draft, setDraft] = useState(String(value))
-  const committed = useRef(value)
-
-  useEffect(() => {
-    if (committed.current !== value) {
-      committed.current = value
-      setDraft(String(value))
-    }
-  }, [value])
-
-  const commit = (raw) => {
-    const trimmed = raw.trim()
-    const n = Number(trimmed)
-    if (trimmed !== '' && isFinite(n)) {
-      committed.current = n
-      onChange(n)
-      setDraft(String(n))
-    } else {
-      setDraft(String(committed.current))
-    }
-  }
-
-  const nudge = (dir) => {
-    const base = isFinite(Number(draft)) ? Number(draft) : committed.current
-    const next = Math.round((base + dir * step) * 1e9) / 1e9
-    committed.current = next
-    onChange(next)
-    setDraft(String(next))
-  }
-
-  return (
-    <div className="offset-input-wrap">
-      <input
-        type="text"
-        inputMode="numeric"
-        className="input-sm offset-input-field"
-        value={draft}
-        title={title}
-        aria-label={title}
-        onChange={e => setDraft(e.target.value)}
-        onBlur={e => commit(e.target.value)}
-        onKeyDown={e => {
-          if (e.key === 'Enter')     { e.preventDefault(); commit(draft) }
-          if (e.key === 'ArrowUp')   { e.preventDefault(); nudge(+1) }
-          if (e.key === 'ArrowDown') { e.preventDefault(); nudge(-1) }
-        }}
-      />
-      <div className="offset-spinners">
-        <button
-          type="button"
-          className="offset-spin-btn"
-          aria-label={`${title}: увеличить`}
-          onMouseDown={e => e.preventDefault()}
-          onClick={() => nudge(+1)}
-        >▲</button>
-        <button
-          type="button"
-          className="offset-spin-btn"
-          aria-label={`${title}: уменьшить`}
-          onMouseDown={e => e.preventDefault()}
-          onClick={() => nudge(-1)}
-        >▼</button>
-      </div>
     </div>
   )
 }

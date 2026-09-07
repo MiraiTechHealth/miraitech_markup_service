@@ -8,16 +8,21 @@ not add or change any backend API routes.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import importlib
+import io
 import json
 import os
-from statistics import median
 import sys
+import threading
+from collections import OrderedDict
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Union
+from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from fastapi import Body, Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Body, Depends, FastAPI, HTTPException, Query, Request, Response
 
 
 DEFAULT_BACKEND_ROOT = Path(__file__).resolve().parent.parent / "MiraiTech-backend"
@@ -27,65 +32,77 @@ BACKEND_ROOT = Path(
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from jump_bilstm_runtime import MarkupJumpBiLSTMCalculator  # noqa: E402
 from plate_flight_gt import PlateFlightError, plate_flight_result  # noqa: E402
 from app.utils.auth import get_current_user  # noqa: E402
 from loguru import logger  # noqa: E402
 
 
-app = FastAPI(title="MiraiTech Markup Calculators")
+# Model bundles the calculators below load lazily. Loading them on the first
+# click cost that click ~2.5 s (jump ensemble 1.6 s, GCT 0.7 s) — so they are
+# loaded once, in the background, as soon as the process is up. A request that
+# arrives mid-load simply waits on the getter's build lock. A bundle that is
+# missing costs only its own calculator, exactly as before.
+WARM_UP_MODELS: Tuple[Tuple[str, str, str], ...] = (
+    ("jump-events", "app.services.calculators.new_jump_model_byAdil_calculator",
+     "get_new_jump_model_byAdil_calculator"),
+    ("grf-split", "app.services.calculators.jump_grf_split_calculator",
+     "get_jump_grf_split_calculator"),
+    ("protocol-walking-detector", "app.services.calculators.step_cadence_calculator",
+     "get_gct_cadence_calculator"),
+)
+_warm_up_state: Dict[str, Any] = {"done": False, "unavailable": []}
+
+
+def _warm_up_models() -> None:
+    for calculator_id, module_name, getter in WARM_UP_MODELS:
+        try:
+            getattr(importlib.import_module(module_name), getter)()
+        except Exception as exc:  # a missing bundle is a degraded mode, not a crash
+            logger.warning(f"markup: {calculator_id} is unavailable — {exc}")
+            _warm_up_state["unavailable"].append(calculator_id)
+    _warm_up_state["done"] = True
+    logger.info("markup: model warm-up finished")
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    threading.Thread(target=_warm_up_models, name="markup-model-warm-up", daemon=True).start()
+    yield
+
+
+app = FastAPI(title="MiraiTech Markup Calculators", lifespan=_lifespan)
 
 CALCULATOR_LABELS = {
     "step-detector-ttest": "Step Detector T-Test",
-    "tkeo-cadence": "TKEO Cadence",
-    "step-cadence": "Step Cadence",
-    "jump-metrics": "Jump BiLSTM",
     "jump-events": "Jump events · plates",
-    "force-jump": "Bilateral GRF",
     "grf-split": "Total GRF · plates",
     "plate-flight": "Полёт по плитам · разметка v7",
     "protocol-walking-detector": "Walking Test Detector",
-    "protocol-running-detector": "Running Analysis Detector",
-    "protocol-jumping-detector": "Jump Analysis Detector",
     "protocol-shuttle-detector": "Shuttle Run Detector",
-    "protocol-sprint-detector": "Sprint 30 m Detector",
     "protocol-beep-detector": "Beep Test Detector",
     "protocol-ttest-detector": "T-Test Detector",
 }
 
 CALCULATOR_MODELS = {
     "step-detector-ttest": "Pressure peak detector",
-    "tkeo-cadence": "TKEO + peak detection",
-    "step-cadence": "StepResUNet",
-    "jump-metrics": "JumpBiLSTM",
     "jump-events": "NewJumpModelByAdil (plate-trained TCN)",
-    "force-jump": "JumpForceBW regressor",
     "grf-split": "JumpGRFTotal (plate-trained total regressor, 20 Hz target)",
     "plate-flight": "plate_flight_v7 (force-plate ground truth, no ML)",
     "protocol-walking-detector": "GCTTCN contacts",
-    "protocol-running-detector": "GCTTCN contacts",
-    "protocol-jumping-detector": "JumpBiLSTM flight detector",
     "protocol-shuttle-detector": "TurnCalculator shuttle phases",
-    "protocol-sprint-detector": "CausalSpeedTCN + GCTTCN sprint steps",
     "protocol-beep-detector": "YoyoTurnCalculator phases",
     "protocol-ttest-detector": "TurnCalculator T-Test phases",
 }
-# The per-foot GRF curve is returned to the browser for plotting, so it is thinned
+# The total GRF curve is returned to the browser for plotting, so it is thinned
 # to this many points. A 20 s session at 500 Hz is 10k samples; the graph cannot
 # resolve more than a few thousand anyway, and the peaks in `events` are read off
 # the full-rate curve before thinning.
 GRF_SPLIT_MAX_POINTS = 4000
 
 CALCULATOR_MODEL_FILES = {
-    "step-cadence": "step_gc_model.pt",
-    "jump-metrics": "jump_bilstm.pt",
     "jump-events": "new_jump_model_byAdil.pt",
-    "force-jump": "jump_force_total.pt",
     "grf-split": "jump_grf_total.pt",
     "protocol-walking-detector": "gct_best.pt",
-    "protocol-running-detector": "gct_best.pt",
-    "protocol-jumping-detector": "jump_bilstm.pt",
-    "protocol-sprint-detector": "speed_cont_v5.pt + gct_best.pt",
 }
 
 # Movement one-hot the plate-trained jump model is conditioned on. It is an
@@ -101,13 +118,26 @@ PER_FOOT_TURN_DETECTOR_IDS = {
     "protocol-ttest-detector",
 }
 
-# Calculators that read the session column-wise and so never need the row dicts.
-# On a 121k-row export ``to_dict`` alone cost ~530 ms — more than the model it
-# was feeding — so the frame is handed over untouched.
-FRAME_CALCULATOR_IDS = {
-    "jump-events",
-    "plate-flight",
-}
+# Every calculator takes the session as one DataFrame. The row-dict path is
+# gone: on a 121k-row export ``to_dict`` alone cost ~530 ms — more than the
+# model it was feeding — and each backend calculator accepts a frame directly.
+
+# A request may carry the session as the parquet file itself instead of JSON:
+# the browser already holds those bytes, so no 8 MB JSON is built on either
+# side, and the same bytes hash to the same key, which is what the result cache
+# below is keyed on.
+PARQUET_CONTENT_TYPES = {"application/vnd.apache.parquet", "application/octet-stream"}
+FRAME_CACHE_SIZE = 4      # parsed sessions, by content hash
+RESULT_CACHE_SIZE = 64    # calculator results, by (content hash, calculator, params)
+
+# Body weight is a conditioning input of the force model, not a unit factor, so
+# it is required rather than defaulted.
+WEIGHT_CALCULATOR_IDS = {"grf-split"}
+
+# Calculators conditioned on the movement one-hot (see JUMP_EVENT_PROTOCOLS).
+# The GRF model reads its take-off / landing instants from the jump detector, so
+# it takes the same protocol.
+PROTOCOL_CALCULATOR_IDS = {"jump-events", "grf-split"}
 
 SENSOR_TO_FOOT = {
     "ESP32_Sensor_1": "left",
@@ -149,25 +179,47 @@ def _canonicalise_names_frame(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _canonicalise_names_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    seen: set = set()
-    out = []
-    for row in rows:
-        name = row.get("Name")
-        canon = _canonical_sensor_name(name)
-        if canon == name:
-            out.append(row)
-            continue
-        seen.add(str(name))
-        item = dict(row)
-        item["Name"] = canon
-        out.append(item)
-    if seen:
-        logger.info(f"markup: Name aliases mapped to sensor names: {sorted(seen)}")
-    return out
+_frame_cache: "OrderedDict[str, pd.DataFrame]" = OrderedDict()
+_result_cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+_cache_lock = threading.Lock()
 
 
-_markup_jump_bilstm_calculator = None
+def _lru_get(cache: OrderedDict, key: Any) -> Any:
+    with _cache_lock:
+        if key not in cache:
+            return None
+        cache.move_to_end(key)
+        return cache[key]
+
+
+def _lru_put(cache: OrderedDict, key: Any, value: Any, size: int) -> None:
+    with _cache_lock:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > size:
+            cache.popitem(last=False)
+
+
+def _frame_from_parquet_bytes(data_key: str, body: bytes) -> pd.DataFrame:
+    """Parse (or recall) the session a request carried as parquet bytes.
+
+    The frame is shared between requests, so it is never handed out to be
+    mutated: every calculator reads it (``as_frame_view``) or copies what it
+    filters, and ``_frame_with_time_in_ms`` copies before it rescales.
+    """
+    cached = _lru_get(_frame_cache, data_key)
+    if cached is not None:
+        return cached
+    try:
+        df = pd.read_parquet(io.BytesIO(body))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Не удалось прочитать parquet: {exc}") from exc
+    if df.empty:
+        raise HTTPException(status_code=422, detail="Parquet без строк")
+    df = _canonicalise_names_frame(df)
+    _lru_put(_frame_cache, data_key, df, FRAME_CACHE_SIZE)
+    return df
+
 
 GOOGLE_CLOUD_AUTH_HINT = (
     "Нет доступа к Google Cloud. Выполните `gcloud auth application-default login` "
@@ -369,14 +421,6 @@ def _update_markup_session_title(session_id: int, session_title: str) -> Dict[st
     return {"id": session_id, "session_title": row.get("session_title")}
 
 
-def _get_markup_jump_calculator():
-    """Create and reuse the 500 Hz, 24-feature JumpBiLSTM calculator."""
-    global _markup_jump_bilstm_calculator
-    if _markup_jump_bilstm_calculator is None:
-        _markup_jump_bilstm_calculator = MarkupJumpBiLSTMCalculator()
-    return _markup_jump_bilstm_calculator
-
-
 def _mean_or_none(values: Iterable[float]) -> float | None:
     values = list(values)
     return sum(values) / len(values) if values else None
@@ -409,33 +453,8 @@ def _round_or_none(value: Any, digits: int = 2) -> float | None:
     return round(float(value), digits)
 
 
-def _rows_with_time_in_ms(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Normalise second-based markup files to the backend models' ms contract."""
-    times = []
-    for row in rows[:300]:
-        try:
-            times.append(float(row.get("Time")))
-        except (TypeError, ValueError):
-            continue
-
-    ordered = sorted(set(times))
-    deltas = [right - left for left, right in zip(ordered, ordered[1:]) if right > left]
-    if not deltas or median(deltas) >= 0.5:
-        return rows
-
-    normalised = []
-    for row in rows:
-        item = dict(row)
-        try:
-            item["Time"] = float(item["Time"]) * 1000.0
-        except (KeyError, TypeError, ValueError):
-            pass
-        normalised.append(item)
-    return normalised
-
-
 def _frame_with_time_in_ms(df: pd.DataFrame) -> pd.DataFrame:
-    """``_rows_with_time_in_ms`` for the column-wise path — same 0.5 ms rule."""
+    """Rescale a second-based ``Time`` column to ms (median step < 0.5 -> seconds)."""
     if "Time" not in df.columns:
         return df
     head = pd.to_numeric(df["Time"].head(300), errors="coerce").dropna()
@@ -451,26 +470,15 @@ def _frame_with_time_in_ms(df: pd.DataFrame) -> pd.DataFrame:
 
 def _cadence_result(
     calculator_id: str,
-    rows: List[Dict[str, Any]],
-    calculator: Any = None,
+    df: pd.DataFrame,
+    calculator: Any,
 ) -> Dict[str, Any]:
     """Turn a cadence detector's contact regions into markup overlays.
 
-    ``calculator`` lets a caller supply its own detector; walking, running and
-    the sprint protocol pass the GCTTCN-backed adapter the backend uses for
-    those protocols.
+    ``calculator`` is any detector with the backend's ``_viz_data`` contract;
+    the walking protocol passes the GCTTCN-backed adapter the backend uses.
     """
-    if calculator is None:
-        if calculator_id == "tkeo-cadence":
-            from app.services.calculators.tkeo_cadence_calculator import TkeoCadenceCalculator
-
-            calculator = TkeoCadenceCalculator()
-        else:
-            from app.services.calculators.step_cadence_calculator import StepCadenceCalculator
-
-            calculator = StepCadenceCalculator()
-
-    result = calculator.calculate(rows)
+    result = calculator.calculate(df)
     events_by_sensor = {
         sensor: calculator._viz_data.get(sensor, {}).get("contact_events", [])
         for sensor in SENSOR_TO_FOOT
@@ -514,10 +522,10 @@ def _cadence_result(
     }
 
 
-def _ttest_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _ttest_result(df: pd.DataFrame) -> Dict[str, Any]:
     from app.services.calculators.step_detector_ttest import StepDetectorTTest
 
-    steps = StepDetectorTTest().calculate(pd.DataFrame(rows))
+    steps = StepDetectorTTest().calculate(df)
     contacts = [
         {
             "foot": str(row.foot),
@@ -558,71 +566,8 @@ def _ttest_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-def _jump_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Run the JumpBiLSTM and expose compact UI-friendly metrics."""
-    rows = _rows_with_time_in_ms(rows)
-    calculator = _get_markup_jump_calculator()
-    # Keep detected pairs and aggregate metrics from the same inference pass.
-    # The JumpBiLSTM calculator owns its full 24-feature preprocessing pipeline.
-    with calculator._infer_lock:
-        result = calculator.calculate(rows)
-        details = {
-            foot: list(calculator.analysis_details.get(foot, {}).get("jump_pairs", []))
-            for foot in ("ESP32_Sensor_1", "ESP32_Sensor_2")
-        }
-
-    contacts = []
-    for sensor, foot in (("ESP32_Sensor_1", "left"), ("ESP32_Sensor_2", "right")):
-        for pair in details[sensor]:
-            start_ms = float(pair["takeoff_time"])
-            end_ms = float(pair["landing_time"])
-            flight_time_ms = float(pair["flight_time_ms"])
-            jump_height_cm = pair.get("jump_height_cm")
-            if jump_height_cm is None:
-                jump_height_cm = calculator.calculate_jump_height_from_flight_time(
-                    flight_time_ms
-                )
-            contacts.append({
-                "foot": foot,
-                "start_time_s": start_ms / 1000.0,
-                "end_time_s": end_ms / 1000.0,
-                "peak_time_s": start_ms / 1000.0,
-                "duration_ms": flight_time_ms,
-                "jump_height_cm": _round_or_none(jump_height_cm),
-                "kind": "flight",
-                "confidence": None,
-            })
-    contacts.sort(key=lambda item: item["start_time_s"])
-
-    flight = result.flight_time
-    contact = result.contact_time
-    rsi = result.rsi
-    return {
-        "calculator": "jump-metrics",
-        "label": CALCULATOR_LABELS["jump-metrics"],
-        "model": CALCULATOR_MODELS["jump-metrics"],
-        "model_file": CALCULATOR_MODEL_FILES["jump-metrics"],
-        "contacts": contacts,
-        "summary": {
-            "left_jump_count": len(flight.left_flight_times_ms),
-            "right_jump_count": len(flight.right_flight_times_ms),
-            "total_jump_count": int(flight.total_flight_events),
-            "left_mean_flight_time_ms": _round_or_none(flight.left_mean_flight_time_ms),
-            "right_mean_flight_time_ms": _round_or_none(flight.right_mean_flight_time_ms),
-            "mean_jump_height_cm": _round_or_none(result.mean_jump_height_cm),
-            "max_jump_height_cm": _round_or_none(result.max_jump_height_cm),
-            "left_mean_contact_time_ms": _round_or_none(contact.left_mean_contact_time_ms),
-            "right_mean_contact_time_ms": _round_or_none(contact.right_mean_contact_time_ms),
-            "left_mean_rsi": _round_or_none(rsi.left_mean_rsi, 3),
-            "right_mean_rsi": _round_or_none(rsi.right_mean_rsi, 3),
-            "activity_type": result.activity_type,
-            "is_valid": bool(result.is_valid),
-        },
-    }
-
-
 def _jump_events_result(
-    data: Union[pd.DataFrame, List[Dict[str, Any]]],
+    df: pd.DataFrame,
     protocol: str = DEFAULT_JUMP_EVENT_PROTOCOL,
 ) -> Dict[str, Any]:
     """Run the plate-trained jump detector and expose its bilateral events.
@@ -640,10 +585,8 @@ def _jump_events_result(
         get_new_jump_model_byAdil_calculator,
     )
 
-    data = (_frame_with_time_in_ms(data) if isinstance(data, pd.DataFrame)
-            else _rows_with_time_in_ms(data))
     calculator = get_new_jump_model_byAdil_calculator()
-    result = calculator.calculate(data, protocol=protocol)
+    result = calculator.calculate(df, protocol=protocol)
 
     contacts = [
         {
@@ -699,7 +642,6 @@ def _plate_flight_result(df: pd.DataFrame) -> Dict[str, Any]:
     for segments the labeler refused to call either way; a mask's ``status`` and
     ``hop`` say why.
     """
-    df = _frame_with_time_in_ms(df)
     return plate_flight_result(
         df, CALCULATOR_LABELS["plate-flight"], CALCULATOR_MODELS["plate-flight"])
 
@@ -717,57 +659,12 @@ def _force_units(units: Any) -> Dict[str, Any] | None:
     }
 
 
-def _force_result(rows: List[Dict[str, Any]], weight_kg: float) -> Dict[str, Any]:
-    """Run bilateral Fz regression and expose peak/flight metrics.
-
-    Forces come out of the model as % of body weight; the calculator derives N,
-    kgf and lbf from the weight passed here, so the absolute units are only as
-    good as that weight. Jump instants come from the jump detector, not from the
-    force curve, so the events line up one-for-one with the jump metrics.
-    """
-    from app.services.calculators.jump_force_bw_calculator import (
-        get_jump_force_bw_calculator,
-    )
-
-    rows = _rows_with_time_in_ms(rows)
-    calculator = get_jump_force_bw_calculator()
-    result = calculator.calculate(rows, weight_kg=weight_kg)
-    peak = result.peak_force
-    return {
-        "calculator": "force-jump",
-        "label": CALCULATOR_LABELS["force-jump"],
-        "model": f"{CALCULATOR_MODELS['force-jump']} · {calculator.arch}",
-        "model_file": CALCULATOR_MODEL_FILES["force-jump"],
-        "events": [
-            {
-                "jump_index": event.jump_index,
-                "takeoff_time_ms": _round_or_none(event.takeoff_time_ms),
-                "landing_time_ms": _round_or_none(event.landing_time_ms),
-                "flight_time_ms": _round_or_none(event.flight_time_ms),
-                "feet": list(event.feet),
-                "takeoff_force": _force_units(event.takeoff_force),
-                "landing_force": _force_units(event.landing_force),
-            }
-            for event in result.events
-        ],
-        "summary": {
-            "peak_force_n": _round_or_none(peak.n, 1) if peak else None,
-            "peak_force_bw": _round_or_none(peak.bw, 3) if peak else None,
-            "peak_force_percent_bw": _round_or_none(peak.percent_bw, 1) if peak else None,
-            "peak_takeoff_force": _force_units(result.peak_takeoff_force),
-            "peak_landing_force": _force_units(result.peak_landing_force),
-            "avg_takeoff_force": _force_units(result.avg_takeoff_force),
-            "avg_landing_force": _force_units(result.avg_landing_force),
-            "jump_count": result.n_jumps,
-            "weight_kg": _round_or_none(result.weight_kg),
-            "weight_source": result.weight_source,
-            "is_valid": bool(result.is_valid),
-        },
-    }
-
-
-def _grf_split_result(rows: List[Dict[str, Any]], weight_kg: float,
-                      protocol: str | None = None) -> Dict[str, Any]:
+def _grf_split_result(
+    df: pd.DataFrame,
+    weight_kg: float,
+    protocol: str = DEFAULT_JUMP_EVENT_PROTOCOL,
+    jump_pairs: Sequence[Tuple[float, float]] | None = None,
+) -> Dict[str, Any]:
     """Total Fz curve plus per-jump forces, for eyeballing the model on a session.
 
     The model's target is the plate **low-passed at ``target_lowpass_hz``** (20 Hz);
@@ -775,7 +672,7 @@ def _grf_split_result(rows: List[Dict[str, Any]], weight_kg: float,
     be laid over each other in the same definition. Against the raw plate column the
     landing peak reads ~10% low by design.
 
-    Unlike ``_force_result`` this returns the **curves** as ``data_points``, so the
+    Besides the per-jump numbers this returns the **curve** as ``data_points``, so the
     markup graph can draw the prediction over the pressure traces it was computed
     from — which is the whole point of having the model here rather than only in
     the API. The series is thinned to keep the payload sane; peaks are read off
@@ -784,15 +681,24 @@ def _grf_split_result(rows: List[Dict[str, Any]], weight_kg: float,
 
     Take-off and landing come from the plate-trained bilateral detector, the same
     one the ``jump-events`` calculator exposes, so the flight bands drawn by both
-    line up.
+    line up. When the caller already ran that detector on this session under the
+    same protocol it passes the pairs in ``jump_pairs`` (ms) and the second
+    inference — about as long as the force model itself — is skipped;
+    ``summary.event_source`` says which happened. ``contacts`` use the shape
+    every calculator shares (``start_time_s`` / ``end_time_s`` in seconds,
+    ``foot`` unset for a bilateral event) so the chart overlay and
+    click-to-inspect treat them like ``jump-events``; the per-jump forces ride
+    along on each contact for the inspect card.
     """
     from app.services.calculators.jump_grf_split_calculator import (
         get_jump_grf_split_calculator,
     )
 
-    rows = _rows_with_time_in_ms(rows)
     calculator = get_jump_grf_split_calculator()
-    result = calculator.calculate(rows, weight_kg=weight_kg, protocol=protocol)
+    result = calculator.calculate(
+        df, weight_kg=weight_kg, protocol=protocol,
+        jump_pairs=list(jump_pairs) if jump_pairs is not None else None,
+    )
 
     step = max(1, len(result.times_ms) // GRF_SPLIT_MAX_POINTS)
     data_points = [
@@ -812,11 +718,18 @@ def _grf_split_result(rows: List[Dict[str, Any]], weight_kg: float,
         "contacts": [
             {
                 "foot": None,
-                "start_ms": jump.takeoff_time_ms,
-                "end_ms": jump.landing_time_ms,
+                "start_time_s": jump.takeoff_time_ms / 1000.0,
+                "end_time_s": jump.landing_time_ms / 1000.0,
+                "peak_time_s": jump.takeoff_time_ms / 1000.0,
                 "duration_ms": jump.flight_time_ms,
                 "kind": "flight",
                 "confidence": None,
+                "pushoff_pct_bw": _round_or_none(
+                    jump.pushoff_force.percent_bw if jump.pushoff_force else None, 1),
+                "landing_pct_bw": _round_or_none(
+                    jump.landing_force.percent_bw if jump.landing_force else None, 1),
+                "contact_impulse_bw_s": jump.contact_impulse_bw_s,
+                "contact_time_ms": _round_or_none(jump.contact_time_ms, 1),
             }
             for jump in result.jumps
         ],
@@ -834,6 +747,9 @@ def _grf_split_result(rows: List[Dict[str, Any]], weight_kg: float,
             for jump in result.jumps
         ],
         "summary": {
+            # The movement the events were detected under - a cached result under
+            # another protocol is not this result.
+            "protocol": protocol,
             "jump_count": summary.n_jumps,
             "peak_force": _force_units(summary.peak_force),
             "peak_pushoff_force": _force_units(summary.peak_pushoff_force),
@@ -864,12 +780,12 @@ def _grf_split_result(rows: List[Dict[str, Any]], weight_kg: float,
 
 def _protocol_contact_detector_result(
     calculator_id: str,
-    rows: List[Dict[str, Any]],
+    df: pd.DataFrame,
 ) -> Dict[str, Any]:
-    """Expose GCTTCN contact regions as walking/running detections."""
+    """Expose GCTTCN contact regions as walking-test detections."""
     from app.services.calculators.step_cadence_calculator import get_gct_cadence_calculator
 
-    base = _cadence_result("step-cadence", rows, get_gct_cadence_calculator())
+    base = _cadence_result(calculator_id, df, get_gct_cadence_calculator())
     contacts = list(base.get("contacts") or [])
     left_count = sum(1 for event in contacts if event.get("foot") == "left")
     right_count = sum(1 for event in contacts if event.get("foot") == "right")
@@ -884,27 +800,6 @@ def _protocol_contact_detector_result(
             "contact_count": len(contacts),
             "left_count": left_count,
             "right_count": right_count,
-            "is_valid": bool(base.get("summary", {}).get("is_valid")),
-        },
-    }
-
-
-def _protocol_jump_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Expose JumpBiLSTM take-off-to-landing regions without metric cards."""
-    calculator_id = "protocol-jumping-detector"
-    base = _jump_result(rows)
-    contacts = list(base.get("contacts") or [])
-    return {
-        "calculator": calculator_id,
-        "label": CALCULATOR_LABELS[calculator_id],
-        "model": CALCULATOR_MODELS[calculator_id],
-        "model_file": CALCULATOR_MODEL_FILES.get(calculator_id),
-        "contacts": contacts,
-        "summary": {
-            "event_count": len(contacts),
-            "flight_count": len(contacts),
-            "left_count": sum(1 for event in contacts if event.get("foot") == "left"),
-            "right_count": sum(1 for event in contacts if event.get("foot") == "right"),
             "is_valid": bool(base.get("summary", {}).get("is_valid")),
         },
     }
@@ -1018,10 +913,9 @@ def _rows_for_detection_foot(
 
 def _protocol_turn_detector_result(
     calculator_id: str,
-    data: Union[pd.DataFrame, List[Dict[str, Any]]],
+    df: pd.DataFrame,
     detection_foot: str = "both",
     sensor_name: str | None = None,
-    protocol: str = DEFAULT_JUMP_EVENT_PROTOCOL,
 ) -> Dict[str, Any]:
     """Run one detector per requested foot; ``both`` overlays L and R results."""
     from app.schemas.turn_cod import TurnEvent
@@ -1044,17 +938,6 @@ def _protocol_turn_detector_result(
             exit_slow_ms=10,
             fast_rate_deg_per_ms=0.14,
         )
-
-    df = data if isinstance(data, pd.DataFrame) else pd.DataFrame(data)
-    if "Time" in df.columns or "time" in df.columns:
-        tcol = "Time" if "Time" in df.columns else "time"
-        s = pd.to_numeric(df[tcol].iloc[:300], errors="coerce").dropna()
-        if not s.empty:
-            diffs = np.diff(np.sort(s.values))
-            diffs = diffs[diffs > 0]
-            if len(diffs) and np.median(diffs) < 0.5:
-                df = df.copy()
-                df[tcol] = pd.to_numeric(df[tcol], errors="coerce") * 1000.0
 
     requested_feet = ["left", "right"] if detection_foot == "both" else [detection_foot]
     contacts: List[Dict[str, Any]] = []
@@ -1170,214 +1053,40 @@ def _protocol_turn_detector_result(
     }
 
 
-def _distance_at_time(points: List[Any], time_ms: float) -> float | None:
-    """Linearly interpolate cumulative SpeedTCN distance at one event time."""
-    if not points:
-        return None
-    if time_ms <= float(points[0].time):
-        return float(points[0].distance)
-    if time_ms >= float(points[-1].time):
-        return float(points[-1].distance)
-    for left, right in zip(points, points[1:]):
-        left_time = float(left.time)
-        right_time = float(right.time)
-        if left_time <= time_ms <= right_time:
-            if right_time <= left_time:
-                return float(left.distance)
-            fraction = (time_ms - left_time) / (right_time - left_time)
-            return float(left.distance) + fraction * (
-                float(right.distance) - float(left.distance)
-            )
-    return None
-
-
-def _valid_length(value: float | None, maximum: float) -> float | None:
-    if value is None or value < 0.05 or value > maximum:
-        return None
-    return round(float(value), 3)
-
-
-def _protocol_sprint_detector_result(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Detect 30 m, sprint steps, step length and same-foot stride length."""
-    from app.services.calculators.ml_speed_calculator import get_speed_calculator
-    from app.services.calculators.step_cadence_calculator import get_gct_cadence_calculator
-
-    calculator_id = "protocol-sprint-detector"
-    normalised_rows = _rows_with_time_in_ms(rows)
-    result = get_speed_calculator().calculate(normalised_rows)
-    points = list(result.series[0]) if result.series else []
-    start = next(
-        (point for point in points if float(point.speed) > 0 and float(point.distance) > 0),
-        None,
-    )
-    finish = None
-    if start is not None:
-        target_distance = float(start.distance) + 30.0
-        finish = next(
-            (point for point in points if float(point.time) > float(start.time)
-             and float(point.distance) >= target_distance),
-            None,
-        )
-
-    end = finish
-    if start is not None and end is None:
-        end = next(
-            (
-                point for point in reversed(points)
-                if float(point.time) > float(start.time)
-                and float(point.distance) >= float(start.distance)
-            ),
-            None,
-        )
-
-    contacts: List[Dict[str, Any]] = []
-    step_contacts: List[Dict[str, Any]] = []
-    step_lengths: List[float] = []
-    stride_lengths: List[float] = []
-    stride_lengths_by_foot = {"left": [], "right": []}
-    cadence_spm = None
-    segment_distance_m = None
-    if start is not None and end is not None:
-        start_time_s = float(start.time) / 1000.0
-        end_time_s = float(end.time) / 1000.0
-        start_distance = float(start.distance)
-        is_complete = finish is not None
-        segment_distance_m = (
-            30.0
-            if is_complete
-            else max(0.0, float(end.distance) - start_distance)
-        )
-        contacts.append({
-            "foot": "both",
-            "start_time_s": start_time_s,
-            "end_time_s": end_time_s,
-            "peak_time_s": start_time_s,
-            "duration_ms": float(end.time) - float(start.time),
-            "kind": "sprint",
-            "distance_m": round(segment_distance_m, 3),
-            "is_complete": is_complete,
-            "confidence": None,
-        })
-
-        cadence_result = _cadence_result(
-            "step-cadence", normalised_rows, get_gct_cadence_calculator()
-        )
-        cadence_spm = cadence_result.get("summary", {}).get("cadence_spm")
-        # Every step the cadence model found across the whole recording is kept
-        # for markup - this is a QA tool, not the timing product, so a step
-        # before the start gate or after the 30 m finish must stay visible and
-        # keep its real GCT. Only the 30 m-dash summary stats (step_count,
-        # median step/stride length, cadence) are scoped to the timed segment.
-        detected_steps = sorted(
-            (dict(event) for event in cadence_result.get("contacts", [])),
-            key=lambda event: float(event["start_time_s"]),
-        )
-
-        previous_distance = None
-        previous_foot_distance: Dict[str, float] = {}
-        segment_step_index = 0
-        for event in detected_steps:
-            event_time_ms = float(event["start_time_s"]) * 1000.0
-            absolute_distance = _distance_at_time(points, event_time_ms)
-            if absolute_distance is None:
-                continue
-
-            step_length = _valid_length(
-                absolute_distance - previous_distance if previous_distance is not None else None,
-                maximum=3.0,
-            )
-            foot = str(event.get("foot"))
-            stride_length = _valid_length(
-                absolute_distance - previous_foot_distance[foot]
-                if foot in previous_foot_distance else None,
-                maximum=4.0,
-            )
-            previous_distance = absolute_distance
-            previous_foot_distance[foot] = absolute_distance
-
-            in_segment = start_time_s <= float(event["start_time_s"]) <= end_time_s
-            if in_segment:
-                segment_step_index += 1
-                if step_length is not None:
-                    step_lengths.append(step_length)
-                if stride_length is not None:
-                    stride_lengths.append(stride_length)
-                    if foot in stride_lengths_by_foot:
-                        stride_lengths_by_foot[foot].append(stride_length)
-
-            event.update({
-                "kind": "step",
-                "step_index": segment_step_index if in_segment else None,
-                "in_segment": in_segment,
-                "distance_m": round(absolute_distance - start_distance, 3),
-                "step_length_m": step_length,
-                "stride_length_m": stride_length,
-            })
-            step_contacts.append(event)
-
-        contacts.extend(step_contacts)
-
-    return {
-        "calculator": calculator_id,
-        "label": CALCULATOR_LABELS[calculator_id],
-        "model": CALCULATOR_MODELS[calculator_id],
-        "model_file": CALCULATOR_MODEL_FILES.get(calculator_id),
-        "contacts": contacts,
-        "summary": {
-            "event_count": len(contacts),
-            "sprint_count": 1 if start is not None and finish is not None else 0,
-            "segment_found": bool(start is not None and end is not None),
-            "distance_m": round(segment_distance_m, 3) if segment_distance_m is not None else None,
-            "step_count": sum(1 for event in step_contacts if event.get("in_segment")),
-            "left_count": sum(1 for event in step_contacts if event.get("foot") == "left" and event.get("in_segment")),
-            "right_count": sum(1 for event in step_contacts if event.get("foot") == "right" and event.get("in_segment")),
-            "step_length_m": round(float(median(step_lengths)), 3) if step_lengths else None,
-            "stride_length_m": round(float(median(stride_lengths)), 3) if stride_lengths else None,
-            "stride_length_left_m": (
-                round(float(median(stride_lengths_by_foot["left"])), 3)
-                if stride_lengths_by_foot["left"] else None
-            ),
-            "stride_length_right_m": (
-                round(float(median(stride_lengths_by_foot["right"])), 3)
-                if stride_lengths_by_foot["right"] else None
-            ),
-            "cadence_spm": cadence_spm,
-            "is_valid": bool(start is not None and finish is not None),
-        },
-    }
-
-
 def _calculate(
     calculator_id: str,
-    data: Union[pd.DataFrame, List[Dict[str, Any]]],
+    df: pd.DataFrame,
     *,
     detection_foot: str = "both",
     sensor_name: str | None = None,
     protocol: str = DEFAULT_JUMP_EVENT_PROTOCOL,
+    weight_kg: float | None = None,
+    jump_pairs: Sequence[Tuple[float, float]] | None = None,
 ) -> Dict[str, Any]:
+    """Run one calculator on already-validated inputs (see ``calculate``).
+
+    ``df`` is the whole session; the backend models all expect ``Time`` in ms,
+    so a second-based export is rescaled here, once, for every calculator.
+    """
+    df = _frame_with_time_in_ms(df)
     if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
         return _protocol_turn_detector_result(
             calculator_id,
-            data,
+            df,
             detection_foot=detection_foot,
             sensor_name=sensor_name,
         )
-
     if calculator_id == "jump-events":
-        return _jump_events_result(data, protocol)
-
-    rows = data if isinstance(data, list) else data.to_dict(orient="records")
+        return _jump_events_result(df, protocol)
+    if calculator_id == "grf-split":
+        return _grf_split_result(df, weight_kg, protocol, jump_pairs)
+    if calculator_id == "plate-flight":
+        return _plate_flight_result(df)
     if calculator_id == "step-detector-ttest":
-        return _ttest_result(rows)
-    if calculator_id == "jump-metrics":
-        return _jump_result(rows)
-    if calculator_id in {"protocol-walking-detector", "protocol-running-detector"}:
-        return _protocol_contact_detector_result(calculator_id, rows)
-    if calculator_id == "protocol-jumping-detector":
-        return _protocol_jump_detector_result(rows)
-    if calculator_id == "protocol-sprint-detector":
-        return _protocol_sprint_detector_result(rows)
-    return _cadence_result(calculator_id, rows)
+        return _ttest_result(df)
+    if calculator_id == "protocol-walking-detector":
+        return _protocol_contact_detector_result(calculator_id, df)
+    raise ValueError(f"Unknown calculator: {calculator_id}")
 
 
 IMU_COLUMNS = ["AcX", "AcY", "AcZ", "XData", "YData", "ZData"]
@@ -1608,8 +1317,12 @@ def _preprocess_imu_dataframe(
 
 
 @app.get("/health")
-def health() -> Dict[str, bool]:
-    return {"ok": True}
+def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "models_ready": bool(_warm_up_state["done"]),
+        "unavailable": list(_warm_up_state["unavailable"]),
+    }
 
 
 @app.get("/markup/sessions")
@@ -1708,14 +1421,75 @@ def _extract_session_dataframe(payload: Dict[str, Any]) -> pd.DataFrame:
     raise HTTPException(status_code=422, detail="Session columns or rows are required")
 
 
-def _extract_session_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    columns = payload.get("columns")
-    if isinstance(columns, dict) and columns:
-        return _canonicalise_names_rows(pd.DataFrame(columns).to_dict(orient="records"))
-    rows = payload.get("rows")
-    if isinstance(rows, list) and rows:
-        return _canonicalise_names_rows(rows)
-    raise HTTPException(status_code=422, detail="Session columns or rows are required")
+def _parse_jump_pairs(raw: Any) -> List[Tuple[float, float]] | None:
+    """``[[takeoff_s, landing_s], …]`` (JSON list, or its string form in a query) -> ms pairs."""
+    if raw in (None, ""):
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=422, detail="jump_pairs must be a JSON list") from exc
+    if not isinstance(raw, list):
+        raise HTTPException(status_code=422, detail="jump_pairs must be a list of [takeoff_s, landing_s]")
+    pairs: List[Tuple[float, float]] = []
+    for item in raw:
+        try:
+            start_s, end_s = (float(item[0]), float(item[1]))
+        except (TypeError, ValueError, IndexError) as exc:
+            raise HTTPException(
+                status_code=422, detail="jump_pairs must be a list of [takeoff_s, landing_s]") from exc
+        if end_s <= start_s:
+            continue
+        pairs.append((start_s * 1000.0, end_s * 1000.0))
+    return pairs
+
+
+def _parse_calculator_options(calculator_id: str, params: Mapping[str, Any]) -> Dict[str, Any]:
+    """Validate the per-calculator inputs of one request.
+
+    ``params`` is the JSON body or the query string, so every value may arrive
+    as a string; the two transports are validated by one function on purpose.
+    """
+    options: Dict[str, Any] = {}
+
+    if calculator_id in WEIGHT_CALCULATOR_IDS:
+        try:
+            weight_kg = float(params.get("weight_kg"))
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail=f"weight_kg is required for {CALCULATOR_LABELS[calculator_id]}",
+            )
+        if weight_kg <= 0:
+            raise HTTPException(status_code=422, detail="weight_kg must be positive")
+        options["weight_kg"] = weight_kg
+
+    if calculator_id in PROTOCOL_CALCULATOR_IDS:
+        raw_protocol = params.get("protocol")
+        protocol = str(raw_protocol) if raw_protocol not in (None, "") else DEFAULT_JUMP_EVENT_PROTOCOL
+        if protocol not in JUMP_EVENT_PROTOCOLS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"protocol must be one of: {', '.join(JUMP_EVENT_PROTOCOLS)}",
+            )
+        options["protocol"] = protocol
+
+    if calculator_id == "grf-split":
+        options["jump_pairs"] = _parse_jump_pairs(params.get("jump_pairs"))
+
+    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
+        detection_foot = str(params.get("detection_foot") or "both").lower()
+        if detection_foot not in {"both", "left", "right"}:
+            raise HTTPException(
+                status_code=422,
+                detail="detection_foot must be one of: both, left, right",
+            )
+        raw_sensor_name = params.get("sensor_name")
+        options["detection_foot"] = detection_foot
+        options["sensor_name"] = str(raw_sensor_name) if raw_sensor_name not in (None, "") else None
+
+    return options
 
 
 @app.post("/markup/preprocess-imu")
@@ -1763,89 +1537,61 @@ async def preprocess_imu(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 
 
 @app.post("/calculate/{calculator_id}")
-async def calculate(
-    calculator_id: str,
-    payload: Dict[str, Any] = Body(...),
-) -> Dict[str, Any]:
+async def calculate(calculator_id: str, request: Request) -> Dict[str, Any]:
+    """Run one calculator on a session.
+
+    Two transports, one contract:
+
+    * ``Content-Type: application/vnd.apache.parquet`` — the body is the session
+      parquet file as the browser holds it, the calculator inputs (``weight_kg``,
+      ``protocol``, ``jump_pairs``, ``detection_foot``, ``sensor_name``) come in
+      the query string. Nothing is serialised to JSON on either side, the parsed
+      frame is cached by content hash, and a repeat of the same request under
+      the same inputs is answered from the result cache.
+    * JSON body ``{"columns": {...}}`` or ``{"rows": [...]}`` with the inputs as
+      top-level keys — what the UI sends once it has rewritten the session in
+      the browser (IMU post-processing), so no parquet describes it any more.
+    """
     if calculator_id not in CALCULATOR_LABELS:
         raise HTTPException(status_code=404, detail="Unknown calculator")
 
-    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS or calculator_id in FRAME_CALCULATOR_IDS:
-        data = _extract_session_dataframe(payload)
+    content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type in PARQUET_CONTENT_TYPES:
+        body = await request.body()
+        if not body:
+            raise HTTPException(status_code=422, detail="Empty parquet body")
+        params: Mapping[str, Any] = request.query_params
+        data_key: str | None = hashlib.sha1(body).hexdigest()
+        df = await asyncio.to_thread(_frame_from_parquet_bytes, data_key, body)
     else:
-        data = _extract_session_rows(payload)
-
-    if calculator_id == "force-jump":
         try:
-            weight_kg = float(payload.get("weight_kg"))
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=422, detail="weight_kg is required for Bilateral GRF")
-        if weight_kg <= 0:
-            raise HTTPException(status_code=422, detail="weight_kg must be positive")
-        try:
-            return await asyncio.to_thread(_force_result, data, weight_kg)
+            payload = await request.json()
         except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    if calculator_id == "grf-split":
-        try:
-            weight_kg = float(payload.get("weight_kg"))
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=422,
-                                detail="weight_kg is required for Total GRF")
-        if weight_kg <= 0:
-            raise HTTPException(status_code=422, detail="weight_kg must be positive")
-        raw_protocol = payload.get("protocol")
-        grf_protocol = (str(raw_protocol) if raw_protocol not in (None, "")
-                        else DEFAULT_JUMP_EVENT_PROTOCOL)
-        if grf_protocol not in JUMP_EVENT_PROTOCOLS:
             raise HTTPException(
-                status_code=422,
-                detail=f"protocol must be one of: {', '.join(JUMP_EVENT_PROTOCOLS)}")
-        try:
-            return await asyncio.to_thread(_grf_split_result, data, weight_kg, grf_protocol)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+                status_code=422, detail="Body must be JSON or parquet bytes") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=422, detail="JSON body must be an object")
+        params = payload
+        data_key = None
+        df = _extract_session_dataframe(payload)
 
-    if calculator_id == "plate-flight":
-        try:
-            return await asyncio.to_thread(_plate_flight_result, data)
-        except PlateFlightError as exc:
-            # Not a failure of the tool: the session has no plates, or one foot.
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    options = _parse_calculator_options(calculator_id, params)
 
-    protocol = DEFAULT_JUMP_EVENT_PROTOCOL
-    if calculator_id == "jump-events":
-        raw_protocol = payload.get("protocol")
-        protocol = str(raw_protocol) if raw_protocol not in (None, "") else DEFAULT_JUMP_EVENT_PROTOCOL
-        if protocol not in JUMP_EVENT_PROTOCOLS:
-            raise HTTPException(
-                status_code=422,
-                detail=f"protocol must be one of: {', '.join(JUMP_EVENT_PROTOCOLS)}",
-            )
-
-    detection_foot = "both"
-    sensor_name = None
-    if calculator_id in PER_FOOT_TURN_DETECTOR_IDS:
-        detection_foot = str(payload.get("detection_foot") or "both").lower()
-        if detection_foot not in {"both", "left", "right"}:
-            raise HTTPException(
-                status_code=422,
-                detail="detection_foot must be one of: both, left, right",
-            )
-        raw_sensor_name = payload.get("sensor_name")
-        sensor_name = str(raw_sensor_name) if raw_sensor_name not in (None, "") else None
+    cache_key = None
+    if data_key is not None:
+        cache_key = json.dumps([data_key, calculator_id, options], sort_keys=True, default=str)
+        cached = _lru_get(_result_cache, cache_key)
+        if cached is not None:
+            return cached
 
     try:
-        return await asyncio.to_thread(
-            _calculate,
-            calculator_id,
-            data,
-            detection_foot=detection_foot,
-            sensor_name=sensor_name,
-            protocol=protocol,
-        )
+        result = await asyncio.to_thread(_calculate, calculator_id, df, **options)
+    except PlateFlightError as exc:
+        # Not a failure of the tool: the session has no plates, or one foot.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if cache_key is not None:
+        _lru_put(_result_cache, cache_key, result, RESULT_CACHE_SIZE)
+    return result

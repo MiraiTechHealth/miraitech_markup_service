@@ -8,11 +8,12 @@
     "calculator-api": "cd ../MiraiTech-backend && poetry run uvicorn calculator_api:app --app-dir ../miraitech_markup_service --host 127.0.0.1 --port 5174",
     "build": "vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:api": "cd ../MiraiTech-backend && poetry run pytest ../miraitech_markup_service/tests -q -p no:cacheprovider"
   },
   "dependencies": {
     "hyparquet": "^1.26.0",
-    "plotly.js-dist-min": "^3.5.1",
+    "plotly.js-basic-dist-min": "^3.5.1",
     "react": "^19.2.6",
     "react-dom": "^19.2.6"
   },
