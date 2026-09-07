@@ -74,6 +74,10 @@ export default function App() {
   const [calculatorResults, setCalculatorResults] = useState({})
   const [activeCalculators, setActiveCalculators] = useState([])
   const [calculatorLoading, setCalculatorLoading] = useState('')
+  // Calculators whose model bundle the companion API could not load (from
+  // /health after its warm-up). Their cards are disabled with the reason
+  // instead of failing with an import error on the first click.
+  const [unavailableCalculators, setUnavailableCalculators] = useState(() => new Set())
   const [selectedCalculatorContact, setSelectedCalculatorContact] = useState(null)
   // Steps the operator struck out of Target, by stepKey(). Held apart from the
   // detector results so a re-run keeps the edits instead of wiping them.
@@ -259,6 +263,30 @@ export default function App() {
   useEffect(() => { correctedXDataColRef.current = correctedXDataCol }, [correctedXDataCol])
   useEffect(() => { relabelStepRef.current = relabelStep }, [relabelStep])
   useEffect(() => { calculatorResultsRef.current = calculatorResults }, [calculatorResults])
+
+  // The companion API loads its model bundles in the background at start-up;
+  // ask it which ones are missing once that is done (poll while it warms up).
+  useEffect(() => {
+    let cancelled = false
+    let attempts = 0
+    let timer = null
+    const probe = async () => {
+      try {
+        const resp = await fetch(`${CALCULATOR_API}/health`, { headers: { accept: 'application/json' } })
+        const health = resp.ok ? await resp.json() : null
+        if (cancelled) return
+        if (health?.models_ready) {
+          setUnavailableCalculators(new Set(health.unavailable || []))
+          return
+        }
+      } catch {
+        // API not up yet - the calculator buttons already explain that on click.
+      }
+      if (!cancelled && attempts++ < 60) timer = setTimeout(probe, 2000)
+    }
+    void probe()
+    return () => { cancelled = true; if (timer) clearTimeout(timer) }
+  }, [])
   useEffect(() => { selectedCalculatorContactRef.current = selectedCalculatorContact }, [selectedCalculatorContact])
   useEffect(() => { deletedStepKeysRef.current = deletedStepKeys }, [deletedStepKeys])
   useEffect(() => { activeCalculatorsRef.current = activeCalculators }, [activeCalculators])
@@ -3971,22 +3999,30 @@ export default function App() {
                               const eventLegend = calculatorEventLegend(detector, result)
                               const supportsPerFootDetection = PER_FOOT_TURN_DETECTOR_IDS.has(detector.id)
                               const selectedDetectionFoot = turnDetectionFeet[detector.id] || 'both'
+                              const unavailable = unavailableCalculators.has(detector.id)
                               return (
-                                <div key={detector.id} className="calculator-option">
+                                <div key={detector.id} className={`calculator-option${unavailable ? ' calculator-option-unavailable' : ''}`}>
                                   <button
                                     type="button"
                                     className={`btn-secondary btn-calculator${active ? ' active' : ''}`}
                                     style={{ '--calculator-color': detector.color }}
-                                    disabled={!parquetData || !!calculatorLoading}
+                                    disabled={!parquetData || !!calculatorLoading || unavailable}
                                     onClick={() => toggleAdditionalCalculator(detector.id)}
-                                    title={active
-                                      ? `Убрать события «${detector.label}» с графика`
-                                      : `Запустить «${detector.label}» на загруженных данных`}
+                                    title={unavailable
+                                      ? 'Модель этого детектора не загрузилась в companion API — в чекауте бэкенда нет её файлов'
+                                      : active
+                                        ? `Убрать события «${detector.label}» с графика`
+                                        : `Запустить «${detector.label}» на загруженных данных`}
                                   >
                                     <span className="calculator-dot" />
                                     {loading ? 'Детектирую…' : active ? `Убрать ${detector.label}` : detector.label}
                                   </button>
                                   <span className="calculator-description">{detector.description}</span>
+                                  {unavailable && (
+                                    <span className="calculator-unavailable-note">
+                                      Недоступно: модель не найдена в бэкенде
+                                    </span>
+                                  )}
                                   {supportsPerFootDetection && (
                                     <div className="turn-foot-selector" role="radiogroup" aria-label={`Нога для детекции поворотов: ${detector.label}`}>
                                       <span className="turn-foot-selector-label">Источник:</span>
@@ -4058,22 +4094,30 @@ export default function App() {
                               const leftCount = summary?.left?.contact_count || 0
                               const rightCount = summary?.right?.contact_count || 0
                               const eventLegend = calculatorEventLegend(calculator, result)
+                              const unavailable = unavailableCalculators.has(calculator.id)
                               return (
-                                <div key={calculator.id} className="calculator-option">
+                                <div key={calculator.id} className={`calculator-option${unavailable ? ' calculator-option-unavailable' : ''}`}>
                                   <button
                                     type="button"
                                     className={`btn-secondary btn-calculator${active ? ' active' : ''}`}
                                     style={{ '--calculator-color': calculator.color }}
-                                    disabled={!parquetData || !!calculatorLoading}
+                                    disabled={!parquetData || !!calculatorLoading || unavailable}
                                     onClick={() => toggleAdditionalCalculator(calculator.id)}
-                                    title={active
-                                      ? `Убрать ${calculator.label} с графика`
-                                      : `Запустить ${calculator.label} для загруженных данных`}
+                                    title={unavailable
+                                      ? 'Модель не загрузилась в companion API — в чекауте бэкенда нет её файлов (см. /calculator-api/health)'
+                                      : active
+                                        ? `Убрать ${calculator.label} с графика`
+                                        : `Запустить ${calculator.label} для загруженных данных`}
                                   >
                                     <span className="calculator-dot" />
                                     {loading ? 'Детектирую…' : active ? `Убрать ${calculator.label}` : calculator.label}
                                   </button>
                                   <span className="calculator-description">{calculator.description}</span>
+                                  {unavailable && (
+                                    <span className="calculator-unavailable-note">
+                                      Недоступно: модель не найдена в бэкенде
+                                    </span>
+                                  )}
                                   {result?.model && (
                                     <span className="calculator-model">
                                       Модель: {result.model}{result.model_file ? ` · ${result.model_file}` : ''}

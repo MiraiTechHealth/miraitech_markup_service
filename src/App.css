@@ -1100,6 +1100,15 @@ label.lab-btn:has(input:focus-visible) {
   font-size: 10px;
   line-height: 1.25;
 }
+.calculator-option-unavailable {
+  opacity: .72;
+  border-style: dashed;
+}
+.calculator-unavailable-note {
+  color: #b45309;
+  font-size: 9.5px;
+  font-weight: 700;
+}
 .turn-foot-selector {
   display: flex;
   align-items: center;
