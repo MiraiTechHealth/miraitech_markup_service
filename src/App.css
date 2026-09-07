@@ -1326,6 +1326,11 @@ label.lab-btn:has(input:focus-visible) {
   object-fit: contain;
   display: block;
 }
+/* Zoomed in, the video is being panned: a mousedown + mouseup on it would
+   otherwise reach the browser's own click-to-play toggle on <video controls>,
+   so pointer events skip the element and land on the wrap (pan / wheel zoom).
+   Play / pause and seeking stay available on the transport bar and the keys. */
+.video-wrap.zoomed .video-el { pointer-events: none }
 
 /* ── Zoom controls overlay ──────────────────────────────────────────── */
 .zoom-overlay {
@@ -1385,6 +1390,67 @@ label.lab-btn:has(input:focus-visible) {
 .muted   { color: #4b5563 }
 .dur     { margin-left: auto }
 
+/* ── Video transport (frame / 0.1 s / 1 s stepping, speed) ─────────────── */
+.video-transport {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 3px;
+  padding: 3px 12px;
+  background: #161b22;
+  border-top: 1px solid #21262d;
+  flex-shrink: 0;
+  user-select: none;
+}
+.video-step-btn {
+  min-width: 30px; height: 24px;
+  padding: 0 6px;
+  border: 1px solid rgba(255,255,255,.14);
+  border-radius: 5px;
+  background: rgba(255,255,255,.07);
+  color: #c9d1d9;
+  font-family: var(--font-sans);
+  font-size: 11.5px; font-weight: 600; line-height: 1;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: background .12s, border-color .12s;
+}
+.video-step-btn:hover  { background: rgba(255,255,255,.16) }
+.video-step-btn:active { background: rgba(255,255,255,.26) }
+.video-step-btn:focus-visible { outline: 2px solid #60a5fa; outline-offset: 1px }
+.video-play-btn {
+  min-width: 40px;
+  margin: 0 3px;
+  background: rgba(37,99,235,.35);
+  border-color: rgba(96,165,250,.55);
+  color: #fff;
+  font-size: 12px;
+}
+.video-play-btn:hover { background: rgba(37,99,235,.55) }
+.video-play-btn.playing {
+  background: rgba(239,68,68,.32);
+  border-color: rgba(248,113,113,.6);
+}
+.video-play-btn.playing:hover { background: rgba(239,68,68,.5) }
+.video-rate {
+  height: 24px;
+  margin-left: 6px;
+  padding: 0 4px;
+  border: 1px solid rgba(255,255,255,.14);
+  border-radius: 5px;
+  background: rgba(255,255,255,.07);
+  color: #c9d1d9;
+  font-size: 11px; font-weight: 600;
+  cursor: pointer;
+}
+.video-rate option { color: #111; }
+.video-transport-hint {
+  margin-left: auto;
+  color: #4b5563;
+  font-size: 10px;
+  white-space: nowrap;
+}
+@media (max-width: 768px) {
+  .video-transport-hint { display: none }
+}
+
 .drop-hint {
   flex: 1; display: flex; flex-direction: column;
   align-items: center; justify-content: center; gap: 8px;
@@ -1429,6 +1495,21 @@ label.lab-btn:has(input:focus-visible) {
   font-size: 10px; color: #6b7280;
   text-align: center;
   margin-top: 3px;
+  white-space: nowrap;
+}
+
+.tl-hover {
+  position: absolute;
+  top: 2px;
+  transform: translateX(-50%);
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(15,23,42,.92);
+  color: #e2e8f0;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  z-index: 12;
   white-space: nowrap;
 }
 

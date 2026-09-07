@@ -14,6 +14,13 @@ import { IMU_SNAPSHOT_COLUMNS, INSOLE_TOTAL_COL, MIRRORED_LEFT_COLUMNS, SENSOR_S
 import { arrayMax, arrayMin, safeNum, unwrapAngleDegrees } from './lib/utils.js'
 import { correctedXData, estimateYawDrift, turnAngleDeg, withTimeInMs } from './lib/yawDrift.js'
 
+// Video transport. Phone footage is 30 or 60 fps; one 1/30 s step is one frame
+// of the former and two of the latter, which is fine for placing a contact.
+const FRAME_STEP_S = 1 / 30
+const FINE_SEEK_S = 0.1
+const COARSE_SEEK_S = 1
+const PLAYBACK_RATES = [0.25, 0.5, 1, 1.5, 2]
+
 // ── Main App ───────────────────────────────────────────────────────────────
 export default function App() {
   // Auth
@@ -91,6 +98,8 @@ export default function App() {
 
   // Video state
   const [videoDuration, setVideoDuration] = useState(0)
+  const [isPlaying, setIsPlaying]         = useState(false)
+  const [playbackRate, setPlaybackRate]   = useState(1)
   const [currentTime, setCurrentTime]     = useState(0)
 
   // Video zoom/pan
@@ -174,6 +183,7 @@ export default function App() {
   const mirrorLeftRef      = useRef(false)
   const isDragging       = useRef(false)
   const isVideoPan      = useRef(false)
+  const tlHoverRef      = useRef(null)
   const vidLblRef       = useRef(null)
   const imuLblRef       = useRef(null)
   const labelingRef      = useRef(false)
@@ -1879,6 +1889,14 @@ export default function App() {
     e.preventDefault()
   }, [zoom])
 
+  // The zoom buttons sit over the video. A mousedown on them must neither start
+  // a pan (it would bubble to the wrap) nor move focus onto the button - with
+  // focus there, the next Space re-fires the zoom instead of play / pause.
+  const swallowOverlayMouseDown = useCallback((e) => {
+    e.preventDefault()
+    e.stopPropagation()
+  }, [])
+
   useEffect(() => {
     const onMove = (e) => {
       if (!isVideoPan.current) return
@@ -1988,6 +2006,7 @@ export default function App() {
     setVideoName(file.name)
     setVideoPanelOpen(true)
     setCurrentTime(0)
+    setIsPlaying(false)
     if (typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches) {
       setMobileTab('video')
     }
@@ -3100,6 +3119,78 @@ export default function App() {
     return () => window.clearTimeout(timeout)
   }, [chartReady, sidebarWidth, videoPanelOpen, videoPanelWidth, mobileTab, isMobile])
 
+  // ── Video transport ───────────────────────────────────────────────────────
+  const seekTo = useCallback((timeS) => {
+    const video = videoRef.current
+    if (!video || !Number.isFinite(video.duration)) return
+    video.currentTime = Math.max(0, Math.min(video.duration, timeS))
+  }, [])
+
+  // Frame steps pause first: stepping through a playing video is meaningless,
+  // and the operator who steps wants to stay on that frame.
+  const seekBy = useCallback((deltaS, { pause = false } = {}) => {
+    const video = videoRef.current
+    if (!video || !Number.isFinite(video.duration)) return
+    if (pause && !video.paused) video.pause()
+    video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + deltaS))
+  }, [])
+
+  const togglePlay = useCallback(() => {
+    const video = videoRef.current
+    if (!video) return
+    if (video.paused) void video.play().catch(() => {})
+    else video.pause()
+  }, [])
+
+  const changePlaybackRate = useCallback((rate) => {
+    const next = PLAYBACK_RATES.includes(rate) ? rate : 1
+    setPlaybackRate(next)
+    if (videoRef.current) videoRef.current.playbackRate = next
+  }, [])
+
+  const stepPlaybackRate = useCallback((direction) => {
+    const index = PLAYBACK_RATES.indexOf(playbackRate)
+    const nextIndex = Math.max(0, Math.min(PLAYBACK_RATES.length - 1, (index < 0 ? 2 : index) + direction))
+    changePlaybackRate(PLAYBACK_RATES[nextIndex])
+  }, [playbackRate, changePlaybackRate])
+
+  // Keyboard transport, active whenever a video is loaded: Space play / pause,
+  // arrows 0.1 s (Shift: 1 s), comma / period one frame, Home / End, < > speed.
+  // Registered in the capture phase so it runs before the <video>'s own key
+  // handling (5 s arrow jumps, its own Space) and replaces it. Typing, focused
+  // buttons / links and the keyboard-resizable separators keep their keys; so
+  // do the arrows while an activity span is selected for nudging.
+  useEffect(() => {
+    if (!videoUrl) return undefined
+    const onKey = (event) => {
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      const target = event.target
+      const tag = target?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || target?.isContentEditable) return
+      if (tag === 'BUTTON' || tag === 'A') return
+      if (target && target !== document.body && tag !== 'VIDEO' && target.tabIndex >= 0) return
+      if (activityModeRef.current && selectedActivityIdxRef.current !== null
+        && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) return
+
+      switch (event.key) {
+        case ' ': togglePlay(); break
+        case 'ArrowLeft': seekBy(event.shiftKey ? -COARSE_SEEK_S : -FINE_SEEK_S); break
+        case 'ArrowRight': seekBy(event.shiftKey ? COARSE_SEEK_S : FINE_SEEK_S); break
+        case ',': seekBy(-FRAME_STEP_S, { pause: true }); break
+        case '.': seekBy(FRAME_STEP_S, { pause: true }); break
+        case '<': stepPlaybackRate(-1); break
+        case '>': stepPlaybackRate(1); break
+        case 'Home': seekTo(0); break
+        case 'End': seekTo(videoRef.current?.duration ?? 0); break
+        default: return
+      }
+      event.preventDefault()
+      event.stopPropagation()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [videoUrl, togglePlay, seekBy, seekTo, stepPlaybackRate])
+
   // ── Video timeupdate → move chart cursor ──────────────────────────────────
   const handleTimeUpdate = useCallback(() => {
     if (!videoRef.current) return
@@ -3142,6 +3233,36 @@ export default function App() {
       document.removeEventListener('mouseup', onUp)
     }
   }, [seekFromX])
+
+  // The time under the pointer, written straight into the DOM: a state update
+  // per mousemove would re-render the whole app.
+  const handleTimelineHover = useCallback((e) => {
+    const rect = timelineRef.current?.getBoundingClientRect()
+    const hover = tlHoverRef.current
+    if (!rect || !hover || videoDuration <= 0) return
+    const x = Math.max(0, Math.min(e.clientX - rect.left, rect.width))
+    hover.style.left = `${(x / rect.width) * 100}%`
+    hover.textContent = formatTime((x / rect.width) * videoDuration)
+    hover.hidden = false
+  }, [videoDuration])
+
+  const handleTimelineLeave = useCallback(() => {
+    if (tlHoverRef.current) tlHoverRef.current.hidden = true
+  }, [])
+
+  // Wheel over the timeline scrubs: 0.1 s per notch, 1 s with Shift. Native
+  // listener because React's onWheel is passive and cannot stop the page scroll.
+  useEffect(() => {
+    const el = timelineRef.current
+    if (!el) return undefined
+    const onWheel = (e) => {
+      e.preventDefault()
+      const direction = e.deltaY > 0 || e.deltaX > 0 ? 1 : -1
+      seekBy(direction * (e.shiftKey ? COARSE_SEEK_S : FINE_SEEK_S))
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [seekBy, videoDuration])
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
   useEffect(() => () => {
@@ -4114,8 +4235,11 @@ export default function App() {
                   src={videoUrl}
                   controls
                   className="video-el"
-                  onLoadedMetadata={e => setVideoDuration(e.target.duration)}
+                  onLoadedMetadata={e => { setVideoDuration(e.target.duration); e.target.playbackRate = playbackRate }}
                   onTimeUpdate={handleTimeUpdate}
+                  onPlay={() => setIsPlaying(true)}
+                  onPause={() => setIsPlaying(false)}
+                  onEnded={() => setIsPlaying(false)}
                 />
               </div>
             ) : (
@@ -4126,12 +4250,12 @@ export default function App() {
             )}
 
             {videoUrl && (
-              <div className="zoom-overlay">
-                <button className="zoom-btn" onClick={() => changeZoom(1.25)} title="Приблизить" aria-label="Приблизить"><UiIcon name="plus" /></button>
+              <div className="zoom-overlay" onMouseDown={swallowOverlayMouseDown}>
+                <button type="button" tabIndex={-1} className="zoom-btn" onClick={() => changeZoom(1.25)} title="Приблизить (колесо над видео)" aria-label="Приблизить"><UiIcon name="plus" /></button>
                 <span className="zoom-label">{zoom.toFixed(1)}×</span>
-                <button className="zoom-btn" onClick={() => changeZoom(1 / 1.25)} title="Отдалить" aria-label="Отдалить"><UiIcon name="minus" /></button>
+                <button type="button" tabIndex={-1} className="zoom-btn" onClick={() => changeZoom(1 / 1.25)} title="Отдалить" aria-label="Отдалить"><UiIcon name="minus" /></button>
                 {zoom > 1 && (
-                  <button className="zoom-btn zoom-reset" onClick={resetZoom} title="Сбросить масштаб" aria-label="Сбросить масштаб"><UiIcon name="maximize" /></button>
+                  <button type="button" tabIndex={-1} className="zoom-btn zoom-reset" onClick={resetZoom} title="Сбросить масштаб" aria-label="Сбросить масштаб"><UiIcon name="maximize" /></button>
                 )}
               </div>
             )}
@@ -4144,13 +4268,49 @@ export default function App() {
             <span className="time-lbl muted dur">{formatTime(videoDuration)}</span>
           </div>
 
+          {videoUrl && (
+            <div className="video-transport" role="toolbar" aria-label="Перемотка видео">
+              <button type="button" className="video-step-btn" onClick={() => seekTo(0)} title="В начало · Home" aria-label="В начало">⏮</button>
+              <button type="button" className="video-step-btn" onClick={() => seekBy(-COARSE_SEEK_S)} title="Назад 1 с · Shift+←" aria-label="Назад 1 секунда">−1с</button>
+              <button type="button" className="video-step-btn" onClick={() => seekBy(-FINE_SEEK_S)} title="Назад 0.1 с · ←" aria-label="Назад 0.1 секунды">−0.1</button>
+              <button type="button" className="video-step-btn" onClick={() => seekBy(-FRAME_STEP_S, { pause: true })} title="Кадр назад (1/30 с) · ," aria-label="Кадр назад">◂▏</button>
+              <button
+                type="button"
+                className={`video-step-btn video-play-btn${isPlaying ? ' playing' : ''}`}
+                onClick={togglePlay}
+                title={isPlaying ? 'Пауза · Space' : 'Играть · Space'}
+                aria-label={isPlaying ? 'Пауза' : 'Играть'}
+                aria-pressed={isPlaying}
+              >{isPlaying ? '❚❚' : '▶'}</button>
+              <button type="button" className="video-step-btn" onClick={() => seekBy(FRAME_STEP_S, { pause: true })} title="Кадр вперёд (1/30 с) · ." aria-label="Кадр вперёд">▕▸</button>
+              <button type="button" className="video-step-btn" onClick={() => seekBy(FINE_SEEK_S)} title="Вперёд 0.1 с · →" aria-label="Вперёд 0.1 секунды">+0.1</button>
+              <button type="button" className="video-step-btn" onClick={() => seekBy(COARSE_SEEK_S)} title="Вперёд 1 с · Shift+→" aria-label="Вперёд 1 секунда">+1с</button>
+              <button type="button" className="video-step-btn" onClick={() => seekTo(videoDuration)} title="В конец · End" aria-label="В конец">⏭</button>
+              <select
+                className="video-rate"
+                value={playbackRate}
+                onChange={e => changePlaybackRate(Number(e.target.value))}
+                title="Скорость воспроизведения · < >"
+                aria-label="Скорость воспроизведения"
+              >
+                {PLAYBACK_RATES.map(rate => <option key={rate} value={rate}>{rate}×</option>)}
+              </select>
+              <span className="video-transport-hint" title="Клавиши работают, когда фокус не в поле ввода">
+                Space · ←→ 0.1 с · Shift 1 с · , . кадр · колесо по шкале
+              </span>
+            </div>
+          )}
+
           {videoDuration > 0 && (
             <div
               className="timeline"
               ref={timelineRef}
               onMouseDown={e => { isDragging.current = true; seekFromX(e.clientX) }}
+              onMouseMove={handleTimelineHover}
+              onMouseLeave={handleTimelineLeave}
             >
               <div className="tl-played" style={{ width: `${cursorPct}%` }} />
+              <span ref={tlHoverRef} className="tl-hover" hidden />
               {ticks.map(({ t, pct }) => (
                 <div key={t} className="tl-tick" style={{ left: `${pct}%` }}>
                   <div className="tl-tick-line" />
