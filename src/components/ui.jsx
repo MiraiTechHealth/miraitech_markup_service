@@ -275,6 +275,9 @@ export function SessionInfoCard({ protocolName, deviceId, timeOffset, gapCount, 
   )
 }
 
+// Russian keyboards type the decimal comma; accept it beside the dot.
+const parseOffset = (raw) => Number(String(raw).trim().replace(',', '.'))
+
 export function OffsetInput({ value, step, title, onChange }) {
   const [draft, setDraft] = useState(String(value))
   const committed = useRef(value)
@@ -288,7 +291,7 @@ export function OffsetInput({ value, step, title, onChange }) {
 
   const commit = (raw) => {
     const trimmed = raw.trim()
-    const n = Number(trimmed)
+    const n = parseOffset(trimmed)
     if (trimmed !== '' && isFinite(n)) {
       committed.current = n
       onChange(n)
@@ -299,7 +302,7 @@ export function OffsetInput({ value, step, title, onChange }) {
   }
 
   const nudge = (dir) => {
-    const base = isFinite(Number(draft)) ? Number(draft) : committed.current
+    const base = draft.trim() !== '' && isFinite(parseOffset(draft)) ? parseOffset(draft) : committed.current
     const next = Math.round((base + dir * step) * 1e9) / 1e9
     committed.current = next
     onChange(next)
@@ -310,7 +313,7 @@ export function OffsetInput({ value, step, title, onChange }) {
     <div className="offset-input-wrap">
       <input
         type="text"
-        inputMode="numeric"
+        inputMode="decimal"
         className="input-sm offset-input-field"
         value={draft}
         title={title}

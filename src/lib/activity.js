@@ -1,5 +1,7 @@
 // Activity segmentation of a session (stand / walk / run / ... spans).
 
+import { convertTime, storedTimeUnit } from './format.js'
+
 // ── Activity segmentation ──────────────────────────────────────────────────
 // Free-mode recordings are labelled with independent [from, to] spans, marked
 // the way contacts are: click the start, click the end. Unmarked stretches stay
@@ -28,14 +30,20 @@ export function contactMarkupFiles(files) {
   return (files || []).filter(f => f.type !== ACTIVITY_FILE_TYPE)
 }
 
-/** Load stored spans back into plot time by re-adding the saved offset. */
-export function activitySpansFromFiles(files, offset) {
+/**
+ * Load stored spans back into plot time: convert them from the unit they were
+ * saved in to `unit`, the one the chart reads now, then re-add the offset.
+ */
+export function activitySpansFromFiles(files, offset, unit) {
   const file = (files || []).find(f => f.type === ACTIVITY_FILE_TYPE)
   if (!file || !Array.isArray(file.activitySpans)) return []
+  const target = unit ?? file.meta?.timeUnit
+  const source = storedTimeUnit(file.meta, file.activitySpans.flatMap(sp => [sp.from, sp.to]), target)
+  const cv = (v) => convertTime(Number(v), source, target)
   return file.activitySpans
     .map(sp => ({
-      from: Number(sp.from) + offset,
-      to: Number(sp.to) + offset,
+      from: cv(sp.from) + offset,
+      to: cv(sp.to) + offset,
       activity: sp.activity,
       ...(Number.isFinite(Number(sp.angleDeg)) ? { angleDeg: Number(sp.angleDeg) } : {}),
     }))

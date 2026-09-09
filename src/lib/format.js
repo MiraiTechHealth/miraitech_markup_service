@@ -28,6 +28,38 @@ export function formatInterval(value) {
   return number.toFixed(number < 10 ? 2 : 1).replace(/0+$/, '').replace(/\.$/, '')
 }
 
+// The chart reads its Time axis in milliseconds or seconds. Converting between
+// the two rounds, so a round trip gives the original value back and the seconds
+// carry no float dust (0.596, not 0.5960000000000001).
+export function convertTime(value, from, to) {
+  if (from === to || value == null) return value
+  const n = Number(value)
+  if (!Number.isFinite(n)) return value
+  return to === 'ms'
+    ? Math.round(n * 1000 * 1e6) / 1e6
+    : Math.round((n / 1000) * 1e9) / 1e9
+}
+
+export function convertTimes(values, from, to) {
+  if (from === to || !Array.isArray(values)) return values
+  return values.map(v => convertTime(v, from, to))
+}
+
+// Unit of a session's Time column, from its largest stamp: no recording in
+// seconds runs past an hour, and none in milliseconds is under 3.6 s.
+export function inferTimeUnit(tMax) {
+  return Number(tMax) > 3600 ? 'ms' : 's'
+}
+
+// Unit a saved markup's times are in. Files written before the unit toggle
+// converted anything carry the label the chart showed, not the unit the values
+// were placed in; a value past an hour cannot be seconds, so it is read as ms.
+export function storedTimeUnit(meta, values, fallback) {
+  let unit = meta?.timeUnit ?? fallback
+  if (unit === 's' && values.some(v => Math.abs(Number(v)) > 3600)) unit = 'ms'
+  return unit
+}
+
 export function hasSessionMetaValue(value) {
   return value != null && value !== ''
 }

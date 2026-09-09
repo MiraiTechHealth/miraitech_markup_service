@@ -8,7 +8,7 @@ import { API_BASE, CALCULATOR_API, MARKUP_API, parseApiError } from './lib/api.j
 import { CALCULATOR_BY_ID, DELETED_STEP_STYLE, EXTRA_CALCULATORS, GRF_PRED_COL, JUMP_EVENT_PROTOCOL_OPTIONS, MODEL_SECTION_CALCULATOR_IDS, PER_FOOT_TURN_DETECTOR_IDS, PLATE_FLIGHT_ID, PLATE_FORCE_COLUMNS, PROTOCOL_DETECTORS, PROTOCOL_DETECTOR_BY_ID, TURN_DETECTION_FOOT_OPTIONS, WEIGHT_REQUIRED_CALCULATORS, calculatorEventLegend, calculatorEventStyle, calculatorQuery, columnsForCalculator, isStepContact, normaliseSpeedPrediction, protocolDetectorSummary, stepKey } from './lib/calculators.js'
 import { DISTANCE_PRED_COLS, L_FILL, L_LINE, PALETTE, PRED_COLOR, R_FILL, R_LINE, SEL_FILL, SEL_LINE, SPEED_PRED_COLS, ST_COLOR, ST_COL_COLORS, ST_ONLY_COLS, TRACE_HOVER_TEMPLATE, UI_FONT_FAMILY, buildCursorShapes, buildGapBandShapes, buildSelectedPointShapes, chartSubplotCenterTop, chartSubplotMetrics, currentAxisRange, plotAxisKey, readPlotRange } from './lib/chart.js'
 import { coerceCsvColumnsToNumbers, extractContactsFromLabeledCsv, getPairStartIndex, parseCsvText } from './lib/csv.js'
-import { formatDuration, formatInterval, formatMetric, formatTime, formatTimeOffset, hasSessionMetaValue, normalizeMemberName, normalizeSessionTitle, timeOffsetAsShift } from './lib/format.js'
+import { convertTime, convertTimes, formatDuration, formatInterval, formatMetric, formatTime, formatTimeOffset, hasSessionMetaValue, inferTimeUnit, normalizeMemberName, normalizeSessionTitle, storedTimeUnit, timeOffsetAsShift } from './lib/format.js'
 import { SPEED_TRACKER, buildDefaultCols, computeAutoOffsetST, computeNumericColumns, detectTimeCol, groupSensorNamesByFoot, resolveStDataCol, rowsToColMap, sensorFootForName, sensorNameForFoot, sortSensorNames } from './lib/sensors.js'
 import { IMU_SNAPSHOT_COLUMNS, INSOLE_TOTAL_COL, MIRRORED_LEFT_COLUMNS, SENSOR_SUM_NORM_COL, TKEO_PLOT_COLS, UNWRAPPABLE_ANGLE_COLUMNS, addAccTkeoColumn, addDerivedSessionColumns, addNormalizedSensorColumns, addSensorSumColumns, addTkeoColumns, addWeightedInsoleTotalColumn, computeGapStats } from './lib/signal.js'
 import { arrayMax, arrayMin, safeNum, unwrapAngleDegrees } from './lib/utils.js'
@@ -170,6 +170,11 @@ export default function App() {
   const offsetSTRef     = useRef(0)
   const showSpeedTrackerRef = useRef(false)
   const timeUnitRef     = useRef('ms')
+  // The Time column as loaded: its unit and its values. The chart can be
+  // switched to the other unit, which rescales parquetData[timeCol]; exports and
+  // the companion API keep reading this original clock.
+  const rawTimeUnitRef  = useRef('ms')
+  const rawTimeColRef   = useRef(null)
   const lastTRef        = useRef(null)
   const plotInitRef      = useRef(false)
   const contactShapesRef = useRef([])
@@ -362,6 +367,66 @@ export default function App() {
     sessionStorage.removeItem('auth_token')
   }, [])
 
+  /**
+   * Put a saved contact markup on the chart. Its contacts and shifts were stored
+   * in the unit the chart read when it was saved, so they are converted to
+   * `unit`, the one it reads now. The refs are written by hand for callers that
+   * read them before React flushes the state.
+   */
+  const applyMarkupFile = useCallback((file, unit) => {
+    const meta = file.meta || {}
+    const left = file.leftContacts || []
+    const right = file.rightContacts || []
+    const source = storedTimeUnit(meta, [...left, ...right], unit)
+    const cv = (v) => convertTime(v, source, unit)
+    setLeftContacts(left.map(cv))
+    setRightContacts(right.map(cv))
+    importedCsvTextRef.current = file.csv || ''
+    if (meta.offsetS1 !== undefined) { offsetS1Ref.current = cv(meta.offsetS1); setOffsetS1(offsetS1Ref.current) }
+    if (meta.offsetS2 !== undefined) { offsetS2Ref.current = cv(meta.offsetS2); setOffsetS2(offsetS2Ref.current) }
+    if (meta.offsetST !== undefined) { offsetSTRef.current = cv(meta.offsetST); setOffsetST(offsetSTRef.current) }
+  }, [])
+
+  /**
+   * Redraw the chart in the other time unit. Everything placed on the time axis
+   * — the Time column, the S1/S2/ST shifts, hand-placed contacts, activity
+   * spans, the saved zoom, the gap statistics — is in the unit being left, so
+   * all of it is converted together. Detector results arrive in seconds and are
+   * scaled at draw time; exports read the raw clock kept in rawTimeColRef.
+   */
+  const changeTimeUnit = useCallback((next) => {
+    const prev = timeUnitRef.current
+    if (next === prev) return
+    const cv = (v) => convertTime(v, prev, next)
+    timeUnitRef.current = next
+    setTimeUnit(next)
+    offsetS1Ref.current = cv(offsetS1Ref.current); setOffsetS1(offsetS1Ref.current)
+    offsetS2Ref.current = cv(offsetS2Ref.current); setOffsetS2(offsetS2Ref.current)
+    offsetSTRef.current = cv(offsetSTRef.current); setOffsetST(offsetSTRef.current)
+    setLeftContacts(contacts => contacts.map(cv))
+    setRightContacts(contacts => contacts.map(cv))
+    setActivitySpans(spans => spans.map(sp => ({ ...sp, from: cv(sp.from), to: cv(sp.to) })))
+    setPendingActivityFrom(v => (v === null ? null : cv(v)))
+    subplotRangesRef.current = Object.fromEntries(
+      Object.entries(subplotRangesRef.current).map(([col, ranges]) => [
+        col,
+        Array.isArray(ranges?.x) ? { ...ranges, x: ranges.x.map(cv) } : ranges,
+      ]),
+    )
+    lastTRef.current = null
+    setParquetData(data => (
+      data && data[timeCol] ? { ...data, [timeCol]: convertTimes(data[timeCol], prev, next) } : data
+    ))
+    setCheckHzData(stats => stats && Object.fromEntries(
+      Object.entries(stats).map(([name, sensor]) => [name, {
+        ...sensor,
+        time_diff_mean: cv(sensor.time_diff_mean),
+        time_diff_max: cv(sensor.time_diff_max),
+        gaps: (sensor.gaps || []).map(([a, b]) => [cv(a), cv(b)]),
+      }]),
+    ))
+  }, [timeCol])
+
   // ── Sessions list fetch ───────────────────────────────────────────────────
   useEffect(() => {
     if (!token) return
@@ -427,24 +492,16 @@ export default function App() {
     const allFiles = result.additional_info?.markup_files || []
     const files = contactMarkupFiles(allFiles)
     setMarkupFiles(files)
-    setActivitySpans(activitySpansFromFiles(allFiles, offsetS1Ref.current))
+    setActivitySpans(activitySpansFromFiles(allFiles, offsetS1Ref.current, timeUnitRef.current))
 
     if (restoreLatest && files.length > 0) {
       const lastFile = files[files.length - 1]
       setActiveMarkupFileId(lastFile.id)
-      setLeftContacts(lastFile.leftContacts || [])
-      setRightContacts(lastFile.rightContacts || [])
-      importedCsvTextRef.current = lastFile.csv || ''
-      if (lastFile.meta) {
-        if (lastFile.meta.offsetS1 !== undefined) setOffsetS1(lastFile.meta.offsetS1)
-        if (lastFile.meta.offsetS2 !== undefined) setOffsetS2(lastFile.meta.offsetS2)
-        if (lastFile.meta.offsetST !== undefined) setOffsetST(lastFile.meta.offsetST)
-        if (lastFile.meta.timeUnit !== undefined) setTimeUnit(lastFile.meta.timeUnit)
-      }
+      applyMarkupFile(lastFile, timeUnitRef.current)
     }
 
     return result
-  }, [token])
+  }, [token, applyMarkupFile])
 
   // ── Gyro yaw drift ────────────────────────────────────────────────────────
   /**
@@ -608,20 +665,15 @@ export default function App() {
       // A saved markup carries the shift its contacts were drawn against, so it
       // outranks the value derived from sessions.time_offset below.
       let markupSuppliedShift = false
+      let restoredMarkupFile = null
       if (initialMarkupFiles.length > 0) {
         const lastFile = initialMarkupFiles[initialMarkupFiles.length - 1]
         setActiveMarkupFileId(lastFile.id)
-        setLeftContacts(lastFile.leftContacts || [])
-        setRightContacts(lastFile.rightContacts || [])
-        importedCsvTextRef.current = lastFile.csv || ''
-        if (lastFile.meta) {
-          markupSuppliedShift = lastFile.meta.offsetS1 !== undefined
-            || lastFile.meta.offsetS2 !== undefined
-          if (lastFile.meta.offsetS1 !== undefined) setOffsetS1(lastFile.meta.offsetS1)
-          if (lastFile.meta.offsetS2 !== undefined) setOffsetS2(lastFile.meta.offsetS2)
-          if (lastFile.meta.offsetST !== undefined) setOffsetST(lastFile.meta.offsetST)
-          if (lastFile.meta.timeUnit !== undefined) setTimeUnit(lastFile.meta.timeUnit)
-        }
+        // Applied below, once the session's time unit is known: the saved
+        // contacts and shifts are converted into it first.
+        restoredMarkupFile = lastFile
+        markupSuppliedShift = lastFile.meta?.offsetS1 !== undefined
+          || lastFile.meta?.offsetS2 !== undefined
       }
 
       const parquetBuffer = await parquetResp.arrayBuffer()
@@ -655,9 +707,12 @@ export default function App() {
 
       const tVals   = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
       const tMax    = tVals.length ? arrayMax(tVals) : 0
-      const autoUnit = tMax > 3600 ? 'ms' : 's'
+      const autoUnit = inferTimeUnit(tMax)
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
+      rawTimeUnitRef.current = autoUnit
+      rawTimeColRef.current = colMap[tCol]
+      if (restoredMarkupFile) applyMarkupFile(restoredMarkupFile, autoUnit)
 
       // Pre-fill the video sync from sessions.time_offset. Applied here rather
       // than beside the other session metadata because the shift has to be
@@ -673,7 +728,7 @@ export default function App() {
       // points are stored in raw sample time, so whatever shift they will be
       // drawn against has to be settled before they can be placed. The ref is
       // written by hand there because setState has not flushed yet.
-      setActivitySpans(activitySpansFromFiles(savedActivityFilesRef.current, offsetS1Ref.current))
+      setActivitySpans(activitySpansFromFiles(savedActivityFilesRef.current, offsetS1Ref.current, autoUnit))
       setSelectedActivityIdx(null)
 
       const gapStats = computeGapStats(colMap, tCol)
@@ -694,7 +749,7 @@ export default function App() {
     } catch (err) {
       setStatus({ text: `Ошибка: ${err.message}`, type: 'error' })
     }
-  }, [sessionId, token, prepareYawDrift, resetYawDrift])
+  }, [sessionId, token, prepareYawDrift, resetYawDrift, applyMarkupFile])
 
   const totalGaps = useMemo(() => {
     if (!checkHzData) return 0
@@ -1138,6 +1193,8 @@ export default function App() {
     if (!parquetData) return ''
     const allCols = Object.keys(parquetData)
     const timeArr = parquetData[timeCol] || []
+    // The exported Time is the session's own clock, whatever unit the chart shows.
+    const rawTime = rawTimeColRef.current?.length === timeArr.length ? rawTimeColRef.current : null
     const nameArr = parquetData['Name']  || []
     const n = timeArr.length
     const leftSensorNames = new Set(sensorGroups.left)
@@ -1202,7 +1259,7 @@ export default function App() {
             ? (inIv(t, lIv) || inIv(t, detectedL) ? 1 : 0)
             : ''
       const vals = allCols.map(c => {
-        const v = parquetData[c][i]
+        const v = c === timeCol && rawTime ? rawTime[i] : parquetData[c][i]
         return v == null ? '' : String(v)
       })
       vals.push(String(target))
@@ -1225,6 +1282,8 @@ export default function App() {
 
     const allCols = Object.keys(parquetData)
     const timeArr = parquetData[timeCol] || []
+    // The exported Time is the session's own clock, whatever unit the chart shows.
+    const rawTime = rawTimeColRef.current?.length === timeArr.length ? rawTimeColRef.current : null
     const offset = offsetS1Ref.current
     const shifted = spans.map(span => {
       const from = span.from - offset
@@ -1246,7 +1305,7 @@ export default function App() {
     const rows = []
     for (let i = 0; i < timeArr.length; i++) {
       const vals = allCols.map(c => {
-        const v = parquetData[c][i]
+        const v = c === timeCol && rawTime ? rawTime[i] : parquetData[c][i]
         return v == null ? '' : String(v)
       })
       const idx = activitySpanAt(shifted, safeNum(timeArr[i]) ?? NaN)
@@ -1299,17 +1358,9 @@ export default function App() {
     const file = markupFiles.find(f => f.id === id)
     if (file) {
       setActiveMarkupFileId(file.id)
-      setLeftContacts(file.leftContacts || [])
-      setRightContacts(file.rightContacts || [])
-      importedCsvTextRef.current = file.csv || ''
-      if (file.meta) {
-        if (file.meta.offsetS1 !== undefined) setOffsetS1(file.meta.offsetS1)
-        if (file.meta.offsetS2 !== undefined) setOffsetS2(file.meta.offsetS2)
-        if (file.meta.offsetST !== undefined) setOffsetST(file.meta.offsetST)
-        if (file.meta.timeUnit !== undefined) setTimeUnit(file.meta.timeUnit)
-      }
+      applyMarkupFile(file, timeUnitRef.current)
     }
-  }, [markupFiles])
+  }, [markupFiles, applyMarkupFile])
 
   /**
    * The ribbon is stored as its own entry in markup_files, beside the contact
@@ -1620,9 +1671,11 @@ export default function App() {
 
         const tVals = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
         const tMax = tVals.length ? arrayMax(tVals) : 0
-        const autoUnit = tMax > 3600 ? 'ms' : 's'
+        const autoUnit = inferTimeUnit(tMax)
         setTimeUnit(autoUnit)
         timeUnitRef.current = autoUnit
+        rawTimeUnitRef.current = autoUnit
+        rawTimeColRef.current = colMap[tCol]
 
         const gapStats = computeGapStats(colMap, tCol)
         const gapCount = Object.values(gapStats)
@@ -1698,9 +1751,16 @@ export default function App() {
       const leftNames = resolveSensors(leftSensors, 'ESP32_Sensor_1')
       const rightNames = resolveSensors(rightSensors, 'ESP32_Sensor_2')
 
+      // The CSV carries the session's own clock; convert to the unit on the chart.
+      const csvTimes = rows.map(r => safeNum(r[tCol])).filter(v => v !== null)
+      const csvUnit = inferTimeUnit(csvTimes.length ? arrayMax(csvTimes) : 0)
+      const chartUnit = timeUnitRef.current
+      const unitRows = csvUnit === chartUnit
+        ? rows
+        : rows.map(r => ({ ...r, [tCol]: convertTime(r[tCol], csvUnit, chartUnit) }))
       const { leftContacts: importedLeft, rightContacts: importedRight, leftCount, rightCount } =
         extractContactsFromLabeledCsv(
-          rows,
+          unitRows,
           tCol,
           leftNames,
           rightNames,
@@ -1790,7 +1850,10 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'accept': 'application/json' },
         body: JSON.stringify({
-          columns: parquetData,
+          // The backend integrates against Time in the session's own clock.
+          columns: rawTimeColRef.current?.length === parquetData[timeCol]?.length
+            ? { ...parquetData, [timeCol]: rawTimeColRef.current }
+            : parquetData,
           target_sensor: imuTargetSensor,
         }),
       })
@@ -1823,6 +1886,9 @@ export default function App() {
       }
 
       const colMap = { ...colMapFromResp }
+      // Rows come back index-aligned; the chart keeps its own clock (which may
+      // be in the other unit than the one sent).
+      if (colMap[timeCol]?.length === parquetData[timeCol]?.length) colMap[timeCol] = parquetData[timeCol]
       // Accelerations changed, so the derived TKEO channel is rebuilt.
       delete colMap['acc_tkeo']
       TKEO_PLOT_COLS.forEach(col => { delete colMap[col] })
@@ -2126,9 +2192,11 @@ export default function App() {
 
       const tVals   = (colMap[tCol] || []).map(safeNum).filter(v => v !== null)
       const tMax    = tVals.length ? arrayMax(tVals) : 0
-      const autoUnit = tMax > 3600 ? 'ms' : 's'
+      const autoUnit = inferTimeUnit(tMax)
       setTimeUnit(autoUnit)
       timeUnitRef.current = autoUnit
+      rawTimeUnitRef.current = autoUnit
+      rawTimeColRef.current = colMap[tCol]
 
       const gapStats = computeGapStats(colMap, tCol)
       const gapCount = Object.values(gapStats)
@@ -2491,7 +2559,8 @@ export default function App() {
         const t = safeNum(times[index])
         const value = safeNum(values[index])
         if (t === null || value === null) continue
-        x.push(t + shift)
+        // Rounded so a shift in seconds leaves no float dust in the hover.
+        x.push(Math.round((t + shift) * 1e6) / 1e6)
         y.push(value)
       }
       return { x, y }
@@ -3232,7 +3301,9 @@ export default function App() {
       `IMU ${timeUnitRef.current === 'ms' ? imuT.toFixed(0) + 'ms' : imuT.toFixed(2) + 's'}`
 
     if (!plotInitRef.current || !chartDivRef.current) return
-    if (lastTRef.current !== null && Math.abs(imuT - lastTRef.current) < 0.04) return
+    // Skip sub-millisecond jitter only: a one-frame step (33 ms) must always move it.
+    const minStep = timeUnitRef.current === 'ms' ? 1 : 0.001
+    if (lastTRef.current !== null && Math.abs(imuT - lastTRef.current) < minStep) return
     lastTRef.current = imuT
 
     const n = selectedColsRef.current.length
@@ -4492,8 +4563,8 @@ export default function App() {
                       </span>
                     )}
                     <div className="btn-group chart-sync-units" aria-label="Единицы времени">
-                      <button type="button" className={`btn-toggle unit-btn${timeUnit === 's' ? ' active' : ''}`} aria-pressed={timeUnit === 's'} onClick={() => setTimeUnit('s')}>с</button>
-                      <button type="button" className={`btn-toggle unit-btn${timeUnit === 'ms' ? ' active' : ''}`} aria-pressed={timeUnit === 'ms'} onClick={() => setTimeUnit('ms')}>мс</button>
+                      <button type="button" className={`btn-toggle unit-btn${timeUnit === 's' ? ' active' : ''}`} aria-pressed={timeUnit === 's'} onClick={() => changeTimeUnit('s')}>с</button>
+                      <button type="button" className={`btn-toggle unit-btn${timeUnit === 'ms' ? ' active' : ''}`} aria-pressed={timeUnit === 'ms'} onClick={() => changeTimeUnit('ms')}>мс</button>
                     </div>
                     <button
                       type="button"
